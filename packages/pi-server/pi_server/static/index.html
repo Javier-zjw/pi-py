@@ -1,0 +1,790 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pi</title>
+<script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+<style>
+/* ── 设计令牌 ────────────────────────────────────────────────────
+   规则和 pi-tui 一致：一个强调色 + 灰阶层次，靠字号/间距/亮度分层，
+   不靠堆颜色。四种消息类型的差异化在 .msg-* 里集中定义。            */
+:root {
+  --bg:        #faf9f7;
+  --panel:     #f4f2ee;
+  --surface:   #ffffff;
+  --line:      #e7e3dc;
+  --line-soft: #efece6;
+  --text:      #2b2a26;
+  --text-2:    #55524b;
+  --muted:     #8e8a81;
+  --accent:    #4a6cb3;
+  --accent-bg: #edf1f9;
+  --think:     #7d78a8;
+  --think-bg:  #f5f4f9;
+  --ok:        #4f8a56;
+  --err:       #b4544e;
+  --radius:    10px;
+  --radius-sm: 7px;
+  --shadow:    0 1px 2px rgba(40,38,33,.05), 0 4px 14px rgba(40,38,33,.045);
+  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+          "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+          "Liberation Mono", monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg:#1c1b19; --panel:#232220; --surface:#26251f; --line:#35332e;
+    --line-soft:#2e2c28; --text:#e8e5df; --text-2:#c2beb5; --muted:#8d887e;
+    --accent:#8fabe0; --accent-bg:#252934; --think:#a49fce; --think-bg:#26242e;
+    --ok:#7cb383; --err:#d98079;
+    --shadow: 0 1px 2px rgba(0,0,0,.3), 0 4px 14px rgba(0,0,0,.2);
+  }
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body {
+  font-family: var(--font); background: var(--bg); color: var(--text);
+  font-size: 15px; line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+}
+[v-cloak] { display: none; }
+button { font-family: inherit; cursor: pointer; }
+::-webkit-scrollbar { width: 9px; height: 9px; }
+::-webkit-scrollbar-thumb { background: var(--line); border-radius: 5px; }
+::-webkit-scrollbar-thumb:hover { background: var(--muted); }
+::-webkit-scrollbar-track { background: transparent; }
+
+/* ── 布局 ─────────────────────────────────────────────────────── */
+.app { display: grid; grid-template-columns: 268px 1fr; height: 100vh; }
+.sidebar {
+  background: var(--panel); border-right: 1px solid var(--line);
+  display: flex; flex-direction: column; overflow: hidden;
+}
+.main { display: flex; flex-direction: column; min-width: 0; }
+
+/* ── 侧栏 ─────────────────────────────────────────────────────── */
+.brand { padding: 18px 18px 12px; }
+.brand h1 {
+  margin: 0; font-size: 17px; font-weight: 600; letter-spacing: .01em;
+  display: flex; align-items: center; gap: 8px;
+}
+.brand .dot {
+  width: 7px; height: 7px; border-radius: 50%; background: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-bg);
+}
+.brand p {
+  margin: 5px 0 0; font-size: 11.5px; color: var(--muted);
+  font-family: var(--mono); overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; direction: rtl; text-align: left;
+}
+.new-btn {
+  margin: 0 14px 14px; padding: 9px 12px; width: calc(100% - 28px);
+  border: 1px solid var(--line); background: var(--surface); color: var(--text);
+  border-radius: var(--radius-sm); font-size: 13.5px; font-weight: 500;
+  display: flex; align-items: center; justify-content: center; gap: 7px;
+  transition: all .16s ease;
+}
+.new-btn:hover { border-color: var(--accent); color: var(--accent); transform: translateY(-1px); }
+.new-btn:active { transform: none; }
+
+.side-scroll { flex: 1; overflow-y: auto; padding-bottom: 16px; }
+.section { padding: 0 14px; margin-bottom: 18px; }
+.section-head {
+  display: flex; align-items: center; justify-content: space-between;
+  font-size: 11px; font-weight: 600; letter-spacing: .09em;
+  text-transform: uppercase; color: var(--muted); padding: 0 4px 7px;
+}
+.section-head button {
+  border: 0; background: none; color: var(--muted); font-size: 11px; padding: 2px 4px;
+  border-radius: 4px;
+}
+.section-head button:hover { color: var(--accent); background: var(--accent-bg); }
+
+.picker { display: flex; flex-direction: column; gap: 2px; }
+.pick {
+  display: flex; align-items: flex-start; gap: 9px; padding: 7px 8px;
+  border-radius: var(--radius-sm); font-size: 13px; transition: background .14s;
+  border: 1px solid transparent;
+}
+.pick:hover { background: var(--surface); }
+.pick.on { background: var(--surface); border-color: var(--line-soft); }
+.pick input { margin: 3px 0 0; accent-color: var(--accent); cursor: pointer; }
+.pick label { cursor: pointer; flex: 1; min-width: 0; }
+.pick .name { display: block; font-weight: 500; color: var(--text); }
+.pick.on .name { color: var(--accent); }
+.pick .desc {
+  display: block; font-size: 11.5px; color: var(--muted); line-height: 1.45;
+  margin-top: 1px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.pick .tag {
+  font-size: 10px; padding: 1px 5px; border-radius: 4px; background: var(--accent-bg);
+  color: var(--accent); font-weight: 500; flex-shrink: 0; margin-top: 2px;
+}
+
+select.field {
+  width: 100%; padding: 7px 9px; font-size: 13px; font-family: inherit;
+  border: 1px solid var(--line); border-radius: var(--radius-sm);
+  background: var(--surface); color: var(--text); cursor: pointer;
+}
+select.field:focus { outline: none; border-color: var(--accent); }
+.field-row { display: flex; gap: 8px; }
+.field-row > * { flex: 1; min-width: 0; }
+
+.recent { display: flex; flex-direction: column; gap: 2px; }
+.recent-item {
+  padding: 8px 9px; border-radius: var(--radius-sm); font-size: 13px;
+  border: 1px solid transparent; transition: background .14s;
+}
+.recent-item:hover { background: var(--surface); }
+.recent-item.on { background: var(--surface); border-color: var(--line-soft); }
+.recent-item .t {
+  display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  color: var(--text-2);
+}
+.recent-item.on .t { color: var(--accent); font-weight: 500; }
+.recent-item .s { display: block; font-size: 11px; color: var(--muted); margin-top: 2px; }
+.empty { font-size: 12.5px; color: var(--muted); padding: 6px 9px; }
+
+/* ── 顶栏 ─────────────────────────────────────────────────────── */
+.topbar {
+  height: 52px; flex-shrink: 0; border-bottom: 1px solid var(--line);
+  display: flex; align-items: center; gap: 14px; padding: 0 24px;
+  background: color-mix(in srgb, var(--bg) 85%, transparent);
+  backdrop-filter: blur(8px); position: sticky; top: 0; z-index: 5;
+}
+.topbar .title { font-size: 14px; font-weight: 500; flex: 1; min-width: 0;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.chip {
+  font-size: 11.5px; color: var(--muted); font-family: var(--mono);
+  padding: 3px 8px; border-radius: 20px; background: var(--panel);
+  white-space: nowrap;
+}
+.chip.warn { color: var(--err); }
+
+/* ── 对话区 ───────────────────────────────────────────────────── */
+.chat { flex: 1; overflow-y: auto; scroll-behavior: smooth; }
+.chat-inner { max-width: 780px; margin: 0 auto; padding: 28px 24px 40px; }
+
+.turn { margin-bottom: 30px; }
+.turn:last-child { margin-bottom: 12px; }
+
+/* 1) 用户输入：字号最大、有底色、有边框，像"卡片" */
+.msg-user {
+  background: var(--accent-bg); border: 1px solid color-mix(in srgb, var(--accent) 18%, transparent);
+  border-radius: var(--radius); padding: 11px 15px; font-size: 15px; font-weight: 500;
+  color: var(--text); white-space: pre-wrap; word-break: break-word;
+  margin-bottom: 14px; animation: rise .22s ease both;
+}
+
+.msg-user.inject { font-size: 14px; margin: 4px 0 12px; opacity: .92; }
+.msg-user.inject::before {
+  content: "插话"; font-size: 10px; color: var(--accent); font-weight: 600;
+  display: block; margin-bottom: 3px; letter-spacing: .06em;
+}
+
+/* 2) 思考：字号最小、压暗、斜体、左侧细线，视觉上"退后" */
+.msg-think {
+  font-size: 12.5px; line-height: 1.65; color: var(--muted); font-style: italic;
+  background: var(--think-bg); border-left: 2px solid var(--think);
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  padding: 8px 12px; margin-bottom: 10px; white-space: pre-wrap;
+  animation: rise .22s ease both;
+}
+.msg-think.clamp { max-height: 4.95em; overflow: hidden; }
+
+/* 3) 工具：等宽字体、面板底色，和自然语言明确区分 */
+.tools { display: flex; flex-direction: column; gap: 5px; margin-bottom: 12px; }
+.tool {
+  background: var(--panel); border: 1px solid var(--line-soft);
+  border-radius: var(--radius-sm); padding: 7px 11px; font-size: 12.5px;
+  font-family: var(--mono); display: flex; align-items: center; gap: 9px;
+  animation: rise .2s ease both;
+}
+.tool .ico { font-size: 12px; width: 13px; text-align: center; flex-shrink: 0; }
+.tool .ico.run { color: var(--accent); animation: spin 1s linear infinite; }
+.tool .ico.ok { color: var(--ok); }
+.tool .ico.bad { color: var(--err); }
+.tool .n { font-weight: 600; color: var(--text-2); flex-shrink: 0; }
+.tool .s {
+  color: var(--muted); overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; flex: 1; min-width: 0;
+}
+.tool-out {
+  font-family: var(--mono); font-size: 11.5px; color: var(--muted);
+  background: var(--panel); border-radius: var(--radius-sm);
+  padding: 7px 11px; margin: -2px 0 5px; white-space: pre-wrap;
+  max-height: 4.5em; overflow: hidden;
+}
+.diff { font-family: var(--mono); font-size: 11.5px; line-height: 1.55;
+  padding: 8px 11px; background: var(--panel); border-radius: var(--radius-sm);
+  margin: -2px 0 6px; overflow-x: auto; max-height: 15em; overflow-y: auto; }
+.diff .p { color: var(--ok); }
+.diff .m { color: var(--err); }
+.diff .h { color: var(--think); }
+.diff .c { color: var(--muted); }
+
+/* 4) 模型输出：主体内容，字号大、行距舒展、无底色无边框 */
+.msg-text {
+  font-size: 15.5px; line-height: 1.82; color: var(--text);
+  word-break: break-word; animation: fade .2s ease both;
+}
+.msg-text p { margin: 0 0 .85em; }
+.msg-text p:last-child { margin-bottom: 0; }
+.msg-text h3 { font-size: 15.5px; font-weight: 600; margin: 1.1em 0 .5em; }
+.msg-text ul { margin: 0 0 .85em; padding-left: 1.3em; }
+.msg-text li { margin-bottom: .3em; }
+.msg-text code {
+  font-family: var(--mono); font-size: .87em; background: var(--panel);
+  padding: 1.5px 5px; border-radius: 4px; color: var(--accent);
+}
+.msg-text pre {
+  background: var(--panel); border: 1px solid var(--line-soft);
+  border-radius: var(--radius-sm); padding: 12px 14px; overflow-x: auto;
+  font-size: 12.5px; line-height: 1.6; margin: 0 0 .9em;
+}
+.msg-text pre code { background: none; padding: 0; color: var(--text-2); }
+.msg-text strong { font-weight: 600; }
+.caret {
+  display: inline-block; width: 7px; height: 1.05em; background: var(--accent);
+  vertical-align: text-bottom; margin-left: 2px; border-radius: 1px;
+  animation: blink 1.05s steps(2) infinite;
+}
+
+/* 折叠后的小胶囊 */
+.folded { display: flex; gap: 7px; flex-wrap: wrap; margin-bottom: 12px; }
+.fold-chip {
+  font-size: 11.5px; color: var(--muted); background: var(--panel);
+  border: 1px solid var(--line-soft); border-radius: 20px; padding: 3px 11px;
+  display: inline-flex; align-items: center; gap: 6px; transition: all .15s;
+}
+.fold-chip:hover { color: var(--accent); border-color: var(--accent); }
+.fold-chip .k { font-size: 9px; }
+
+/* 思考中动画 */
+.waiting {
+  display: flex; align-items: center; gap: 9px; font-size: 13px;
+  color: var(--muted); padding: 3px 0 12px;
+}
+.dots { display: inline-flex; gap: 4px; }
+.dots i {
+  width: 5px; height: 5px; border-radius: 50%; background: var(--accent);
+  display: block; animation: bounce 1.25s ease-in-out infinite;
+}
+.dots i:nth-child(2) { animation-delay: .16s; }
+.dots i:nth-child(3) { animation-delay: .32s; }
+.shimmer {
+  background: linear-gradient(90deg, var(--muted) 20%, var(--accent) 45%, var(--muted) 70%);
+  background-size: 220% 100%; -webkit-background-clip: text; background-clip: text;
+  color: transparent; animation: shimmer 2.1s linear infinite;
+}
+
+/* 每轮结束的统计条 */
+.meta {
+  display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  font-size: 11.5px; color: var(--muted); font-family: var(--mono);
+  padding-top: 10px; margin-top: 12px; border-top: 1px solid var(--line-soft);
+  animation: fade .3s ease both;
+}
+.meta .v { color: var(--text-2); }
+.meta .err { color: var(--err); font-family: var(--font); }
+
+/* ── 输入区 ───────────────────────────────────────────────────── */
+.composer { border-top: 1px solid var(--line); padding: 14px 24px 18px;
+  background: var(--bg); }
+.composer-inner {
+  max-width: 780px; margin: 0 auto; background: var(--surface);
+  border: 1px solid var(--line); border-radius: var(--radius);
+  box-shadow: var(--shadow); transition: border-color .16s;
+  display: flex; align-items: flex-end; gap: 10px; padding: 10px 12px;
+}
+.composer-inner:focus-within { border-color: var(--accent); }
+.composer textarea {
+  flex: 1; border: 0; outline: none; resize: none; background: none;
+  font-family: inherit; font-size: 14.5px; line-height: 1.6; color: var(--text);
+  max-height: 190px; padding: 3px 0;
+}
+.composer textarea::placeholder { color: var(--muted); }
+.send {
+  border: 0; border-radius: var(--radius-sm); padding: 7px 15px; font-size: 13px;
+  font-weight: 500; background: var(--accent); color: #fff; flex-shrink: 0;
+  transition: opacity .15s, transform .15s;
+}
+.send:disabled { opacity: .38; cursor: not-allowed; }
+.send:not(:disabled):hover { transform: translateY(-1px); }
+.send.stop { background: var(--err); }
+.hint { max-width: 780px; margin: 7px auto 0; font-size: 11px; color: var(--muted); }
+
+.welcome { text-align: center; padding: 90px 20px; color: var(--muted); }
+.welcome h2 { font-size: 19px; font-weight: 500; color: var(--text-2); margin: 0 0 8px; }
+.welcome p { font-size: 13.5px; margin: 0; }
+
+@keyframes rise { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: none; } }
+@keyframes fade { from { opacity: 0; } to { opacity: 1; } }
+@keyframes bounce { 0%, 70%, 100% { transform: translateY(0); opacity: .45; }
+                    35% { transform: translateY(-5px); opacity: 1; } }
+@keyframes shimmer { to { background-position: -220% 0; } }
+@keyframes blink { 50% { opacity: 0; } }
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (max-width: 820px) {
+  .app { grid-template-columns: 1fr; }
+  .sidebar { display: none; }
+}
+</style>
+</head>
+<body>
+<div id="app" v-cloak>
+  <div class="app">
+
+    <!-- ── 左侧 ──────────────────────────────────────────────── -->
+    <aside class="sidebar">
+      <div class="brand">
+        <h1><span class="dot"></span> pi</h1>
+        <p>{{ meta.cwd }}</p>
+      </div>
+
+      <button class="new-btn" @click="newSession">＋ 新建会话</button>
+
+      <div class="side-scroll">
+        <div class="section">
+          <div class="section-head"><span>模型</span></div>
+          <div class="field-row">
+            <select class="field" v-model="draft.model">
+              <option v-for="m in availableModels" :key="m.key" :value="m.key">{{ m.name }}</option>
+            </select>
+            <select class="field" v-model="draft.thinking" style="max-width:88px">
+              <option v-for="l in levels" :key="l" :value="l">{{ l }}</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="section">
+          <div class="section-head">
+            <span>技能 {{ draft.skills.length ? '· ' + draft.skills.length : '' }}</span>
+            <button @click="toggleAll('skills')">{{ allOn('skills') ? '全不选' : '全选' }}</button>
+          </div>
+          <div class="picker">
+            <div v-for="s in meta.skills" :key="s.name"
+                 class="pick" :class="{ on: draft.skills.includes(s.name) }">
+              <input type="checkbox" :id="'sk-'+s.name" :value="s.name" v-model="draft.skills">
+              <label :for="'sk-'+s.name">
+                <span class="name">{{ s.name }}</span>
+                <span class="desc" :title="s.description">{{ s.description }}</span>
+              </label>
+            </div>
+            <div v-if="!meta.skills.length" class="empty">.pi/skills/ 下还没有技能</div>
+          </div>
+        </div>
+
+        <div class="section">
+          <div class="section-head">
+            <span>工具 {{ draft.tools.length ? '· ' + draft.tools.length : '' }}</span>
+            <button @click="toggleAll('tools')">{{ allOn('tools') ? '全不选' : '全选' }}</button>
+          </div>
+          <div class="picker">
+            <div v-for="t in meta.tools" :key="t.name"
+                 class="pick" :class="{ on: draft.tools.includes(t.name) }">
+              <input type="checkbox" :id="'tl-'+t.name" :value="t.name" v-model="draft.tools">
+              <label :for="'tl-'+t.name">
+                <span class="name">{{ t.label }}</span>
+                <span class="desc" :title="t.description">{{ t.description }}</span>
+              </label>
+              <span v-if="t.source === 'extension'" class="tag">扩展</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="section">
+          <div class="section-head"><span>最近对话</span></div>
+          <div class="recent">
+            <div v-for="r in recent" :key="r.file" class="recent-item"
+                 :class="{ on: session && session.file === r.file }" @click="resume(r)">
+              <span class="t">{{ r.title || r.name }}</span>
+              <span class="s">{{ timeAgo(r.mtime) }}</span>
+            </div>
+            <div v-if="!recent.length" class="empty">还没有会话记录</div>
+          </div>
+        </div>
+      </div>
+    </aside>
+
+    <!-- ── 中间 ──────────────────────────────────────────────── -->
+    <div class="main">
+      <div class="topbar">
+        <span class="title">{{ session ? (session.title || '新会话') : 'pi' }}</span>
+        <span v-if="session" class="chip">{{ session.model }}</span>
+        <span v-if="session && session.thinking !== 'off'" class="chip">think {{ session.thinking }}</span>
+        <span v-if="totalCost" class="chip">¥{{ totalCost.toFixed(4) }}</span>
+        <span v-if="error" class="chip warn">{{ error }}</span>
+      </div>
+
+      <div class="chat" ref="chat">
+        <div class="chat-inner">
+          <div v-if="!turns.length" class="welcome">
+            <h2>开始一个新会话</h2>
+            <p>左侧勾选技能和工具，然后在下面输入你的任务</p>
+          </div>
+
+          <div v-for="(turn, ti) in turns" :key="ti" class="turn">
+            <!-- 用户输入 -->
+            <div class="msg-user">{{ turn.user }}</div>
+
+            <!-- 等待第一个 token -->
+            <div v-if="turn.phase === 'waiting'" class="waiting">
+              <span class="dots"><i></i><i></i><i></i></span>
+              <span class="shimmer">正在思考中…</span>
+            </div>
+
+            <!-- 思考：流式时最多 3 行，正文出现后折叠成胶囊 -->
+            <div v-if="turn.thinking && !turn.folded" class="msg-think"
+                 :class="{ clamp: !turn.thinkOpen }">{{ turn.thinkOpen ? turn.thinking : tail(turn.thinking, 3) }}</div>
+
+            <!-- 工具：流式时最多 3 条，正文出现后折叠 -->
+            <div v-if="turn.tools.length && !turn.folded" class="tools">
+              <template v-for="tool in visibleTools(turn)" :key="tool.id">
+                <div class="tool">
+                  <span class="ico" :class="tool.state">{{ toolIcon(tool) }}</span>
+                  <span class="n">{{ tool.name }}</span>
+                  <span class="s" :title="tool.summary">{{ tool.preview || tool.summary }}</span>
+                </div>
+                <div v-if="tool.patch && turn.phase === 'done'" class="diff"
+                     v-html="renderDiff(tool.patch)"></div>
+              </template>
+            </div>
+
+            <!-- 折叠后的入口 -->
+            <div v-if="turn.folded && (turn.thinking || turn.tools.length)" class="folded">
+              <span v-if="turn.thinking" class="fold-chip" @click="unfold(turn, 'think')">
+                <span class="k">▸</span> 思考过程 · {{ lineCount(turn.thinking) }} 行
+              </span>
+              <span v-if="turn.tools.length" class="fold-chip" @click="unfold(turn, 'tools')">
+                <span class="k">▸</span> {{ turn.tools.length }} 个工具调用
+                <span v-if="failedTools(turn)" style="color:var(--err)">· {{ failedTools(turn) }} 失败</span>
+              </span>
+            </div>
+
+            <!-- 途中插入的消息 -->
+            <div v-for="(msg, mi) in turn.injected" :key="'inj-'+mi" class="msg-user inject">{{ msg }}</div>
+
+            <!-- 模型输出 -->
+            <div v-if="turn.text" class="msg-text" v-html="renderMarkdown(turn.text)"></div>
+            <span v-if="turn.phase === 'writing'" class="caret"></span>
+
+            <!-- 本轮统计 -->
+            <div v-if="turn.phase === 'done'" class="meta">
+              <span>⏱ <span class="v">{{ turn.elapsed.toFixed(1) }}s</span></span>
+              <span>↑ <span class="v">{{ turn.usage.input || 0 }}</span></span>
+              <span>↓ <span class="v">{{ turn.usage.output || 0 }}</span></span>
+              <span v-if="turn.usage.cacheRead">⚡ <span class="v">{{ turn.usage.cacheRead }}</span></span>
+              <span v-if="turn.usage.cost">¥<span class="v">{{ turn.usage.cost.toFixed(5) }}</span></span>
+              <span v-if="turn.tools.length">🔧 <span class="v">{{ turn.tools.length }}</span></span>
+              <span v-if="turn.error" class="err">✗ {{ turn.error }}</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="composer">
+        <div class="composer-inner">
+          <textarea ref="input" v-model="text" :placeholder="busy ? '模型正在回答…' : '描述你的任务，Enter 发送'"
+                    rows="1" @input="autoGrow" @keydown="onKey"></textarea>
+          <button v-if="busy" class="send stop" @click="abort">停止</button>
+          <button v-else class="send" :disabled="!text.trim()" @click="send">发送</button>
+        </div>
+        <div class="hint">Enter 发送 · Shift+Enter 换行{{ session ? '' : ' · 发送时会自动新建会话' }}</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const { createApp, ref, reactive, computed, nextTick, onMounted } = Vue;
+
+const LEVELS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
+const api = async (method, url, body) => {
+  const res = await fetch(url, {
+    method,
+    headers: body ? { 'Content-Type': 'application/json' } : {},
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (!res.ok) {
+    const detail = await res.json().catch(() => ({}));
+    throw new Error(detail.detail || `HTTP ${res.status}`);
+  }
+  return res.json();
+};
+const escapeHtml = (s) => s.replace(/[&<>"']/g, (c) =>
+  ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+createApp({
+  setup() {
+    const meta = reactive({ cwd: '', models: [], tools: [], skills: [] });
+    const draft = reactive({ model: '', thinking: 'off', tools: [], skills: [] });
+    const recent = ref([]);
+    const session = ref(null);
+    const turns = ref([]);
+    const text = ref('');
+    const busy = ref(false);
+    const error = ref('');
+    const chat = ref(null);
+    const input = ref(null);
+    let source = null;
+
+    const availableModels = computed(() => meta.models.filter((m) => m.available));
+    const totalCost = computed(() => turns.value.reduce((a, t) => a + (t.usage.cost || 0), 0));
+    const current = () => turns.value[turns.value.length - 1];
+
+    // ── 视图工具 ────────────────────────────────────────────
+    const tail = (s, n) => s.split('\n').slice(-n).join('\n');
+    const lineCount = (s) => s.split('\n').filter((l) => l.trim()).length;
+    const visibleTools = (turn) =>
+      turn.toolsOpen || turn.phase === 'done' ? turn.tools : turn.tools.slice(-3);
+    const failedTools = (turn) => turn.tools.filter((t) => t.state === 'bad').length;
+    const toolIcon = (t) => (t.state === 'run' ? '◐' : t.state === 'ok' ? '✓' : '✗');
+    const unfold = (turn, what) => {
+      turn.folded = false;
+      if (what === 'think') turn.thinkOpen = true;
+      else turn.toolsOpen = true;
+    };
+    const timeAgo = (ts) => {
+      const d = Date.now() / 1000 - ts;
+      if (d < 60) return '刚刚';
+      if (d < 3600) return `${Math.floor(d / 60)} 分钟前`;
+      if (d < 86400) return `${Math.floor(d / 3600)} 小时前`;
+      return `${Math.floor(d / 86400)} 天前`;
+    };
+
+    // 极简 markdown：先转义再渲染，绝不 innerHTML 原始文本
+    const renderMarkdown = (src) => {
+      let html = escapeHtml(src);
+      html = html.replace(/```(\w*)\n([\s\S]*?)```/g,
+        (_, lang, code) => `<pre><code>${code.replace(/\n$/, '')}</code></pre>`);
+      html = html.replace(/`([^`\n]+)`/g, '<code>$1</code>');
+      html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+      const blocks = html.split(/\n{2,}/).map((block) => {
+        if (block.startsWith('<pre>')) return block;
+        if (/^#{1,6}\s/.test(block)) return `<h3>${block.replace(/^#{1,6}\s*/, '')}</h3>`;
+        if (/^\s*[-*]\s/m.test(block)) {
+          const items = block.split('\n').filter((l) => l.trim())
+            .map((l) => `<li>${l.replace(/^\s*[-*]\s*/, '')}</li>`).join('');
+          return `<ul>${items}</ul>`;
+        }
+        return `<p>${block.replace(/\n/g, '<br>')}</p>`;
+      });
+      return blocks.join('');
+    };
+
+    const renderDiff = (patch) => escapeHtml(patch).split('\n').map((line) => {
+      if (line.startsWith('+++') || line.startsWith('---')) return `<div class="c">${line}</div>`;
+      if (line.startsWith('@@')) return `<div class="h">${line}</div>`;
+      if (line.startsWith('+')) return `<div class="p">${line}</div>`;
+      if (line.startsWith('-')) return `<div class="m">${line}</div>`;
+      return `<div class="c">${line}</div>`;
+    }).join('');
+
+    const scrollDown = () => nextTick(() => {
+      const el = chat.value;
+      if (el) el.scrollTop = el.scrollHeight;
+    });
+
+    // ── 事件流 ──────────────────────────────────────────────
+    const listen = (id) => {
+      if (source) source.close();
+      source = new EventSource(`/api/sessions/${id}/events?replay=false`);
+      source.onmessage = (e) => handle(JSON.parse(e.data));
+      source.onerror = () => { /* EventSource 自己会重连 */ };
+    };
+
+    const handle = (frame) => {
+      const turn = current();
+      switch (frame.type) {
+        case 'turn_start':
+          if (turn) turn.phase = turn.phase === 'done' ? 'waiting' : turn.phase;
+          break;
+        case 'thinking_delta':
+          if (!turn) return;
+          turn.thinking += frame.text;
+          turn.phase = 'thinking';
+          break;
+        case 'text_start':
+          // 正文开始 = 过程结束，把思考和工具折叠起来，让注意力回到结论
+          if (turn) { turn.folded = true; turn.phase = 'writing'; }
+          break;
+        case 'text_delta':
+          if (!turn) return;
+          turn.text += frame.text;
+          turn.phase = 'writing';
+          break;
+        case 'tool_start':
+          if (!turn) return;
+          turn.tools.push({ ...frame, state: 'run', preview: '' });
+          if (turn.phase === 'waiting' || turn.phase === 'thinking') turn.phase = 'tools';
+          break;
+        case 'tool_update': {
+          const t = turn && turn.tools.find((x) => x.id === frame.id);
+          if (t) t.preview = frame.preview.split('\n').slice(-1)[0];
+          break;
+        }
+        case 'tool_end': {
+          const t = turn && turn.tools.find((x) => x.id === frame.id);
+          if (t) {
+            t.state = frame.ok ? 'ok' : 'bad';
+            t.preview = (frame.preview || '').split('\n')[0];
+            t.patch = frame.patch;
+          }
+          break;
+        }
+        case 'injected':
+          // 用户在模型运行途中插入的消息（steering / follow-up）
+          if (turn) turn.injected.push(frame.text);
+          break;
+        case 'message_end':
+          if (!turn) return;
+          turn.usage = frame.usage || {};
+          turn.elapsed = frame.elapsed || 0;
+          if (frame.error) turn.error = frame.error;
+          break;
+        case 'done':
+          if (turn) { turn.phase = 'done'; turn.folded = true; turn.elapsed = frame.elapsed || turn.elapsed; }
+          busy.value = false;
+          refreshRecent();
+          break;
+        case 'aborted':
+          if (turn) { turn.phase = 'done'; turn.error = '已中断'; }
+          busy.value = false;
+          break;
+        case 'error':
+          if (turn) { turn.phase = 'done'; turn.error = frame.message; }
+          busy.value = false;
+          break;
+      }
+      scrollDown();
+    };
+
+    // ── 动作 ────────────────────────────────────────────────
+    const ensureSession = async () => {
+      if (session.value) return session.value;
+      const created = await api('POST', '/api/sessions', {
+        model: draft.model || null,
+        thinking: draft.thinking,
+        tools: draft.tools.length ? draft.tools : null,
+        skills: draft.skills,
+      });
+      session.value = created;
+      listen(created.id);
+      return created;
+    };
+
+    const send = async () => {
+      const content = text.value.trim();
+      if (!content || busy.value) return;
+      error.value = '';
+      try {
+        const s = await ensureSession();
+        turns.value.push({
+          user: content, thinking: '', text: '', tools: [], usage: {}, elapsed: 0,
+          phase: 'waiting', folded: false, thinkOpen: false, toolsOpen: false,
+          error: '', injected: [],
+        });
+        text.value = '';
+        if (input.value) input.value.style.height = 'auto';
+        busy.value = true;
+        scrollDown();
+        await api('POST', `/api/sessions/${s.id}/prompt`, { text: content });
+      } catch (e) {
+        error.value = e.message;
+        busy.value = false;
+      }
+    };
+
+    const abort = async () => {
+      if (session.value) await api('POST', `/api/sessions/${session.value.id}/abort`).catch(() => {});
+    };
+
+    const newSession = () => {
+      if (source) source.close();
+      session.value = null;
+      turns.value = [];
+      error.value = '';
+      busy.value = false;
+      if (input.value) input.value.focus();
+    };
+
+    const resume = async (item) => {
+      try {
+        newSession();
+        const created = await api('POST', '/api/sessions', {
+          model: draft.model || null, thinking: draft.thinking,
+          tools: draft.tools.length ? draft.tools : null,
+          skills: draft.skills, resume: item.file,
+        });
+        session.value = created;
+        listen(created.id);
+        const { messages } = await api('GET', `/api/sessions/${created.id}/messages`);
+        // 历史只重建 user/assistant 的骨架，过程细节不回放
+        let turn = null;
+        for (const m of messages) {
+          if (m.role === 'user') {
+            turn = { user: m.text, thinking: '', text: '', tools: [], usage: {}, elapsed: 0,
+                     phase: 'done', folded: true, thinkOpen: false, toolsOpen: false,
+                     error: '', injected: [] };
+            turns.value.push(turn);
+          } else if (m.role === 'assistant' && turn) {
+            turn.text = m.text;
+          }
+        }
+        scrollDown();
+      } catch (e) {
+        error.value = e.message;
+      }
+    };
+
+    const refreshRecent = async () => {
+      try { recent.value = (await api('GET', '/api/sessions')).recent; } catch (e) { /* 忽略 */ }
+    };
+
+    const toggleAll = (kind) => {
+      const all = kind === 'tools' ? meta.tools.map((t) => t.name) : meta.skills.map((s) => s.name);
+      draft[kind] = allOn(kind) ? [] : all;
+    };
+    const allOn = (kind) => {
+      const all = kind === 'tools' ? meta.tools : meta.skills;
+      return all.length > 0 && draft[kind].length === all.length;
+    };
+
+    const autoGrow = (e) => {
+      e.target.style.height = 'auto';
+      e.target.style.height = Math.min(e.target.scrollHeight, 190) + 'px';
+    };
+    const onKey = (e) => {
+      if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); }
+    };
+
+    onMounted(async () => {
+      try {
+        const info = await api('GET', '/api/meta');
+        Object.assign(meta, info);
+        draft.tools = info.tools.filter((t) => t.default).map((t) => t.name);
+        draft.skills = info.skills.map((s) => s.name);
+        const first = info.models.find((m) => m.available);
+        if (first) draft.model = first.key;
+        if (info.diagnostics && info.diagnostics.length) error.value = info.diagnostics[0];
+      } catch (e) {
+        error.value = '无法连接后端：' + e.message;
+      }
+      refreshRecent();
+      if (input.value) input.value.focus();
+    });
+
+    return {
+      meta, draft, recent, session, turns, text, busy, error, chat, input,
+      levels: LEVELS, availableModels, totalCost,
+      send, abort, newSession, resume, toggleAll, allOn, autoGrow, onKey,
+      tail, lineCount, visibleTools, failedTools, toolIcon, unfold, timeAgo,
+      renderMarkdown, renderDiff,
+    };
+  },
+}).mount('#app');
+</script>
+</body>
+</html>

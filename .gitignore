@@ -1,0 +1,31 @@
+# 环境变量配置文件
+.env
+.env.local
+.env.development
+.env.production
+.env.test
+
+# 日志文件
+*.log
+logs/
+/build
+
+# 依赖目录
+node_modules/
+venv/
+__pycache__/
+*.pyc
+.venv-build/
+packages/pi-server/pi_server.egg-info
+packages/pi-web/node_modules
+README_server_web.md
+
+# IDE缓存
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 系统文件
+.DS_Store
+Thumbs.db

@@ -1,0 +1,26 @@
+[project]
+name = "pi-server"
+version = "0.1.0"
+description = "Top layer: HTTP + SSE API for the coding agent"
+requires-python = ">=3.10"
+dependencies = [
+    "pi-coding-agent>=0.1.0",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "pydantic>=2.6",
+]
+
+[project.scripts]
+pi-web = "pi_server.app:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+# 用 setuptools 而不是 hatchling：不用额外安装构建后端，
+# 大多数环境里 pip 自带就能用。
+[tool.setuptools]
+packages = ["pi_server"]
+
+[tool.setuptools.package-data]
+pi_server = ["static/*", "web/*", "web/assets/*"]

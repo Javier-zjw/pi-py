@@ -1,0 +1,20 @@
+[project]
+name = "pi-py"
+version = "0.1.0"
+description = "A layered Python port of the pi agent harness: ai / agent / coding-agent"
+requires-python = ">=3.10"
+
+[tool.uv.workspace]
+members = ["packages/*"]
+
+[tool.uv.sources]
+pi-ai = { workspace = true }
+pi-agent = { workspace = true }
+pi-coding-agent = { workspace = true }
+
+[dependency-groups]
+dev = ["import-linter>=2.0", "pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.6"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

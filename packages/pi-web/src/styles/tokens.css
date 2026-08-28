@@ -1,0 +1,61 @@
+/* 设计令牌。和 pi-tui 一个思路：一个强调色 + 灰阶层次，
+   靠字号、间距、亮度分层，不靠堆颜色。深浅两套主题跟随系统。 */
+:root {
+  --bg: #faf9f7;
+  --panel: #f3f1ed;
+  --surface: #ffffff;
+  --line: #e7e3dc;
+  --line-soft: #efece6;
+  --text: #2b2a26;
+  --text-2: #55524b;
+  --muted: #8e8a81;
+  --accent: #4a6cb3;
+  --accent-bg: #edf1f9;
+  --think: #7d78a8;
+  --think-bg: #f5f4f9;
+  --ok: #4f8a56;
+  --err: #b4544e;
+  --radius: 10px;
+  --radius-sm: 7px;
+  --shadow: 0 1px 2px rgba(40, 38, 33, 0.05), 0 4px 14px rgba(40, 38, 33, 0.045);
+  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+    "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1c1b19; --panel: #232220; --surface: #26251f; --line: #35332e;
+    --line-soft: #2e2c28; --text: #e8e5df; --text-2: #c2beb5; --muted: #8d887e;
+    --accent: #8fabe0; --accent-bg: #252934; --think: #a49fce; --think-bg: #26242e;
+    --ok: #7cb383; --err: #d98079;
+    --shadow: 0 1px 2px rgba(0,0,0,.3), 0 4px 14px rgba(0,0,0,.2);
+  }
+}
+* { box-sizing: border-box; }
+html, body, #app { height: 100%; margin: 0; }
+body {
+  font-family: var(--font); background: var(--bg); color: var(--text);
+  font-size: 15px; line-height: 1.6; -webkit-font-smoothing: antialiased;
+}
+button { font-family: inherit; cursor: pointer; }
+::-webkit-scrollbar { width: 9px; height: 9px; }
+::-webkit-scrollbar-thumb { background: var(--line); border-radius: 5px; }
+::-webkit-scrollbar-thumb:hover { background: var(--muted); }
+::-webkit-scrollbar-track { background: transparent; }
+
+/* 复用型小类 */
+.muted { color: var(--muted); }
+.mono { font-family: var(--mono); }
+.row { display: flex; align-items: center; gap: 8px; }
+.spacer { flex: 1; }
+.chip {
+  font-size: 11.5px; color: var(--muted); font-family: var(--mono);
+  padding: 3px 8px; border-radius: 20px; background: var(--panel); white-space: nowrap;
+}
+.field {
+  width: 100%; padding: 7px 9px; font-size: 13px; font-family: inherit;
+  border: 1px solid var(--line); border-radius: var(--radius-sm);
+  background: var(--surface); color: var(--text); cursor: pointer;
+}
+.field:focus { outline: none; border-color: var(--accent); }
+.empty { font-size: 12.5px; color: var(--muted); padding: 10px 9px; }

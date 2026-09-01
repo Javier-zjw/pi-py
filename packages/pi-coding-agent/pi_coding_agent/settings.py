@@ -20,6 +20,7 @@ DEFAULT_SETTINGS : dict[str, Any] = {
     "compaction": {"enabled": True, "threshold": 0.85, "keepLastTurns": 4},
     "retry": {"enabled": True, "maxRetries": 3},
     "extensions": [],
+    "disabledExtensions": [],
     "skills": {"enabled": True}
 }
 

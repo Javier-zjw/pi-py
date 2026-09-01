@@ -148,8 +148,9 @@ class EventTranslator:
         ]
 
     def _on_tool_execution_end(self, event) -> list[dict]:
-        details = getattr(event.result, "details", None)
-        patch = details.get("patch") if isinstance(details, dict) else None
+        details = getattr(event.result, "details", None) or {}
+        if not isinstance(details, dict):
+            details = {}
         return [
             {
                 "type": "tool_end",
@@ -157,7 +158,9 @@ class EventTranslator:
                 "name": event.tool_name,
                 "ok": not event.is_error,
                 "preview": preview_of(event.result),
-                "patch": patch,
+                "patch": details.get("patch"),
+                # 计划模式：前端据此在输入框上方显示"执行计划"入口
+                "plan": details.get("plan"),
             }
         ]
 

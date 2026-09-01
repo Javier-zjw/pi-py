@@ -19,6 +19,7 @@ __pycache__/
 packages/pi-server/pi_server.egg-info
 packages/pi-web/node_modules
 README_server_web.md
+SUMMARY.md
 
 # IDE缓存
 .idea/

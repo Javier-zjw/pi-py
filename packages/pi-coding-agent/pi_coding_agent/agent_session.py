@@ -114,6 +114,10 @@ class AgentSession:
         self._listeners: list[Callable[[AgentEvent], None]] = []
         self._persisted: set[int] = set()
         self._compacting = False
+        # 当前工作模式。核心不解释它的含义，具体行为由扩展的 Mode.apply 决定
+        self.mode: str = "chat"
+        self._base_system_prompt = state.system_prompt or ""
+        self._base_tools = list(active_tools)
         self.agent.subscribe(self._on_agent_event)
         self.resources.get_extension_api().session = self
 
@@ -154,6 +158,7 @@ class AgentSession:
 
     async def _transform_context(self, messages: list[AgentMessage]) -> list[AgentMessage]:
         """自动上下文压缩钩子，由Agent主循环在每次调用LLM之前触发"""
+        messages = await self.resources.get_extension_api().run_context_hook(messages)
         if self._compacting or not self.settings.get("compaction.enabled", True):
             return messages
         model = self.agent.state.model
@@ -209,6 +214,28 @@ class AgentSession:
 
         return text
 
+    async def set_mode(self, mode: str) -> str:
+        """切换工作模式。写进会话记录，恢复时能还原"""
+        self.mode = mode
+        self.session.append_custom_entry("mode_change", {"mode": mode})
+        return self.mode
+
+    def available_modes(self) -> list[Any]:
+        api = self.resources.get_extension_api()
+        return list(api.modes.values())
+
+    async def _apply_mode(self) -> None:
+        """
+        每轮开始前把模式效果落到 state 上
+        每次都从基线重建，而不是在上一轮的结果上叠加——否则来回切几次模式
+        系统提示会越滚越长，工具集也会残留。
+        """
+        self.agent.state.system_prompt = self._base_system_prompt
+        self.agent.set_tools(list(self._base_tools))
+        mode = self.resources.get_extension_api().modes.get(self.mode)
+        if mode is not None and mode.apply is not None:
+            await mode.apply(self)
+
     async def prompt(
             self,
             text: str,
@@ -217,7 +244,23 @@ class AgentSession:
     ) -> list[AgentMessage]:
         if expand_prompt_templates:
             text = self.expand_prompt_template(text)
+        await self._apply_mode()
+        errors = await self.resources.get_extension_api().run_before_start(self)
+        for note in errors:
+            self.services.diagnostics.append(f"before_agent_start 失败：{note}")
         return await self.agent.prompt(text, images)
+
+    async def run_command(self, name: str, rest: str = "") -> str | None:
+        """执行扩展注册的斜杠命令,终端和网页共用这一条路径"""
+        command = self.resources.get_extension_api().commands.get(name)
+        if command is None:
+            raise KeyError(name)
+        return await command.handler(rest)
+
+    def set_base_tools(self, tools: Iterable[AgentTool]) -> None:
+        """更新工具基线,模式会在这个基线上做增减"""
+        self._base_tools = list(tools)
+        self.agent.set_tools(list(self._base_tools))
 
     def steer(self, text: str) -> None:
         self.agent.steer(text)

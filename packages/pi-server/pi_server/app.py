@@ -56,6 +56,11 @@ class ToolsRequest(BaseModel):
     skills: list[str] | None = None
 
 
+class CommandRequest(BaseModel):
+    name: str
+    rest: str = ""
+
+
 def create_app(cwd: str | Path = ".", agent_dir: str | Path | None = None) -> FastAPI:
     registry = SessionRegistry(cwd=cwd, agent_dir=agent_dir)
     app = FastAPI(title="pi web", version="0.1.0")
@@ -85,7 +90,21 @@ def create_app(cwd: str | Path = ".", agent_dir: str | Path | None = None) -> Fa
             "tools": registry.list_tools(target),
             "skills": registry.list_skills(target),
             "diagnostics": registry.services_for(target).diagnostics,
+            "extensions": registry.list_extensions(target),
+            "modes": registry.list_modes(target),
+            "commands": registry.list_commands(target),
         }
+
+    # -- 扩展 ------------------------------------------------------ #
+
+    @app.get("/api/extensions")
+    def extensions(cwd: str | None = None) -> dict[str, Any]:
+        return {"extensions": registry.list_extensions(cwd)}
+
+    @app.post("/api/extensions/{key}")
+    def toggle_extension(key: str, enabled: bool = Body(..., embed=True),
+                         cwd: str | None = None) -> dict[str, Any]:
+        return {"extensions": registry.toggle_extension(key, enabled, cwd)}
 
     # -- 工作目录 -------------------------------------------------- #
 
@@ -167,7 +186,40 @@ def create_app(cwd: str | Path = ".", agent_dir: str | Path | None = None) -> Fa
     async def compact(session_id: str) -> dict[str, Any]:
         live = require(session_id)
         result = await live.session.compact()
+        if result:
+            # 关键：告诉前端"上下文已经重置"，否则页面上的占用还按旧的累计
+            live.publish({
+                "type": "compacted",
+                "tokensBefore": result.tokens_before,
+                "summary": result.summary[:200],
+            })
         return {"ok": bool(result), "tokensBefore": result.tokens_before if result else 0}
+
+    # -- 模式与命令 ------------------------------------------------ #
+
+    @app.post("/api/sessions/{session_id}/mode")
+    async def set_mode(session_id: str, mode: str = Body(..., embed=True)) -> dict[str, Any]:
+        live = require(session_id)
+        available = {m["id"] for m in registry.list_modes(live.session.cwd)}
+        if mode not in available:
+            raise HTTPException(404, f"未知模式 {mode}")
+        await live.session.set_mode(mode)
+        live.publish({"type": "mode", "mode": mode})
+        return registry.snapshot(live)
+
+    @app.post("/api/sessions/{session_id}/command")
+    async def run_command(session_id: str, body: CommandRequest = Body(...)) -> dict[str, Any]:
+        """执行斜杠命令。和终端走同一条路径，行为一致。"""
+        live = require(session_id)
+        try:
+            output = await live.session.run_command(body.name, body.rest)
+        except KeyError:
+            raise HTTPException(404, f"未知命令 /{body.name}") from None
+        except Exception as exc:
+            raise HTTPException(500, f"{type(exc).__name__}: {exc}") from exc
+        if output:
+            live.publish({"type": "notice", "text": output})
+        return {"ok": True, "output": output, "mode": live.session.mode}
 
     @app.post("/api/sessions/{session_id}/model")
     def set_model(session_id: str, spec: str = Body(..., embed=True)) -> dict[str, Any]:

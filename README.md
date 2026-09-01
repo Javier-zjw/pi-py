@@ -20,9 +20,9 @@ uv sync                      # workspace install, all packages editable
 pip install -e packages/pi-ai
 pip install -e packages/pi-agent
 pip install -e packages/pi-coding-agent
-pip install -e packages/pi-app
 pip install -e packages/pi-tui
-pip install -e packages/pi-sever
+pip install -e packages/pi-app
+pip install -e packages/pi-server
 ```
 
 ## Configure Models
@@ -81,7 +81,7 @@ pi-tui
 web
 ```bash
 # Terminal 1: Backend pi‑web‑server
-pi-web-server            # 或 python -m pi_server.app
+pi-web            # 或 python -m pi_server.app
 # Default: http://127.0.0.1:8848
 
 # Terminal 2: Frontend

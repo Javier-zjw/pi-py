@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterable
 from pi_ai import ImageContent, Model, TextContent, ThinkingLevel, UserMessage
 
 from .loop import LoopConfig, default_convert_to_llm, run_agent_loop
@@ -89,7 +89,7 @@ class Agent:
     def set_thinking_level(self, level: ThinkingLevel) -> None:
         self.state.thinking_level = level
 
-    def set_tools(self, tools: Iterator[AgentTool]) -> None:
+    def set_tools(self, tools: Iterable[AgentTool]) -> None:
         self.state.tools = list(tools)
 
     def add_tool(self, tool: AgentTool) -> None:
@@ -118,7 +118,7 @@ class Agent:
     @staticmethod
     def user_message(
             text: str,
-            images: Iterator[ImageContent] | None = None
+            images: Iterable[ImageContent] | None = None
     ) -> UserMessage:
         images = list(images or [])
         if not images:
@@ -131,7 +131,7 @@ class Agent:
     async def prompt(
             self,
             text: str | AgentMessage,
-            images: Iterator[ImageContent] | None = None
+            images: Iterable[ImageContent] | None = None
     ) -> list[AgentMessage]:
         """
         发送一条消息并执行至整轮流程完成。
@@ -160,12 +160,12 @@ class Agent:
         self._emit(MessageStartEvent(message=message))
         self._emit(MessageEndEvent(message=message))
 
-    def steer(self, text: str | AgentMessage, images: Iterator[ImageContent] | None = None) -> None:
+    def steer(self, text: str | AgentMessage, images: Iterable[ImageContent] | None = None) -> None:
         """等待当前轮次所有工具调用完成后再推送"""
         message = text if not isinstance(text, str) else self.user_message(text, images)
         self.steering_queue.push(message)
 
-    def follow_up(self, text: str | AgentMessage, images: Iterator[ImageContent] | None = None) -> None:
+    def follow_up(self, text: str | AgentMessage, images: Iterable[ImageContent] | None = None) -> None:
         """当智能体即将终止运行时，才进行消息推送"""
         message = text if not isinstance(text, str) else self.user_message(text, images)
         self.follower_queue.push(message)

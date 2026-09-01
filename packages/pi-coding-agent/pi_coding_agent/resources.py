@@ -33,7 +33,8 @@ class DefaultResourceLoader:
             system_prompt_override: Callable[[], str] | None = None,
             additional_extension_paths: list[str | Path] | None = None,
             extension_factories: list[Callable[[ExtensionAPI], None]] | None = None,
-            event_bus: EventBus | None = None
+            event_bus: EventBus | None = None,
+            disabled_extensions: set[str] | None = None
     ) -> None:
         self.cwd = Path(cwd).expanduser().resolve()
         self.agent_dir = Path(agent_dir or DEFAULT_AGENT_DIR).expanduser()
@@ -41,6 +42,7 @@ class DefaultResourceLoader:
         self.additional_extension_paths = [Path(p) for p in (additional_extension_paths or [])]
         self.extension_factories = extension_factories or []
         self.events = event_bus or create_event_bus()
+        self.disabled_extensions = set(disabled_extensions or ())
 
         self.api = ExtensionAPI(cwd=str(self.cwd), events=self.events)
         self._extensions: list[LoadedExtension] = []
@@ -69,8 +71,12 @@ class DefaultResourceLoader:
 
         self._context_files = find_context_files(self.cwd, self.agent_dir)
 
-        directories = [self.agent_dir / "extensions", self.cwd / CONFIG_DIR_NAME / "extensions"]
-        self._extensions = load_extensions(directories, self.api)
+        directories = [
+            Path(__file__).parent / "builtin_extensions",
+            self.agent_dir / "extensions",
+            self.cwd / CONFIG_DIR_NAME / "extensions"
+        ]
+        self._extensions = load_extensions(directories, self.api, self.disabled_extensions)
         for path in self.additional_extension_paths:
             from .extensions import load_extension_file
 
@@ -88,6 +94,11 @@ class DefaultResourceLoader:
 
     def get_extensions(self) -> list[LoadedExtension]:
         return list(self._extensions)
+
+    def set_disabled(self, names: set[str]) -> None:
+        """改变禁用名单并重新加载。调用方负责之后重建会话的工具集"""
+        self.disabled_extensions = set(names)
+        self.reload()
 
     def get_extension_api(self) -> ExtensionAPI:
         return self.api

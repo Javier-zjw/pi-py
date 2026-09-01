@@ -129,6 +129,60 @@ class SessionRegistry:
             )
         return out
 
+    def list_extensions(self, cwd: str | None = None) -> list[dict]:
+        services = self.services_for(cwd)
+        disabled = set(services.settings.get("disabledExtensions") or [])
+        out = []
+        for e in services.resources.get_extensions():
+            key = Path(e.path).stem if e.path else e.name
+            out.append({
+                "key": key,
+                "name": e.name,
+                "description": e.description,
+                "path": e.path,
+                "error": e.error,
+                "enabled": key not in disabled and e.enabled,
+                "registered": e.registered,
+                "builtin": bool(e.path and "builtin_extensions" in str(e.path)),
+            })
+        return out
+
+    def toggle_extension(self, key: str, enabled: bool, cwd: str | None = None) -> list[dict]:
+        """启用/停用扩展。写进设置并重新加载，活跃会话的工具集一起重建。"""
+        services = self.services_for(cwd)
+        disabled = set(services.settings.get("disabledExtensions") or [])
+        disabled.discard(key) if enabled else disabled.add(key)
+        services.settings.set("disabledExtensions", sorted(disabled))
+        services.settings.flush()
+        services.resources.set_disabled(disabled)
+
+        # 已经跑起来的会话也要跟着变，否则要等新建会话才生效
+        for live in self._sessions.values():
+            if live.session.cwd == (cwd or self.cwd):
+                self.update_tools(live, [t.name for t in live.session.agent.state.tools])
+        return self.list_extensions(cwd)
+
+    def list_modes(self, cwd: str | None = None) -> list[dict]:
+        api = self.services_for(cwd).resources.get_extension_api()
+        return [
+            {"id": m.id, "label": m.label, "description": m.description, "badge": m.badge}
+            for m in api.modes.values()
+        ]
+
+    def list_commands(self, cwd: str | None = None) -> list[dict]:
+        services = self.services_for(cwd)
+        api = services.resources.get_extension_api()
+        out = [
+            {"name": c.name, "description": c.description, "usage": c.usage, "source": "extension"}
+            for c in api.commands.values()
+        ]
+        out += [
+            {"name": p.name, "description": p.description, "usage": f"/{p.name} [参数]",
+             "source": "prompt"}
+            for p in services.resources.get_prompts()
+        ]
+        return sorted(out, key=lambda c: c["name"])
+
     def list_skills(self, cwd: str | None = None) -> list[dict]:
         return [
             {

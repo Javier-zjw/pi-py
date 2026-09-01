@@ -31,6 +31,14 @@ export const api = {
   setThinking: (id, level) => request("POST", `/api/sessions/${id}/thinking`, { level }),
   setTools: (id, tools, skills) =>
     request("POST", `/api/sessions/${id}/tools`, { tools, skills }),
+  setMode: (id, mode) => request("POST", `/api/sessions/${id}/mode`, { mode }),
+  runCommand: (id, name, rest = "") =>
+    request("POST", `/api/sessions/${id}/command`, { name, rest }),
+
+  extensions: (cwd) =>
+    request("GET", `/api/extensions${cwd ? `?cwd=${encodeURIComponent(cwd)}` : ""}`),
+  toggleExtension: (key, enabled) =>
+    request("POST", `/api/extensions/${encodeURIComponent(key)}`, { enabled }),
 
   history: (limit = 30, cwd) =>
     request("GET", `/api/history?limit=${limit}${cwd ? `&cwd=${encodeURIComponent(cwd)}` : ""}`),

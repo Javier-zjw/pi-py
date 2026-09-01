@@ -7,11 +7,19 @@ import TurnBlock from "./components/TurnBlock.vue";
 import Composer from "./components/Composer.vue";
 import FileViewer from "./components/FileViewer.vue";
 
-const meta = reactive({ cwd: "", models: [], tools: [], skills: [], diagnostics: [] });
+const meta = reactive({
+  cwd: "", models: [], tools: [], skills: [], diagnostics: [],
+  extensions: [], modes: [], commands: [],
+});
 const draft = reactive({ model: "", thinking: "off", tools: [], skills: [] });
 
 const history = ref([]);
 const workspaces = ref([]);
+const mode = ref("chat");
+const plan = ref(null);
+const notices = ref([]);
+// 压缩之后，之前那些轮次的用量不再代表当前上下文占用
+const contextBase = ref(0);
 const files = ref(null);
 const openFile = ref(null);
 const session = ref(null);
@@ -25,8 +33,9 @@ const totalCost = computed(() =>
   turns.value.reduce((sum, t) => sum + (t.usage.cost || 0), 0)
 );
 const contextUsed = computed(() => {
-  // 优先取最后一轮上报的输入量——它就是"下一次请求要带多少上下文"
-  for (let i = turns.value.length - 1; i >= 0; i--) {
+  // 只看压缩检查点之后的轮次——压缩过的部分已经不在上下文里了，
+  // 继续用旧数字会让占用一直虚高
+  for (let i = turns.value.length - 1; i >= contextBase.value; i--) {
     const u = turns.value[i].usage;
     if (u && u.input) return u.input + (u.output || 0);
   }
@@ -135,9 +144,26 @@ function handle(frame) {
         t.state = frame.ok ? "ok" : "bad";
         t.preview = frame.preview || "";
         t.patch = frame.patch;
+        // 计划提交后在输入框上方显示执行入口
+        if (frame.name === "submit_plan" && frame.ok && frame.plan) plan.value = frame.plan;
       }
       break;
     }
+    case "compacted":
+      // 压缩完成：把基线挪到当前位置，之前的用量不再计入上下文占用
+      contextBase.value = turns.value.length;
+      turns.value.push({
+        ...newTurn(""), phase: "done", folded: true,
+        text: `（上下文已压缩，压缩前 ${frame.tokensBefore} tokens）\n\n${frame.summary}`,
+      });
+      break;
+    case "mode":
+      mode.value = frame.mode;
+      break;
+    case "notice":
+      notices.value.push(frame.text);
+      turns.value.push({ ...newTurn(""), phase: "done", folded: true, text: frame.text });
+      break;
     case "injected":
       if (turn) turn.injected.push(frame.text);
       break;
@@ -178,6 +204,7 @@ async function ensureSession() {
     skills: draft.skills,
     cwd: meta.cwd,
   });
+  if (mode.value !== "chat") await api.setMode(created.id, mode.value).catch(() => {});
   session.value = created;
   unsubscribe = subscribe(created.id, handle);
   return created;
@@ -198,6 +225,47 @@ async function send(text) {
   }
 }
 
+async function switchMode(id) {
+  mode.value = id;
+  if (!session.value) return;      // 还没会话，等新建时带上
+  try {
+    const snapshot = await api.setMode(session.value.id, id);
+    session.value = { ...session.value, ...snapshot };
+  } catch (e) {
+    error.value = e.message;
+  }
+}
+
+async function runCommand(name, rest) {
+  try {
+    const s = await ensureSession();
+    const r = await api.runCommand(s.id, name, rest);
+    if (r.mode) mode.value = r.mode;
+  } catch (e) {
+    // 不是已知命令就当普通提问发出去，别让用户白打一遍
+    if (String(e.message).includes("未知命令")) {
+      await send(`/${name}${rest ? " " + rest : ""}`);
+    } else {
+      error.value = e.message;
+    }
+  }
+}
+
+async function buildPlan() {
+  await runCommand("build", "");
+  plan.value = null;
+}
+
+async function toggleExtension(key, enabled) {
+  try {
+    const r = await api.toggleExtension(key, enabled);
+    meta.extensions = r.extensions;
+    Object.assign(meta, await api.meta(meta.cwd));   // 工具/命令/模式都可能变了
+  } catch (e) {
+    error.value = e.message;
+  }
+}
+
 async function abort() {
   if (session.value) await api.abort(session.value.id).catch(() => {});
 }
@@ -210,6 +278,8 @@ function newSession() {
   error.value = "";
   busy.value = false;
   openFile.value = null;
+  plan.value = null;
+  contextBase.value = 0;
 }
 
 async function resume(item) {
@@ -333,6 +403,7 @@ onMounted(async () => {
       :workspaces="workspaces"
       @new="newSession" @resume="resume" @browse="browse" @open-file="showFile"
       @switch-workspace="switchWorkspace" @hide-history="hideHistory"
+      @toggle-extension="toggleExtension"
     />
 
     <div class="main">
@@ -342,6 +413,9 @@ onMounted(async () => {
         <span v-if="session && session.thinking !== 'off'" class="chip">
           think {{ session.thinking }}
         </span>
+        <span v-if="mode !== 'chat'" class="chip accent">{{
+          meta.modes.find((m) => m.id === mode)?.label || mode
+        }}</span>
         <span v-if="contextMax" class="meter" :title="`${contextUsed} / ${contextMax}`">
           <span class="bar"><i :style="{ width: contextPct + '%' }" /></span>
           <span class="chip">{{ contextPct.toFixed(0) }}%</span>
@@ -365,7 +439,12 @@ onMounted(async () => {
         </div>
       </div>
 
-      <Composer :busy="busy" :has-session="!!session" @send="send" @abort="abort" />
+      <Composer
+        :busy="busy" :has-session="!!session"
+        :modes="meta.modes" :mode="mode" :commands="meta.commands" :plan="plan"
+        @send="send" @abort="abort" @switch-mode="switchMode"
+        @run-command="runCommand" @build="buildPlan"
+      />
     </div>
 
     <FileViewer
@@ -397,6 +476,7 @@ onMounted(async () => {
   font-size: 14px; font-weight: 500; flex: 1; min-width: 0;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
+.topbar .accent { color: var(--accent); background: var(--accent-bg); }
 .topbar .warn { color: var(--err); max-width: 240px; overflow: hidden; text-overflow: ellipsis; }
 .ghost {
   border: 1px solid var(--line); background: transparent; color: var(--muted);

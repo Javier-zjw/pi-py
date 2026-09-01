@@ -1,5 +1,6 @@
 <script setup>
 import { computed, ref } from "vue";
+import PluginPanel from "./PluginPanel.vue";
 
 const props = defineProps({
   meta: { type: Object, required: true },
@@ -11,6 +12,7 @@ const props = defineProps({
 });
 const emit = defineEmits([
   "new", "resume", "browse", "open-file", "switch-workspace", "hide-history",
+  "toggle-extension",
 ]);
 
 const tab = ref("chat");
@@ -35,6 +37,7 @@ const TABS = [
   { id: "chat", label: "会话" },
   { id: "files", label: "文件" },
   { id: "config", label: "配置" },
+  { id: "plugins", label: "扩展" },
 ];
 
 const availableModels = computed(() => props.meta.models.filter((m) => m.available));
@@ -177,6 +180,14 @@ function timeAgo(ts) {
             <div v-if="!files?.entries?.length" class="empty">空目录</div>
           </div>
         </div>
+      </template>
+
+      <!-- 扩展 -->
+      <template v-else-if="tab === 'plugins'">
+        <PluginPanel
+          :extensions="meta.extensions || []"
+          @toggle="(key, enabled) => emit('toggle-extension', key, enabled)"
+        />
       </template>
 
       <!-- 模型 / 技能 / 工具 -->
@@ -344,7 +355,7 @@ function timeAgo(ts) {
 
 .tabs { display: flex; gap: 2px; padding: 0 14px 10px; }
 .tabs button {
-  flex: 1; padding: 6px 0; font-size: 12.5px; border: 0; border-radius: var(--radius-sm);
+  flex: 1; padding: 6px 0; font-size: 12px; border: 0; border-radius: var(--radius-sm);
   background: transparent; color: var(--muted);
 }
 .tabs button.on { background: var(--surface); color: var(--accent); font-weight: 500; }

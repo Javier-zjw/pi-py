@@ -16,7 +16,8 @@ import asyncio
 import math
 import sys
 import time
-from typing import Callable, TextIO
+from collections.abc import Callable
+from typing import TextIO
 
 from .theme import DEFAULT_THEME, Theme
 from .width import display_width, terminal_width
@@ -102,9 +103,12 @@ class LiveRegion:
             self._rows = rendered_rows(lines, terminal_width())
         self.stream.flush()
 
-    def append(self, lines: list[str]) -> None:
-        """在活动区上方插入永久内容，活动区保持在最下面。"""
-        saved = list(self._lines)
+    def append(self, lines: list[str], live: list[str] | None = None) -> None:
+        """在活动区上方插入永久内容，活动区保持在最下面。
+
+        ``live`` 给出插入后活动区的新内容；不给就重画原来的。流式内容一边定稿一边更新预览时要给，
+        否则会先把旧预览画一遍（刚定稿的那行在下面重复出现，直到下一次刷新）。"""
+        saved = list(self._lines) if live is None else list(live)
         self._erase()
         self._ensure_line_start()
         if lines:

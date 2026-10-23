@@ -29,6 +29,7 @@ from .input import (
     HAS_PROMPT_TOOLKIT, LineReader, SlashCommand, SlashCompleter, match_commands,
     missing_dependency_hint,
 )
+from .markdown import MarkdownStream, render_inline, render_markdown, wrap_ansi
 from .picker import PickerItem, PickerState, PickResult, pick
 from .live import LiveRegion, Spinner, StatusBar, Ticker, rendered_rows, TextStreamer
 from .theme import (
@@ -59,4 +60,5 @@ __all__ = [
     "tool_result", "truncate", "usage_line", "user_message", "wrap", "LineReader", "missing_dependency_hint",
     "Ticker", "answer_start", "TextStreamer", "SlashCommand", "SlashCompleter", "match_commands",
     "PickerItem", "PickerState", "PickResult", "pick",
+    "MarkdownStream", "render_inline", "render_markdown", "wrap_ansi",
 ]

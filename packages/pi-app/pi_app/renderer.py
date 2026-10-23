@@ -29,8 +29,11 @@
    这次调用以工具调用收尾 → 是过渡话，丢掉；没有工具调用 → 是回答，写出去。
    超过活动区行数的长文字直接当回答流式写出（过渡话不会这么长）。
 3. **本轮用时在最上面**：回答开始前写一行「✻ 用时 · 工具」，回答结束后一行 token 统计。
-4. **正文真流式**，经 TextStreamer 匀速吐字；以 ● 开头，续行缩进两格，首尾空行去掉。
-5. **输入框**上下各一条细线，线上不放模型、token 之类的文字。
+4. **回答按 Markdown 排版**（pi_tui.MarkdownStream，同 Codex 按整行提交）：一行源文本收齐才渲染成
+   终端行写进 scrollback，还在写的半行和没收齐的表格显示在活动区里，所以仍是实时的。
+   以 ● 开头，折行带悬挂缩进；首尾空行去掉，连续空行压成一个。
+5. **留白**：每次提问前空一行，用时行和回答之间空一行，一问一答之间不粘在一起。
+6. **输入框**上下各一条细线，线上不放模型、token 之类的文字。
 """
 
 from __future__ import annotations
@@ -45,9 +48,9 @@ from typing import Any, TextIO
 
 from pi_tui import (
     LiveRegion,
+    MarkdownStream,
     Spinner,
     StatusBar,
-    TextStreamer,
     Theme,
     Ticker,
     diff_block,
@@ -65,6 +68,7 @@ EXPAND_RESULT_LINES = 20
 ANSWER_MARK = "●"
 INDENT = "  "
 SLOT_LINES = 6        # 活动区里思考 / 过渡话最多显示几行（只显示最新的）
+PREVIEW_ROWS = 12     # 回答还没定稿的部分（半行、没收齐的表格）在活动区里最多显示几行
 
 
 def summarize_arguments(arguments: Any) -> str:
@@ -143,8 +147,7 @@ class RenderState:
     call_started: float = 0.0
     text: str = ""                  # 这次调用的正文，还不知道是不是最终回答
     answering: bool = False         # 已确定是最终回答，正在流式写进 scrollback
-    answer_hold: str = ""           # 回答末尾的空白先扣着，后面有字才写，免得段尾留空行
-    answer_body: bool = False       # 回答已经写出过非空白内容（开头的空行要去掉）
+    markdown: MarkdownStream | None = None   # 正在写的回答
     # 活动区当前显示什么："thinking" / "text" / "tools" / ""；后来的顶掉先来的
     slot: str = ""
     shown: str = ""                 # slot 为 thinking / text 时显示的文字
@@ -178,7 +181,8 @@ class SessionRenderer:
         self.status = StatusBar(theme=self.theme)
         self.spinner = Spinner(self.theme)
         self.ticker = Ticker(self._repaint, interval=0.1)
-        self.streamer = TextStreamer(self.live.stream_text)
+        # 最后写出的一行是不是空行：提问前补空行时用，避免连着两个空行
+        self._blank_tail = True
         self.state = RenderState()
         self.turn = TurnRecord()
         self.last_turn: TurnRecord | None = None
@@ -214,7 +218,8 @@ class SessionRenderer:
         """输入框提交后被擦掉（erase_when_done），用这一行把用户的话留在 scrollback 里"""
         t = self.theme
         lines = text.split("\n") or [""]
-        out = [f"{t.accent('❯', bold=True)} {t.bold(lines[0])}"]
+        out = [] if self._blank_tail else [""]      # 和上一问一答分开
+        out.append(f"{t.accent('❯', bold=True)} {t.bold(lines[0])}")
         out += [f"{INDENT}{t.bold(line)}" for line in lines[1:]]
         self._emit(out)
 
@@ -239,7 +244,6 @@ class SessionRenderer:
 
     def stop(self) -> None:
         self.ticker.stop()
-        self.streamer.stop()
         self.live.finalize()
 
     def expand_last_turn(self) -> None:
@@ -425,7 +429,6 @@ class SessionRenderer:
     # -- 压缩：同步进行，期间不执行任务，所以必须让用户看得到 ----------- #
 
     def _on_compaction_start(self, event) -> None:
-        self._flush()
         self.state.compaction_tail = ""
         self.ticker.start()
         reason = COMPACTION_REASONS.get(event.reason, event.reason)
@@ -441,7 +444,6 @@ class SessionRenderer:
         t = self.theme
         if not self.agent_running:
             self.ticker.stop()
-        self._flush()
         self.live.finalize()
         if event.error:
             lines = [t.warn(f"{INDENT}· 压缩未执行：{event.error}")]
@@ -576,44 +578,43 @@ class SessionRenderer:
         if self.state.summary_done or not self.state.turn_started:
             return
         self.state.summary_done = True
-        self._flush()
         self.live.finalize()
-        self.live.append([self._turn_summary()])
+        self._emit([self._turn_summary()])
 
     def _begin_answer(self, text: str) -> None:
-        """确定是最终回答：活动区收起，先写本轮用时，再以 ● 起头流式写正文"""
+        """确定是最终回答：活动区收起，先写本轮用时，空一行，再以 ● 起头按 Markdown 排版写正文"""
         self._commit_thinking()
         self._commit_summary()
         self.state.answering = True
-        self.state.answer_hold = ""
-        self.state.answer_body = False
         self.state.slot, self.state.shown, self.state.text = "", "", ""
+        self.state.markdown = MarkdownStream(
+            self.width, self.theme, first_prefix=f"{self.theme.accent(ANSWER_MARK)} ", prefix=INDENT)
         self.live.finalize()
-        self.live.stream_text(f"{self.theme.accent(ANSWER_MARK)} ")
+        self._emit([""])
         self._feed_answer(text)
 
     def _feed_answer(self, delta: str) -> None:
-        text = self.state.answer_hold + delta.replace("\r", "")
-        if not self.state.answer_body:
-            text = text.lstrip()
-        body = text.rstrip()
-        self.state.answer_hold = text[len(body):]
-        if body:
-            self.state.answer_body = True
-            # 连续空行压成一行；续行缩进，和 ● 后面的第一行对齐
-            body = re.sub(r"\n[ \t]*\n(?:[ \t]*\n)+", "\n\n", body)
-            self.streamer.feed(body.replace("\n", "\n" + INDENT))
+        if self.state.markdown is None:
+            return
+        lines = self.state.markdown.feed(delta)
+        if lines:
+            # 定稿的行写进 scrollback，活动区直接换成新的预览（还没写完的半行、没收齐的表格）
+            self.live.append(lines, live=self._answer_preview())
+            self._blank_tail = lines[-1] == ""
+        else:
+            self._repaint()
 
     def _end_answer(self) -> None:
-        if self.state.answering:
-            self._flush()
-            self.live.finalize()
-            self.state.answering = False
-            self.state.answer_hold = ""
-
-    def _flush(self) -> None:
-        """吐完缓冲里剩余的字。插入任何其它内容之前都要先调，否则顺序会乱。"""
-        self.streamer.flush()
+        if not self.state.answering:
+            return
+        markdown = self.state.markdown
+        self.state.answering = False
+        self.state.markdown = None
+        self.live.finalize()
+        if markdown is not None:
+            lines = markdown.finish()
+            if lines:
+                self._emit(lines)
 
     def _commit_thinking(self) -> None:
         """一段思考结束：记进 TurnRecord（ctrl+o 展开用）。活动区里的思考留着，直到被下一步顶掉"""
@@ -683,15 +684,22 @@ class SessionRenderer:
         return f"{INDENT}{mark} {t.muted(names)}"
 
     def _repaint(self) -> None:
-        # 回答流式写入期间不画活动区，否则转圈会插进句子中间
         if self.state.answering:
+            self.live.update(self._answer_preview())
             return
         self.live.update(self._live_lines())
+
+    def _answer_preview(self) -> list[str]:
+        """写回答时活动区只放还没定稿的部分（半行、没收齐的表格），太高就只留最后几行"""
+        preview = self.state.markdown.preview() if self.state.markdown else []
+        return preview[-PREVIEW_ROWS:]
 
     def _tail(self, text: str, limit: int = 60) -> str:
         flat = " ".join(text.split())
         return truncate(flat[-limit * 2:], limit) if flat else ""
 
     def _emit(self, lines: list[str]) -> None:
-        self._flush()
+        if not lines:
+            return
         self.live.append(lines)
+        self._blank_tail = lines[-1] == ""

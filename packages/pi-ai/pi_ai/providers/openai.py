@@ -135,6 +135,8 @@ def build_payload(model: Model, context: Context, options: StreamOptions) -> dic
             }
             for t in context.tools
         ]
+        if options.tool_choice:
+            payload["tool_choice"] = options.tool_choice
 
     reasoning = getattr(options, "reasoning", "off")
 

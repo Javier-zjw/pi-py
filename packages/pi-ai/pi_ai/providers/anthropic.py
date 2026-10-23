@@ -71,6 +71,9 @@ def _content_to_blocks(content: Any) -> list[dict[str, Any]]:
     return blocks
 
 
+_ANTHROPIC_TOOL_CHOICE = {"auto": "auto", "none": "none", "required": "any"}
+
+
 def build_payload(model: Model, context: Context, options: StreamOptions) -> dict[str, Any]:
     messages: list[dict[str, Any]] = []
     for m in context.messages:
@@ -123,6 +126,8 @@ def build_payload(model: Model, context: Context, options: StreamOptions) -> dic
             {"name": t.name, "description": t.description, "input_schema": t.parameters}
             for t in context.tools
         ]
+        if options.tool_choice:
+            payload["tool_choice"] = {"type": _ANTHROPIC_TOOL_CHOICE[options.tool_choice]}
 
     if options.temperature is not None:
         payload["temperature"] = options.temperature

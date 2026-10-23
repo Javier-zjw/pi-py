@@ -180,6 +180,18 @@ def test_anthropic_payload_shapes() -> None:
     check("anthropic: 相邻工具结果合并", len(payload["messages"][2]["content"]) == 2)
     check("anthropic: tool_use 块", payload["messages"][1]["content"][0]["type"] == "tool_use")
 
+    tools = [Tool(name="read", description="r", parameters={"type": "object", "properties": {}})]
+    with_tools = Context(messages=[UserMessage(content="q")], tools=tools)
+    payload = build_payload(ANTHROPIC_MODEL, with_tools, SimpleStreamOptions(tool_choice="none"))
+    check("anthropic: tool_choice none", payload.get("tool_choice") == {"type": "none"}, str(payload.get("tool_choice")))
+    payload = build_payload(ANTHROPIC_MODEL, with_tools, SimpleStreamOptions(tool_choice="required"))
+    check("anthropic: tool_choice required → any", payload.get("tool_choice") == {"type": "any"})
+    payload = build_payload(ANTHROPIC_MODEL, with_tools, SimpleStreamOptions())
+    check("anthropic: 默认不传 tool_choice", "tool_choice" not in payload)
+    payload = build_payload(ANTHROPIC_MODEL, Context(messages=[UserMessage(content="q")]),
+                            SimpleStreamOptions(tool_choice="none"))
+    check("anthropic: 无工具时不传 tool_choice", "tool_choice" not in payload)
+
 
 # ── openai 协议 ─────────────────────────────────────────────────────
 
@@ -232,6 +244,14 @@ def test_openai_payload_shapes() -> None:
     check("openai: 消息角色序", roles == ["user", "assistant", "tool"], str(roles))
     check("openai: tool_calls arguments 是字符串", isinstance(payload["messages"][1]["tool_calls"][0]["function"]["arguments"], str))
     check("openai: tool_call_id 回填", payload["messages"][2]["tool_call_id"] == "t1")
+
+    tools = [Tool(name="read", description="r", parameters={"type": "object", "properties": {}})]
+    with_tools = Context(messages=[UserMessage(content="q")], tools=tools)
+    payload = build_payload(OPENAI_MODEL, with_tools, SimpleStreamOptions(tool_choice="none"))
+    check("openai: tool_choice none", payload.get("tool_choice") == "none", str(payload.get("tool_choice")))
+    payload = build_payload(OPENAI_MODEL, Context(messages=[UserMessage(content="q")]),
+                            SimpleStreamOptions(tool_choice="none"))
+    check("openai: 无工具时不传 tool_choice", "tool_choice" not in payload)
 
 
 # ── 错误路径与工具函数 ──────────────────────────────────────────────

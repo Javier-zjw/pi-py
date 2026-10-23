@@ -13,6 +13,8 @@ from typing import Any, Literal, Union
 Api = Literal["anthropic-messages", "openai-completions"]
 StopReason = Literal["pending", "stop", "length", "toolUse", "error", "aborted"]
 ThinkingLevel = Literal["off", "minimal", "low", "medium", "high", "xhigh", "max"]
+# auto：模型自行决定；none：带着工具定义但禁止调用（保持前缀缓存）；required：必须调用工具
+ToolChoice = Literal["auto", "none", "required"]
 
 THINKING_LEVELS: tuple[str, ...] = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
 
@@ -198,6 +200,8 @@ class StreamOptions:
     """
     max_tokens: int | None = None
     temperature: float | None = None
+    # 只在 context.tools 非空时下发；None 表示不传，沿用服务商默认（auto）
+    tool_choice: ToolChoice | None = None
     api_key: str | None = None
     base_url: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)

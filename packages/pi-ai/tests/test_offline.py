@@ -39,7 +39,9 @@ FAILURES: list[str] = []
 
 # pytest 下必须抛出来，否则失败会被吞掉变成假绿灯；
 # 脚本模式下继续往下跑，一次看完所有问题。
-UNDER_PYTEST = "PYTEST_CURRENT_TEST" in os.environ
+def under_pytest() -> bool:
+    # 必须在调用时判断：import（收集）阶段 pytest 还没设置这个环境变量
+    return "PYTEST_CURRENT_TEST" in os.environ
 
 
 def check(name: str, cond: bool, detail: str = "") -> None:
@@ -48,7 +50,7 @@ def check(name: str, cond: bool, detail: str = "") -> None:
         return
     FAILURES.append(f"{name}: {detail}")
     print(f"  FAIL {name} {detail}")
-    if UNDER_PYTEST:
+    if under_pytest():
         raise AssertionError(f"{name}: {detail}")
 
 

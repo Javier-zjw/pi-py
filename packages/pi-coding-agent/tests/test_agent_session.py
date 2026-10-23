@@ -37,7 +37,9 @@ from pi_coding_agent.agent_session import (  # noqa: E402
 )
 
 VERBOSE = "-v" in sys.argv
-UNDER_PYTEST = "PYTEST_CURRENT_TEST" in os.environ
+def under_pytest() -> bool:
+    # 必须在调用时判断：import（收集）阶段 pytest 还没设置这个环境变量
+    return "PYTEST_CURRENT_TEST" in os.environ
 FAILURES: list[str] = []
 
 
@@ -47,7 +49,7 @@ def check(name: str, cond: bool, detail: str = "") -> None:
         return
     FAILURES.append(f"{name}: {detail}")
     print(f"  FAIL {name} {detail}")
-    if UNDER_PYTEST:
+    if under_pytest():
         raise AssertionError(f"{name}: {detail}")
 
 
@@ -338,6 +340,32 @@ def activate(pi):
         check("扩展: 会话绑回扩展 API",
               services.resources.get_extension_api().session is session)
         check("扩展: 加载无诊断信息", services.diagnostics == [], str(services.diagnostics))
+
+
+async def case_plan_mode_tools() -> None:
+    """submit_plan 只属于计划模式：聊天模式看不到，切回聊天后也要消失。"""
+    with Sandbox() as cwd:
+        models, _ = fake_models([[TextContent(text="x")]])
+        runtime = ModelRuntime(models, cwd / "agent")
+        services = create_agent_session_services(
+            cwd=cwd, agent_dir=cwd / "agent", model_runtime=runtime
+        )
+        session = AgentSession(services, SessionManager.in_memory(cwd), model=FAKE_MODEL)
+
+        def names() -> set[str]:
+            return {t.name for t in session.agent.state.tools}
+
+        await session._apply_mode()
+        check("计划模式: 聊天模式无 submit_plan", "submit_plan" not in names(), str(names()))
+
+        await session.set_mode("plan")
+        await session._apply_mode()
+        check("计划模式: 只读工具 + submit_plan", names() == {"read", "submit_plan"}, str(names()))
+
+        await session.set_mode("chat")
+        await session._apply_mode()
+        check("计划模式: 切回聊天后恢复基线",
+              names() == {"read", "bash", "edit", "write"}, str(names()))
 
 
 def test_diagnostics_surface() -> None:
@@ -651,6 +679,10 @@ def test_model_and_thinking_switch() -> None:
     asyncio.run(case_model_and_thinking_switch())
 
 
+def test_plan_mode_tools() -> None:
+    asyncio.run(case_plan_mode_tools())
+
+
 def test_manual_compact() -> None:
     asyncio.run(case_manual_compact())
 
@@ -697,6 +729,7 @@ async def main() -> int:
     print("工具与扩展")
     test_tool_selection()
     test_extension_tools_wired()
+    await case_plan_mode_tools()
     test_diagnostics_surface()
     print("压缩接入")
     await case_manual_compact()

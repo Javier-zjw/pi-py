@@ -47,7 +47,9 @@ from pi_coding_agent.compaction import (  # noqa: E402
 from pi_coding_agent.model_runtime import ModelRuntime  # noqa: E402
 
 VERBOSE = "-v" in sys.argv
-UNDER_PYTEST = "PYTEST_CURRENT_TEST" in os.environ
+def under_pytest() -> bool:
+    # 必须在调用时判断：import（收集）阶段 pytest 还没设置这个环境变量
+    return "PYTEST_CURRENT_TEST" in os.environ
 FAILURES: list[str] = []
 
 
@@ -57,7 +59,7 @@ def check(name: str, cond: bool, detail: str = "") -> None:
         return
     FAILURES.append(f"{name}: {detail}")
     print(f"  FAIL {name} {detail}")
-    if UNDER_PYTEST:
+    if under_pytest():
         raise AssertionError(f"{name}: {detail}")
 
 

@@ -16,8 +16,7 @@ from __future__ import annotations
 
 import json
 
-from pi_agent import AgentToolResult, ToolContext
-from requests import session
+from pi_agent import AgentTool, AgentToolResult, ToolContext
 
 NAME = "plan_mode"
 DESCRIPTION = "计划模式：只读分析并产出可执行计划，确认后再切换执行"
@@ -83,7 +82,9 @@ def activate(pi) -> None:
         lines.append("等待用户确认后执行。用 /build 开始执行，或继续讨论调整计划。")
         return AgentToolResult.text("\n".join(lines), details={"plan": plan})
 
-    submit_tool = pi.register_tool(
+    # 不走 pi.register_tool：那会把它加进每个会话的工具基线，聊天模式下模型也能调。
+    # 它只属于计划模式，由 apply_plan_mode 按需挂上
+    submit_tool = AgentTool(
         name="submit_plan",
         label="提交计划",
         description=(

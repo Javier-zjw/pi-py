@@ -25,7 +25,7 @@ ruff check packages                       # line-length 100, py310
 
 测试全部离线、无需安装：每个测试文件自己往 `sys.path` 塞入 `packages/pi-ai`、`pi-agent`、`pi-coding-agent`。
 
-**以脚本方式直接运行是权威结果**（会跑完全部断言并汇总失败）：
+以脚本方式直接运行会跑完全部断言并一次性汇总失败（脚本模式下 `check()` 失败不中断）：
 
 ```bash
 python packages/pi-ai/tests/test_offline.py
@@ -33,11 +33,14 @@ python packages/pi-agent/tests/test_offline.py [-v]
 python packages/pi-coding-agent/tests/test_tools.py      # 另有 test_session / test_resources / test_runtime / test_agent_session
 ```
 
-pytest 也能跑，但有两个坑：
-- pi-ai 和 pi-agent 的测试文件都叫 `test_offline.py` 且没有 `__init__.py`，必须**按包分别运行**（`cd packages/pi-agent && pytest tests`），一次性收集会报 import file mismatch。
-- `UNDER_PYTEST = "PYTEST_CURRENT_TEST" in os.environ` 在 import（收集）时求值，那时环境变量还没设置，所以 `check()` 失败**不会抛 AssertionError，pytest 会假绿**。只有直接抛异常的问题能被 pytest 发现。修改实现后务必用脚本方式确认。
+pytest 下 `check()` 失败会抛 AssertionError（`under_pytest()` 必须在调用时判断环境变量，不能在 import 时求值，否则 pytest 会假绿）。pi-ai 和 pi-agent 的测试文件都叫 `test_offline.py` 且没有 `__init__.py`，必须**按包分别运行**，一次性收集会报 import file mismatch：
 
-单个用例：`cd packages/pi-coding-agent && pytest tests/test_session.py::test_persistence`（同样受假绿影响）。
+```bash
+cd packages/pi-agent && pytest tests
+cd packages/pi-coding-agent && pytest tests/test_session.py::test_persistence   # 单个用例
+```
+
+新增用例时沿用现有写法：异步逻辑写成 `async def case_xxx()`，在文件末尾的 pytest 兼容层加同步壳 `def test_xxx(): asyncio.run(case_xxx())`，并加进 `main()`。
 
 `tests/manual/*.py` 需要真实模型和密钥，不属于离线测试。`packages/pi-agent/tests/CHECKLIST.md` 把每条断言映射到实现位置，断言变红时先查它。
 
@@ -83,4 +86,6 @@ pi-web（Vue 3 + Vite，只通过 HTTP/SSE 与 pi-server 通信）
 
 `pi`（`extensions.py::ExtensionAPI`）提供 `register_tool` / `register_command` / `register_mode` / `before_agent_start` / `transform_context` / `on(event_type)` / `events`（扩展间总线）/ `state` / `session` / `send_message`。加载或钩子异常都会被捕获并记入 `LoadedExtension.error` → `services.diagnostics`，不会让 CLI 起不来。注册项按 `api.owner` 归属到扩展。`settings.disabledExtensions` 中的扩展仍会列出但不执行 `activate`。
 
-当前唯一的内置扩展是 `builtin_extensions/plan_mode.py`（`submit_plan` 工具 + `chat`/`plan` 模式 + `/plan` `/build` `/show_plan` 命令），可作为模板。SUMMARY.md 提到的 `subagents.py`、`mcp.py` 尚未在仓库中。注意：内置扩展的工具会出现在每个 AgentSession 的工具列表里，断言工具名集合的测试需要考虑这一点。
+当前唯一的内置扩展是 `builtin_extensions/plan_mode.py`（`chat`/`plan` 模式 + `/plan` `/build` `/show_plan` 命令），可作为模板。SUMMARY.md 提到的 `subagents.py`、`mcp.py` 尚未在仓库中。
+
+注意 `pi.register_tool` 注册的工具会进入**每个** AgentSession 的工具基线（也会出现在网页的工具选择里）。只属于某个模式的工具（如 `submit_plan`）应直接构造 `AgentTool`，在该模式的 `apply` 里挂上。内置扩展总会被加载，断言扩展列表的测试要把它们算进去。

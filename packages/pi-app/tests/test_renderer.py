@@ -15,6 +15,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 HERE = Path(__file__).resolve()
 PACKAGES = HERE.parents[2]
@@ -28,7 +29,7 @@ from pi_ai import TextContent, ThinkingContent, ToolCall, Usage, UserMessage  # 
 from pi_tui import Theme  # noqa: E402
 from pi_tui.theme import ColorMode  # noqa: E402
 
-from pi_app.renderer import SessionRenderer, ToolRecord  # noqa: E402
+from pi_app.renderer import SLOT_LINES, SessionRenderer, ToolRecord  # noqa: E402
 from pi_coding_agent import ModelRuntime, SessionManager  # noqa: E402
 from pi_coding_agent.agent_session import AgentSession, create_agent_session_services  # noqa: E402
 
@@ -86,59 +87,111 @@ async def case_collapsed_turn() -> None:
         _renderer, out, _ = await run_turn(cwd, list(SCRIPT))
         text = out.getvalue()
         lines = [line for line in text.splitlines() if line.strip()]
-        check("收起: 不打印工具参数", "ls -la" not in text and "missing.txt" not in text, text)
-        check("收起: 不打印工具结果", "# demo" not in text and "No such file" not in text)
-        summary = [line for line in lines if "个工具调用" in line]
-        check("收起: 工具收成一行", len(summary) == 1, str(summary))
-        check("收起: 摘要带名字和次数", "bash ×2" in summary[0] and "read ×2" in summary[0], summary[0])
-        check("收起: 失败数醒目标出", "1 失败" in summary[0], summary[0])
-        check("收起: 提示怎么展开", "ctrl+o 展开" in summary[0])
-        check("思考: 实时显示思考原文", "✻ 思考" in text and "  用户想看代码，我先列目录，再读关键文件。" in lines,
-              text)
-        check("思考: 显示原文时不再打「思考了」", "思考了" not in text, text)
+        check("不落盘: 不打印工具参数", "ls -la" not in text and "missing.txt" not in text, text)
+        check("不落盘: 不打印工具结果", "# demo" not in text and "No such file" not in text)
+        check("不落盘: 不打印思考", "先列目录" not in text and "思考" not in text, text)
+        summary = [line for line in lines if line.startswith("✻ ")]
+        check("用时: 每轮一行，在最上面", len(summary) == 1 and lines[0] == summary[0], str(lines))
+        check("用时: 带工具次数和名字", "4 次工具" in summary[0] and "bash ×2" in summary[0]
+              and "read ×2" in summary[0], summary[0])
+        check("用时: 失败数醒目标出", "1 失败" in summary[0], summary[0])
+        check("用时: 提示怎么展开", "ctrl+o 展开" in summary[0])
+        check("用时: 不带文字标签", "用时" not in text and "上下文" not in text, text)
         answer = next((i for i, line in enumerate(lines) if line.startswith("● ")), None)
-        check("回答: 以 ● 开头", answer is not None, text)
+        check("回答: 以 ● 开头，紧跟在用时下面", answer == 1, str(lines))
         check("回答: 续行缩进两格", answer is not None and lines[answer + 1].startswith("  - README.md"),
               str(lines[answer:answer + 3]))
-        check("回答: 工具摘要在回答之前", text.index("个工具调用") < text.index("● "))
-        footers = [line for line in lines if "↑" in line and "↓" in line]
-        check("统计: 每轮只有一行", len(footers) == 1, str(footers))
-        check("统计: 上下文取最后一次、输出累加",
-              "↑4.1k" in footers[0] and "↓344" in footers[0] and "4 次工具" in footers[0],
-              footers[0])
-        check("统计: 不带文字标签，以用时开头",
-              footers[0].split(" · ")[0].endswith("s") and not any(
-                  word in footers[0] for word in ("用时", "上下文", "输出", "✻")), footers[0])
+        check("统计: 最后一行只有 token", lines[-1] == "↑4.1k · ↓344", lines[-1])
         check("统计: 不再每次调模型都打一行", "↑4130" not in text)
 
 
-async def case_thinking_order() -> None:
-    """多次调模型：思考 → 工具摘要 → 思考 → 回答，按真实顺序；思考的多余空行被压掉"""
+async def case_interim_text() -> None:
+    """工具前的过渡话不当回答；回答首尾和中间多余的空行去掉"""
     script = [
-        [ThinkingContent(thinking="\n\n先看目录。\n\n\n\n再决定读哪个文件。\n\n"),
+        [ThinkingContent(thinking="先看目录。"),
+         TextContent(text="好的，让我先查看一下项目结构。\n\n\n"),
          ToolCall(id="t1", name="bash", arguments={"command": "ls"})],
-        [ThinkingContent(thinking="README 最关键。"),
-         ToolCall(id="t2", name="read", arguments={"path": "README.md"})],
-        [ThinkingContent(thinking="可以回答了。"), TextContent(text="这是一个示例项目。")],
+        [ThinkingContent(thinking="可以回答了。"),
+         TextContent(text="\n\n这是一个示例项目。\n\n\n\n第二段。\n\n\n")],
     ]
     with Sandbox() as cwd:
-        _renderer, out, _ = await run_turn(cwd, script)
+        renderer, out, _ = await run_turn(cwd, script)
         text = out.getvalue()
-        lines = text.splitlines()
-        marks = [text.index(m) for m in ("先看目录", "1 个工具调用 · bash", "README 最关键",
-                                         "1 个工具调用 · read", "可以回答了", "● 这是一个示例项目")]
-        check("顺序: 思考 → 工具 → 思考 → 工具 → 思考 → 回答", marks == sorted(marks), text)
-        check("思考: 每次调用一个标题", text.count("✻ 思考") == 3, text)
-        check("思考: 开头的空行去掉", lines[lines.index("✻ 思考") + 1] == "  先看目录。", text)
-        check("思考: 连续空行压成一行，续行缩进",
-              "  先看目录。\n  \n  再决定读哪个文件。\n" in text, repr(text))
-        check("思考: 段尾空行不写出", "再决定读哪个文件。\n▸" in text, repr(text))
+        check("过渡话: 不写进 scrollback", "让我先查看" not in text, text)
+        check("过渡话: 只有一个 ●", text.count("●") == 1, text)
+        check("回答: 开头空行去掉", "● 这是一个示例项目。" in text, repr(text))
+        check("回答: 连续空行压成一行", "这是一个示例项目。\n  \n  第二段。\n" in text, repr(text))
+        check("回答: 段尾空行不写出，和统计之间只空一行", "第二段。\n\n↑" in text, repr(text))
+        steps = [kind for kind, _ in renderer.last_turn.steps]
+        check("展开: 按顺序记下思考、过渡话、工具、思考",
+              steps == ["thinking", "text", "tool", "thinking"], str(steps))
+        before = len(text)
+        renderer.expand_last_turn()
+        expanded = out.getvalue()[before:]
+        check("展开: 过渡话也能看到", "◦ 好的，让我先查看一下项目结构。" in expanded, expanded)
+        check("展开: 顺序和发生顺序一致",
+              expanded.index("先看目录") < expanded.index("让我先查看") < expanded.index("✓ bash")
+              < expanded.index("可以回答了"), expanded)
 
-    with Sandbox() as cwd:
-        _renderer, out, _ = await run_turn(cwd, list(SCRIPT), show_thinking=False)
-        text = out.getvalue()
-        check("--no-thinking: 收成一行时长", "思考了" in text and "先列目录" not in text
-              and "✻ 思考" not in text, text)
+
+def ev(kind: str, **fields):
+    return SimpleNamespace(type=kind, **fields)
+
+
+def delta(kind: str, text: str):
+    return ev("message_update", assistant_message_event=SimpleNamespace(type=kind, delta=text))
+
+
+def test_live_slot() -> None:
+    """思考、过渡话、工具共用活动区的一块位置，后来的顶掉先来的；第一行是本轮用时"""
+    renderer = SessionRenderer(theme=Theme(ColorMode.NONE), stream=io.StringIO())
+    live = lambda: "\n".join(renderer._live_lines())  # noqa: E731
+    renderer.on_event(ev("agent_start"))
+    renderer.state.turn_started = time.time() - 3.0
+    renderer.on_event(ev("turn_start"))
+    renderer.on_event(delta("thinking_delta", "\n\n用户想看代码，"))
+    renderer.on_event(delta("thinking_delta", "我先列目录。"))
+    text = live()
+    check("活动区: 第一行是用时和状态", text.split("\n")[0].endswith("3.0s · 思考中"), text)
+    check("活动区: 显示思考原文，去掉开头空行", "\n  用户想看代码，我先列目录。" in text, repr(text))
+
+    renderer.on_event(ev("tool_execution_start", tool_call_id="t1", tool_name="bash",
+                         arguments={"command": "ls -la"}))
+    text = live()
+    check("活动区: 工具顶掉思考", "bash" in text and "列目录" not in text, text)
+    check("活动区: 不显示工具参数", "ls -la" not in text, text)
+    check("活动区: 用时行带工具次数", "执行工具 · 1 次工具" in text, text)
+    renderer.on_event(ev("tool_execution_end", tool_call_id="t1", is_error=False,
+                         result=SimpleNamespace(content=[], details=None)))
+    check("活动区: 工具跑完显示 ✓，等下一步", "✓ bash" in live(), live())
+
+    renderer.on_event(ev("turn_start"))
+    renderer.on_event(delta("thinking_delta", "README 最关键。"))
+    text = live()
+    check("活动区: 新的思考顶掉工具", "README 最关键" in text and "bash" not in text, text)
+    renderer.on_event(delta("text_delta", "让我读一下 README。"))
+    text = live()
+    check("活动区: 过渡话顶掉思考", "让我读一下" in text and "README 最关键" not in text, text)
+
+    long_thought = "\n".join(f"第 {i} 行思考" for i in range(20))
+    renderer.on_event(ev("turn_start"))
+    renderer.on_event(delta("thinking_delta", long_thought))
+    text = live()
+    check("活动区: 长思考只显示最新几行", "第 19 行思考" in text and "第 0 行思考" not in text
+          and len(text.split("\n")) == 1 + SLOT_LINES, text)
+
+    renderer.on_event(delta("text_delta", "\n".join(f"回答第 {i} 行" for i in range(10))))
+    renderer._flush()        # 在事件循环里时回答是匀速吐字的
+    check("长文字: 超过活动区就当回答写出", renderer.state.answering
+          and "● 回答第 0 行" in renderer.stream.getvalue(), renderer.stream.getvalue())
+    check("长文字: 用时写在回答上面", renderer.stream.getvalue().index("✻ ")
+          < renderer.stream.getvalue().index("●"))
+
+    quiet = SessionRenderer(theme=Theme(ColorMode.NONE), stream=io.StringIO(), show_thinking=False)
+    quiet.on_event(ev("agent_start"))
+    quiet.on_event(delta("thinking_delta", "不该出现"))
+    check("--no-thinking: 活动区不显示思考原文", "不该出现" not in "\n".join(quiet._live_lines())
+          and "思考中" in "\n".join(quiet._live_lines()))
 
 
 async def case_expand() -> None:
@@ -167,19 +220,21 @@ async def case_expand() -> None:
 def test_running_status() -> None:
     """运行中只显示正在执行的那个工具：名字 + 时长，不带参数"""
     renderer = SessionRenderer(theme=Theme(ColorMode.NONE), stream=io.StringIO())
+    renderer.agent_running = True
     renderer.state.turn_started = time.time()
     record = ToolRecord("t1", "bash", {"command": "pytest -q tests"}, time.time() - 2.0)
     renderer.state.running["t1"] = record
-    status = renderer._status_text()
-    check("状态行: 显示工具名", "bash" in status, status)
-    check("状态行: 不显示参数", "pytest" not in status, status)
-    check("状态行: 显示已执行时长", "2.0s" in status, status)
-    renderer.state.running["t2"] = ToolRecord("t2", "read", {"path": "a.py"}, time.time())
-    status = renderer._status_text()
-    check("状态行: 并行时只显示最新的一个", "read" in status and "bash" not in status
+    renderer.state.slot, renderer.state.batch = "tools", [record]
+    status = renderer._tools_line()
+    check("工具行: 显示工具名", "bash" in status, status)
+    check("工具行: 不显示参数", "pytest" not in status, status)
+    check("工具行: 显示已执行时长", "2.0s" in status, status)
+    second = ToolRecord("t2", "read", {"path": "a.py"}, time.time())
+    renderer.state.running["t2"] = second
+    renderer.state.batch.append(second)
+    status = renderer._tools_line()
+    check("工具行: 并行时只显示最新的一个", "read" in status and "bash" not in status
           and "等 2 个" in status, status)
-    renderer.state.running.clear()
-    check("状态行: 等模型时显示思考中", "思考中" in renderer._status_text())
 
 
 async def case_steering_echo() -> None:
@@ -207,8 +262,8 @@ def test_expand() -> None:
     asyncio.run(case_expand())
 
 
-def test_thinking_order() -> None:
-    asyncio.run(case_thinking_order())
+def test_interim_text() -> None:
+    asyncio.run(case_interim_text())
 
 
 def test_steering_echo() -> None:
@@ -218,8 +273,10 @@ def test_steering_echo() -> None:
 async def main() -> int:
     print("收起与统计")
     await case_collapsed_turn()
-    print("思考")
-    await case_thinking_order()
+    print("过渡话与空行")
+    await case_interim_text()
+    print("活动区")
+    test_live_slot()
     print("展开")
     await case_expand()
     print("状态行与回显")

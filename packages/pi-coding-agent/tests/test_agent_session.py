@@ -39,6 +39,7 @@ from pi_ai import (  # noqa: E402
     ThinkingContent,
     ToolCall,
     Usage,
+    UserMessage,
 )
 
 from pi_coding_agent import ModelRuntime, SessionManager, define_tool  # noqa: E402
@@ -737,6 +738,60 @@ async def case_overflow_other_errors() -> None:
               str(calls))
 
 
+def dangling_calls(messages) -> set[str]:
+    calls = {c.id for m in messages if getattr(m, "role", "") == "assistant" for c in m.tool_calls()}
+    return calls - {m.tool_call_id for m in messages if getattr(m, "role", "") == "toolResult"}
+
+
+async def case_resume_after_crash_mid_tool() -> None:
+    """工具执行中进程退出：文件里只有调用、没有结果。恢复后补上中断结果并能继续对话"""
+    with Sandbox() as cwd:
+        manager = file_manager(cwd)
+        session, _ = make_session(
+            cwd, [[ToolCall(id="c1", name="bash", arguments={"command": "sleep 5"})]],
+            tools=["bash"], session_manager=manager)
+        task = asyncio.create_task(session.prompt("跑个长命令"))
+        await asyncio.sleep(0.3)
+        task.cancel()                                   # 相当于进程被杀
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        on_disk = [e.message.role for e in SessionManager.open(cwd / "s.jsonl").get_entries()
+                   if e.type == "message"]
+        check("中断恢复: 前提——文件里只有调用", on_disk == ["user", "assistant"], str(on_disk))
+
+        reopened, provider = make_session(cwd, [[TextContent(text="我先检查一下命令是否跑完")]],
+                                          tools=["bash"], session_manager=SessionManager.open(cwd / "s.jsonl"))
+        check("中断恢复: 记下补全了哪些调用", reopened.interrupted_tool_calls == ["c1"])
+        repaired = [e.message for e in SessionManager.open(cwd / "s.jsonl").get_entries()
+                    if e.type == "message"]
+        check("中断恢复: 中断结果写回了文件",
+              repaired[-1].role == "toolResult" and repaired[-1].details == {"interrupted": True},
+              str([m.role for m in repaired]))
+        await reopened.prompt("继续")
+        sent = provider.calls[0]["context"].messages
+        check("中断恢复: 发出的请求里调用都有结果", dangling_calls(sent) == set(), str(dangling_calls(sent)))
+        check("中断恢复: 对话能继续", reopened.messages[-1].text() == "我先检查一下命令是否跑完")
+
+        again = AgentSession(reopened.services, SessionManager.open(cwd / "s.jsonl"), model=FAKE_MODEL)
+        check("中断恢复: 再次打开不会重复补", again.interrupted_tool_calls == [])
+
+
+async def case_abort_mid_tool_call_stream() -> None:
+    """模型刚发出工具调用就被取消：这条回复带着没执行的调用，下一次请求不能因此被拒"""
+    with Sandbox() as cwd:
+        session, provider = make_session(cwd, [[TextContent(text="好的")]], tools=["bash"])
+        session.messages.extend([
+            UserMessage(content="跑测试"),
+            AssistantMessage(content=[ToolCall(id="x1", name="bash", arguments={"command": "pytest"})],
+                             stop_reason="aborted"),
+        ])
+        await session.prompt("算了，先别跑")
+        sent = provider.calls[0]["context"].messages
+        check("取消后: 发出的请求里调用都有结果", dangling_calls(sent) == set(), str([m.role for m in sent]))
+
+
 async def case_compaction_no_gain() -> None:
     """内容太少、压缩后反而更大时不替换历史。"""
     with Sandbox() as cwd:
@@ -1233,6 +1288,14 @@ def test_overflow_other_errors() -> None:
     asyncio.run(case_overflow_other_errors())
 
 
+def test_resume_after_crash_mid_tool() -> None:
+    asyncio.run(case_resume_after_crash_mid_tool())
+
+
+def test_abort_mid_tool_call_stream() -> None:
+    asyncio.run(case_abort_mid_tool_call_stream())
+
+
 def test_compaction_no_gain() -> None:
     asyncio.run(case_compaction_no_gain())
 
@@ -1315,6 +1378,8 @@ async def main() -> int:
     await case_overflow_recovery()
     await case_overflow_unrecoverable()
     await case_overflow_other_errors()
+    await case_resume_after_crash_mid_tool()
+    await case_abort_mid_tool_call_stream()
     await case_compaction_no_gain()
     await case_double_compaction_resume()
     await case_compact_before_prompt()

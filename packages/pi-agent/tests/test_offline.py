@@ -732,6 +732,35 @@ async def case_stream_error_hook() -> None:
           events[-1].reason == "error" and calls["n"] == MAX_ERROR_RETRIES + 1, str(calls["n"]))
 
 
+def test_tool_result_pairing() -> None:
+    from pi_agent import ensure_tool_results
+    from pi_agent.loop import INTERRUPTED_TOOL_TEXT
+
+    def call(i: str) -> ToolCall:
+        return ToolCall(id=i, name="bash", arguments={"command": "ls"})
+
+    def result(i: str) -> ToolResultMessage:
+        return ToolResultMessage(tool_call_id=i, tool_name="bash", content=[TextContent(text="ok")])
+
+    aborted = AssistantMessage(content=[call("a")], stop_reason="aborted")
+    msgs = [UserMessage(content="q"), aborted, UserMessage(content="继续")]
+    out = default_convert_to_llm(msgs)
+    check("配对: 缺结果的调用补上中断结果",
+          [m.role for m in out] == ["user", "assistant", "toolResult", "user"], str([m.role for m in out]))
+    check("配对: 补的结果标明被中断",
+          out[2].tool_call_id == "a" and out[2].is_error and out[2].text() == INTERRUPTED_TOOL_TEXT)
+
+    partial = [UserMessage(content="q"), AssistantMessage(content=[call("x"), call("y")]), result("x")]
+    out = ensure_tool_results(partial)
+    check("配对: 部分缺失时补在已有结果之后",
+          [getattr(m, "tool_call_id", m.role) for m in out] == ["user", "assistant", "x", "y"],
+          str([getattr(m, "tool_call_id", m.role) for m in out]))
+
+    complete = [UserMessage(content="q"), AssistantMessage(content=[call("z")]), result("z")]
+    check("配对: 完整的不动（同一个列表）", ensure_tool_results(complete) is complete)
+    check("配对: 原列表不被修改", len(msgs) == 3 and len(partial) == 3)
+
+
 async def case_no_terminal_event() -> None:
     """provider 异常退出、一个终止事件都没发——必须有兜底。"""
     def truncated(model, context, options=None):
@@ -934,6 +963,7 @@ async def main() -> int:
     print("错误路径")
     await case_stream_error()
     await case_stream_error_hook()
+    test_tool_result_pairing()
     await case_no_terminal_event()
     await case_loop_continue()
     print("订阅与输入")

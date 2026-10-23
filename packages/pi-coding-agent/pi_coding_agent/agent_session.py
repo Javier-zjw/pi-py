@@ -21,6 +21,8 @@ from pi_agent import (
     CustomMessage,
     MessageEndEvent,
     TurnEndEvent,
+    find_missing_tool_results,
+    interrupted_tool_result,
 )
 from pi_ai import (
     AssistantMessage,
@@ -117,6 +119,9 @@ class AgentSession:
         active_tools = [t for t in all_tools if t.name not in excluded]
 
         restored = self.session.build_session_context()
+        # 上次在工具执行中退出：补上"被中断"的结果并写回文件（发请求时 pi-agent 也会兜底补，
+        # 这里落盘是为了历史里看得到这一步没做完）
+        self.interrupted_tool_calls = self._repair_interrupted(restored)
         if model is None and restored["model"]:
             model = self.model_runtime.get_model(*restored["model"])
         if model is None:
@@ -173,6 +178,21 @@ class AgentSession:
         self.agent.subscribe(self._on_agent_event)
         self.resources.get_extension_api().session = self
 
+
+    def _repair_interrupted(self, restored: dict[str, Any]) -> list[str]:
+        """只处理末尾那次：结果追加到分支末尾刚好紧跟在调用之后。更早的缺口由请求出口兜底"""
+        messages: list[AgentMessage] = restored["messages"]
+        missing = find_missing_tool_results(messages)
+        if not missing or missing[-1][0] != len(messages):
+            return []
+        entry_ids = restored.setdefault("entry_ids", [])
+        repaired: list[str] = []
+        for call in missing[-1][1]:
+            result = interrupted_tool_result(call)
+            entry_ids.append(self.session.append_message(result))
+            messages.append(result)
+            repaired.append(call.id)
+        return repaired
 
     def _restore_prune(self, entry_ids: list[str | None]) -> None:
         """恢复会话：重放 context_prune 条目，让发给模型的内容和中断前一致"""

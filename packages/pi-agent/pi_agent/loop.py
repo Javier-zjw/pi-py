@@ -18,6 +18,7 @@ from pi_ai import (
     ErrorEvent,
     Message,
     SimpleStreamOptions,
+    TextContent,
     Tool,
     ToolCall,
     ToolResultMessage,
@@ -51,6 +52,57 @@ from .types import (
 
 from .validation import ValidationError, validate_tool_arguments
 
+INTERRUPTED_TOOL_TEXT = (
+    "[没有执行结果：工具执行被中断（中途取消或进程退出），结果未知。"
+    "如果它会修改文件或系统状态，请先检查现状，再决定是否重做]"
+)
+
+
+def interrupted_tool_result(call: ToolCall) -> ToolResultMessage:
+    return ToolResultMessage(
+        tool_call_id=call.id,
+        tool_name=call.name,
+        content=[TextContent(text=INTERRUPTED_TOOL_TEXT)],
+        details={"interrupted": True},
+        is_error=True,
+    )
+
+
+def find_missing_tool_results(messages: list[Any]) -> list[tuple[int, list[ToolCall]]]:
+    """[(应插入的位置, 缺结果的工具调用)]。结果必须紧跟在发起调用的 assistant 之后"""
+    missing: list[tuple[int, list[ToolCall]]] = []
+    for i, m in enumerate(messages):
+        if not isinstance(m, AssistantMessage):
+            continue
+        calls = m.tool_calls()
+        if not calls:
+            continue
+        j = i + 1
+        answered: set[str] = set()
+        while j < len(messages) and isinstance(messages[j], ToolResultMessage):
+            answered.add(messages[j].tool_call_id)
+            j += 1
+        lacking = [c for c in calls if c.id not in answered]
+        if lacking:
+            missing.append((j, lacking))
+    return missing
+
+
+def ensure_tool_results(messages: list[Any]) -> list[Any]:
+    """
+    给没有结果的工具调用补上"被中断"的结果。
+    服务商要求每个 tool_call 后面都有对应结果，否则整个请求被拒——中途取消（模型刚
+    发出调用就被中断）或进程在工具执行中退出，都会留下这种调用，之后每次请求都失败。
+    """
+    missing = find_missing_tool_results(messages)
+    if not missing:
+        return messages
+    out = list(messages)
+    for position, calls in reversed(missing):
+        out[position:position] = [interrupted_tool_result(c) for c in calls]
+    return out
+
+
 def default_convert_to_llm(messages: list[AgentMessage]) -> list[Message]:
 
     out: list[Message] = []
@@ -62,7 +114,7 @@ def default_convert_to_llm(messages: list[AgentMessage]) -> list[Message]:
         else:
             out.append(m)
 
-    return out
+    return ensure_tool_results(out)
 
 @dataclass
 class LoopConfig:

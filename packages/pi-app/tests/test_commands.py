@@ -200,7 +200,6 @@ async def case_model_picker() -> None:
               and app.renderer.status.thinking == "high")
         text = tail(out, start)
         check("/model: 打印一行结论", "✓ 模型 fake/thinker" in text and "思考 high" in text, text)
-        check("/model: 输入框提示行带上新档位", "think high" in app.renderer.input_prompt())
 
         app.picks = [None]
         start = len(out.getvalue())

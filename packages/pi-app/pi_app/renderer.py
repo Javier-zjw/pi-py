@@ -8,7 +8,7 @@
     ● 当前目录是一个很小的示例项目：
       - README.md：说明文档
 
-    ✻ 用时 7.9s · 上下文 ↑4.1k · 输出 ↓86
+    7.9s · ↑4.1k · ↓86
 
 设计原则：
 
@@ -16,7 +16,8 @@
    显示正在执行的那个工具（名字闪烁），不打印参数。细节按 ctrl+o（或 /expand）
    展开上一轮再看。
 2. **正文真流式**，经 TextStreamer 匀速吐字；以 ● 开头，续行缩进两格。
-3. **每轮一行统计**，亮色：用时、上下文大小、输出 token。不再每次调用模型都打一行。
+3. **每轮一行统计**，亮色、不带文字标签：用时 · ↑上下文 · ↓输出。不再每次调用模型都打一行。
+4. **输入框**上下各一条细线，线上不放模型、token 之类的文字。
 """
 
 from __future__ import annotations
@@ -194,21 +195,18 @@ class SessionRenderer:
         self._emit(out)
 
     def input_prompt(self) -> str:
-        """输入框：一条带提示的细线 + ❯。配合 LineReader 的 erase_when_done，提交后整块擦掉
+        """输入框上沿 + ❯。和 Claude Code 一样上下各一条细线把输入夹住，线上不带任何文字；
+        下沿由 LineReader 的 footer 画（input_footer）。配合 erase_when_done，提交后整块擦掉
 
-            ── glm-5.2 · 16.9k tok · ctrl+o 展开 · /help ──────────────
+            ────────────────────────────
             ❯ _
+            ────────────────────────────
         """
-        bits = [self.status.model]
-        if self.status.thinking and self.status.thinking != "off":
-            bits.append(f"think {self.status.thinking}")
-        if self.status.tokens:
-            bits.append(f"{_k(self.status.tokens)} tok")
-        if self.last_turn and (self.last_turn.tools or self.last_turn.thinking):
-            bits.append(EXPAND_HINT)
-        bits.append("/help")
-        label = " · ".join(b for b in bits if b)
-        return f"{rule(self.width, label, self.theme)}\n{self.theme.accent('❯', bold=True)} "
+        return f"{rule(self.width, '', self.theme)}\n{self.theme.accent('❯', bold=True)} "
+
+    def input_footer(self) -> str:
+        """输入框下沿"""
+        return rule(self.width, "", self.theme)
 
     def on_event(self, event: Any) -> None:
         handler = getattr(self, f"_on_{event.type}", None)
@@ -495,11 +493,12 @@ class SessionRenderer:
         t = self.theme
         state = self.state
         elapsed = time.time() - (state.turn_started or time.time())
-        parts = [f"{t.highlight('✻', bold=True)} {t.muted('用时')} {t.highlight(_seconds(elapsed), bold=True)}"]
+        # 只留数字和箭头：3.5s · ↑911 · ↓99（↑ 上下文，↓ 输出）
+        parts = [t.highlight(_seconds(elapsed), bold=True)]
         if state.context_tokens:
-            parts.append(f"{t.muted('上下文')} {t.info('↑' + _k(state.context_tokens), bold=True)}")
+            parts.append(t.info("↑" + _k(state.context_tokens), bold=True))
         if state.output_tokens:
-            parts.append(f"{t.muted('输出')} {t.success('↓' + _k(state.output_tokens), bold=True)}")
+            parts.append(t.success("↓" + _k(state.output_tokens), bold=True))
         if state.tool_total:
             parts.append(t.muted(f"{state.tool_total} 次工具"))
         if state.cost:

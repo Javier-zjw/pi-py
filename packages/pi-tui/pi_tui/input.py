@@ -21,14 +21,16 @@ from typing import Any
 
 try:  # 可选依赖，缺了也能跑
     from prompt_toolkit import PromptSession
-    from prompt_toolkit.application import run_in_terminal
+    from prompt_toolkit.application import get_app, run_in_terminal
     from prompt_toolkit.completion import Completer, Completion
     from prompt_toolkit.document import Document
     from prompt_toolkit.enums import DEFAULT_BUFFER
-    from prompt_toolkit.filters import Condition, has_focus
+    from prompt_toolkit.filters import Condition, has_focus, is_done, to_filter
     from prompt_toolkit.formatted_text import ANSI
     from prompt_toolkit.history import FileHistory
     from prompt_toolkit.key_binding import KeyBindings
+    from prompt_toolkit.layout import ConditionalContainer, Dimension, Window
+    from prompt_toolkit.layout.controls import FormattedTextControl
     from prompt_toolkit.patch_stdout import patch_stdout
     from prompt_toolkit.styles import Style
 
@@ -115,6 +117,7 @@ class LineReader:
     - ``key_handlers``：额外快捷键（prompt_toolkit 的键名，如 ``"c-o"``）→ 回调。回调在输入行
       上方打印内容，打完输入行原样恢复，正在输入的字不丢。
     - ``erase_when_done``：提交后擦掉输入框，由上层用自己的样式回显这句话。
+    - ``footer``：编辑时画在输入行下方的一行（如输入框下沿的细线），提交时不留下。
     - ``commands``：行首输入 / 时弹出的命令菜单（见 SlashCompleter）。菜单打开时回车会先补全
       高亮的那条（没高亮就取第一条）再提交，所以 ``/mo`` 回车就是 ``/model``。
 
@@ -128,6 +131,7 @@ class LineReader:
             key_handlers: dict[str, Callable[[], None]] | None = None,
             erase_when_done: bool = False,
             commands: Commands | None = None,
+            footer: Callable[[], str] | None = None,
     ) -> None:
         self.session: Any = None
         self.completer: SlashCompleter | None = None
@@ -185,13 +189,41 @@ class LineReader:
             enable_history_search=self.completer is None,
             erase_when_done=erase_when_done,
             style=Style.from_dict(MENU_STYLE),
-            # 菜单要在输入行下方留出空行。固定预留会让输入行下面一直空着一大块，
-            # 所以平时为 0，输入 / 有候选时才按候选数撑开（见 _fit_menu）
+            # 固定预留会让输入行下面一直空着一大块；菜单空间由 _input_height 按需撑开
             reserve_space_for_menu=0,
         )
+        if footer is not None:
+            # PromptSession 只提供贴在屏幕最底行的 bottom_toolbar；这里把一行插在输入区正下方
+            # （布局最外层 HSplit 的第 0 个孩子是输入区，补全菜单浮在输入区内，所以菜单在这行上面）
+            line = ConditionalContainer(
+                Window(FormattedTextControl(lambda: ANSI(footer())), height=1, dont_extend_height=True),
+                filter=~is_done,
+            )
+            self.session.layout.container.children.insert(1, line)
+        input_window = next(w for w in self.session.layout.find_all_windows()
+                            if getattr(w.content, "buffer", None) is self.session.default_buffer)
+        if footer is not None:
+            # 输入窗口默认会撑满下方剩余的空间，这行就被挤到屏幕最底下（和 bottom_toolbar 一样）
+            input_window.dont_extend_height = to_filter(True)
         if self.completer is not None:
-            self.session.default_buffer.on_text_changed += self._fit_menu
+            # 菜单浮在输入窗口里，窗口要按候选数撑开（见 _input_height）
+            input_window.height = self._input_height
             self.session.default_buffer.on_completions_changed += _highlight_first
+
+    def _input_height(self) -> Dimension:
+        """输入窗口的高度：平时一行；有命令候选时撑开放菜单（不用 reserve_space_for_menu
+        固定预留，否则输入行下面一直空着一大块）。
+
+        按输入的原文算候选数：↑↓ 浏览时 prompt_toolkit 会把选中的候选写进输入框，
+        按那段文字算菜单会缩成一行"""
+        buffer = self.session.default_buffer
+        if get_app().is_done or self.completer is None:
+            return Dimension()
+        state = buffer.complete_state
+        text = state.original_document.text if state is not None else buffer.text
+        count = len(self.completer.matches(text))
+        lines = buffer.document.line_count
+        return Dimension(min=lines + min(count, MENU_ROWS)) if count else Dimension()
 
     def _typing_command(self) -> bool:
         text = self.session.default_buffer.document.text_before_cursor
@@ -210,10 +242,6 @@ class LineReader:
             text = f"/{matches[0].name}"
             buffer.document = Document(text, len(text))
 
-    def _fit_menu(self, buffer: Any) -> None:
-        count = len(self.completer.matches(buffer.text)) if self.completer else 0
-        self.session.reserve_space_for_menu = min(count, MENU_ROWS)
-
     @property
     def rich(self) -> bool:
         return self.session is not None
@@ -221,7 +249,6 @@ class LineReader:
     async def read(self, prompt: str = "> ") -> str:
         """读一行。上层不要再回显——这里已经显示过了。"""
         if self.session is not None:
-            self.session.reserve_space_for_menu = 0
             # patch_stdout：流式输出和输入行共存，输出不会把正在输入的内容冲掉
             with patch_stdout(raw=True):
                 return await self.session.prompt_async(ANSI(prompt))

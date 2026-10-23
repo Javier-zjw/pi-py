@@ -99,11 +99,14 @@ async def case_collapsed_turn() -> None:
         check("回答: 续行缩进两格", answer is not None and lines[answer + 1].startswith("  - README.md"),
               str(lines[answer:answer + 3]))
         check("回答: 工具摘要在回答之前", text.index("个工具调用") < text.index("● "))
-        footers = [line for line in lines if "用时" in line]
+        footers = [line for line in lines if "↑" in line and "↓" in line]
         check("统计: 每轮只有一行", len(footers) == 1, str(footers))
         check("统计: 上下文取最后一次、输出累加",
-              "上下文 ↑4.1k" in footers[0] and "输出 ↓344" in footers[0] and "4 次工具" in footers[0],
+              "↑4.1k" in footers[0] and "↓344" in footers[0] and "4 次工具" in footers[0],
               footers[0])
+        check("统计: 不带文字标签，以用时开头",
+              footers[0].split(" · ")[0].endswith("s") and not any(
+                  word in footers[0] for word in ("用时", "上下文", "输出", "✻")), footers[0])
         check("统计: 不再每次调模型都打一行", "↑4130" not in text)
 
 
@@ -119,13 +122,15 @@ async def case_expand() -> None:
               and "cat missing.txt" in expanded, expanded)
         check("展开: 工具结果", "# demo" in expanded and "def main" in expanded)
         check("展开: 失败的工具标 ✗", "✗ bash" in expanded, expanded)
-        check("展开: 提示行里出现 ctrl+o", "ctrl+o 展开" in renderer.input_prompt())
+        prompt = renderer.input_prompt()
+        check("输入框: 上沿是不带文字的细线", prompt.split("\n")[0].strip("─ ") == ""
+              and "ctrl+o" not in prompt and "tok" not in prompt, prompt)
+        check("输入框: 下沿也是细线", renderer.input_footer().strip("─ ") == "")
 
     out = io.StringIO()
     fresh = SessionRenderer(theme=Theme(ColorMode.NONE), stream=out)
     fresh.expand_last_turn()
     check("展开: 还没有轮次时给提示", "没有可展开" in out.getvalue())
-    check("展开: 没有可展开内容时提示行不出现 ctrl+o", "ctrl+o" not in fresh.input_prompt())
 
 
 def test_running_status() -> None:

@@ -254,6 +254,57 @@ def test_openai_payload_shapes() -> None:
     check("openai: 无工具时不传 tool_choice", "tool_choice" not in payload)
 
 
+def test_prompt_cache_breakpoints() -> None:
+    import dataclasses
+
+    from pi_ai.providers.anthropic import build_payload
+
+    official = dataclasses.replace(ANTHROPIC_MODEL, provider="anthropic", base_url=None, reasoning=False)
+    tools = [Tool(name=n, description=n, parameters={"type": "object", "properties": {}})
+             for n in ("read", "bash")]
+    context = Context(
+        system_prompt="你是编码助手",
+        tools=tools,
+        messages=[
+            UserMessage(content="第一问"),
+            message_from_dict({"role": "assistant", "provider": "anthropic", "content": [
+                {"type": "toolCall", "id": "t1", "name": "read", "arguments": {"path": "a"}}]}),
+            ToolResultMessage(tool_call_id="t1", tool_name="read", content=[TextContent(text="内容")]),
+            message_from_dict({"role": "assistant", "content": [{"type": "text", "text": "读完了"}]}),
+            UserMessage(content="第二问"),
+        ],
+    )
+
+    def marks(payload):
+        found = []
+        if isinstance(payload.get("system"), list):
+            found += ["system" for b in payload["system"] if "cache_control" in b]
+        found += [f"tool:{t['name']}" for t in payload.get("tools", []) if "cache_control" in t]
+        for i, m in enumerate(payload["messages"]):
+            found += [f"msg{i}:{b['type']}" for b in m["content"] if "cache_control" in b]
+        return found
+
+    payload = build_payload(official, context, SimpleStreamOptions())
+    got = marks(payload)
+    check("缓存: 官方 Anthropic 自动开启",
+          got == ["system", "tool:bash", "msg2:tool_result", "msg4:text"], str(got))
+    check("缓存: 断点不超过 4 个", len(got) <= 4)
+    check("缓存: system 改成带断点的块", payload["system"][0]["text"] == "你是编码助手")
+
+    third_party = build_payload(ANTHROPIC_MODEL, context, SimpleStreamOptions())
+    check("缓存: 第三方兼容端点默认不加", marks(third_party) == [] and third_party["system"] == "你是编码助手",
+          str(marks(third_party)))
+    opted_in = build_payload(dataclasses.replace(ANTHROPIC_MODEL, prompt_cache=True), context,
+                             SimpleStreamOptions())
+    check("缓存: 第三方端点可显式开启", len(marks(opted_in)) == 4, str(marks(opted_in)))
+    opted_out = build_payload(dataclasses.replace(official, prompt_cache=False), context,
+                              SimpleStreamOptions())
+    check("缓存: 官方也可显式关闭", marks(opted_out) == [])
+
+    bare = build_payload(official, Context(messages=[UserMessage(content="hi")]), SimpleStreamOptions())
+    check("缓存: 没有 system / 工具时只标消息", marks(bare) == ["msg0:text"], str(marks(bare)))
+
+
 # ── 错误路径与工具函数 ──────────────────────────────────────────────
 
 
@@ -390,6 +441,7 @@ async def main() -> int:
     await case_anthropic_text()
     await case_anthropic_tools_and_thinking()
     test_anthropic_payload_shapes()
+    test_prompt_cache_breakpoints()
     print("openai-completions")
     await case_openai_text_tools_reasoning()
     test_openai_payload_shapes()

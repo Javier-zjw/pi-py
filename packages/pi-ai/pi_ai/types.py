@@ -187,6 +187,9 @@ class Model:
     input_modalities: tuple[str, ...] = ("text",)
     base_url: str | None = None
     thinking_level_map: dict[str, Any] = field(default_factory=dict)
+    # Anthropic 前缀缓存断点（cache_control）。None = 自动：官方 Anthropic 才开；
+    # 兼容 anthropic-messages 的第三方端点不一定认这个字段，需要在 models.json 里显式 "promptCache": true
+    prompt_cache: bool | None = None
 
     @property
     def key(self) -> str:

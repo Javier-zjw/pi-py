@@ -114,6 +114,7 @@ def test_runtime_custom_models() -> None:
                 "cost": {"input": 1.5, "output": 6.0, "cacheRead": 0.3},
                 "baseUrl": "https://example.invalid/api/v3",
                 "promptCache": True,
+                "reasoningPassback": True,
             }],
         }, ensure_ascii=False), "utf-8")
         (agent_dir / "auth.json").write_text(json.dumps({"ark": {"apiKey": "sk-ark"}}), "utf-8")
@@ -131,6 +132,8 @@ def test_runtime_custom_models() -> None:
             check("自定义: reasoning 标记", model.reasoning is True)
             check("自定义: base_url", model.base_url.endswith("/api/v3"), str(model.base_url))
             check("自定义: promptCache 读进模型", model.prompt_cache is True, str(model.prompt_cache))
+            check("自定义: reasoningPassback 读进模型", model.reasoning_passback is True,
+                  str(model.reasoning_passback))
         check("自定义: 出现在可用列表",
               any(m.id == "doubao-seed-code" for m in runtime.available_models()),
               str([m.key for m in runtime.available_models()]))

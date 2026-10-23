@@ -48,4 +48,15 @@ class CompactionEndEvent:
         return not (self.error or self.cancelled or self.skipped)
 
 
-CompactionEvent = CompactionStartEvent | CompactionProgressEvent | CompactionEndEvent
+@dataclass
+class ContextPrunedEvent:
+    """L1：旧工具输出被换成占位。不调模型、毫秒级，只发这一个事件。"""
+    count: int
+    tokens_before: int
+    tokens_after: int
+    type: Literal["context_pruned"] = "context_pruned"
+
+
+CompactionEvent = (
+    CompactionStartEvent | CompactionProgressEvent | CompactionEndEvent | ContextPrunedEvent
+)

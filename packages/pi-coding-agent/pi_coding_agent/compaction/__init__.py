@@ -33,11 +33,13 @@ from .events import (
     CompactionEvent,
     CompactionProgressEvent,
     CompactionStartEvent,
+    ContextPrunedEvent,
 )
 from .prune import PRUNE_ENTRY_TYPE, PrunePlan, apply_prune, is_pruned, plan_prune
 from .state import render_markdown
 
 __all__ = [
+    "PRUNE_ENTRY_TYPE",
     "STATE_MESSAGE_TYPE",
     "CompactionBudget",
     "CompactionCancelled",
@@ -49,18 +51,18 @@ __all__ = [
     "CompactionProgressEvent",
     "CompactionRequest",
     "CompactionStartEvent",
+    "ContextPrunedEvent",
     "CutPoint",
-    "PRUNE_ENTRY_TYPE",
     "PrunePlan",
     "apply_prune",
-    "is_pruned",
-    "plan_prune",
     "context_tokens",
     "estimate_message_tokens",
     "estimate_text_tokens",
     "estimate_tokens",
     "find_cut",
+    "is_pruned",
     "make_state_message",
+    "plan_prune",
     "render_markdown",
     "run_compaction",
 ]

@@ -19,9 +19,8 @@ from pi_agent import (
     AgentTool,
     CustomMessage,
     MessageEndEvent,
-    TurnEndEvent
+    TurnEndEvent,
 )
-
 from pi_ai import ImageContent, Model, ThinkingLevel, Tool, Usage
 
 from .compaction import (
@@ -34,15 +33,21 @@ from .compaction import (
     CompactionProgressEvent,
     CompactionRequest,
     CompactionStartEvent,
+    ContextPrunedEvent,
+    apply_prune,
     context_tokens,
     estimate_text_tokens,
+    plan_prune,
     run_compaction,
 )
+from .compaction.prune import PRUNE_ENTRY_TYPE
 from .model_runtime import ModelRuntime
 from .resources import DefaultResourceLoader, ResourceLoader
+from .session.entries import CustomEntry
 from .session.manager import SessionManager
 from .settings import SettingsManager
 from .tools import DEFAULT_TOOL_NAMES, create_tools
+
 
 @dataclass
 class AgentSessionServices:
@@ -133,6 +138,10 @@ class AgentSession:
             for m, entry_id in zip(state.messages, restored.get("entry_ids") or [])
             if entry_id
         }
+        # L1 清理过的工具结果；之前那些回复的 usage 是清理前的，不能当计量锚
+        self._pruned_ids: set[str] = set()
+        self._anchor_floor = 0
+        self._restore_prune(restored.get("entry_ids") or [])
         latest = self.session.latest_compaction()
         # 上一次压缩的结构化状态，下一次压缩在它的基础上增量合并
         self._compaction_state: dict[str, Any] | None = (
@@ -153,6 +162,31 @@ class AgentSession:
         self.agent.subscribe(self._on_agent_event)
         self.resources.get_extension_api().session = self
 
+
+    def _restore_prune(self, entry_ids: list[str | None]) -> None:
+        """恢复会话：重放 context_prune 条目，让发给模型的内容和中断前一致"""
+        branch = self.session.get_branch()
+        position = {e.id: i for i, e in enumerate(branch)}
+        last_prune = -1
+        for i, e in enumerate(branch):
+            if isinstance(e, CustomEntry) and e.custom_type == PRUNE_ENTRY_TYPE:
+                self._pruned_ids.update((e.data or {}).get("toolCallIds") or [])
+                last_prune = i
+        if not self._pruned_ids:
+            return
+        self._swap_messages(apply_prune(self.agent.state.messages, self._pruned_ids)[0])
+        before = [i for i, entry_id in enumerate(entry_ids)
+                  if entry_id and position.get(entry_id, -1) < last_prune]
+        self._anchor_floor = before[-1] + 1 if before else 0
+
+    def _swap_messages(self, messages: list[AgentMessage]) -> None:
+        """换成新列表；被替换成副本的消息沿用原条目 id，且永远不会再落盘"""
+        for old, new in zip(self.agent.state.messages, messages):
+            if new is not old:
+                if id(old) in self._entry_ids:
+                    self._entry_ids[id(new)] = self._entry_ids[id(old)]
+                self._persisted.add(id(new))
+        self.agent.state.messages = messages
 
     def _on_agent_event(self, event: AgentEvent) -> None:
         if isinstance(event, MessageEndEvent) and event.message is not None:
@@ -217,21 +251,49 @@ class AgentSession:
     def context_tokens(self) -> int:
         """下一次请求的上下文大小（以服务商实报 usage 为锚）"""
         return context_tokens(self.agent.state.messages, self.agent.state.system_prompt,
-                              self._llm_tools())
+                              self._llm_tools(), min_anchor=self._anchor_floor)
 
     async def _maybe_compact(self, extra_text: str = "") -> bool:
-        """超过触发线就同步压缩。一次 prompt 内最多尝试两次，失败或取消后本轮不再尝试"""
-        if self._compacting or self._compaction_blocked:
-            return False
-        if not self.settings.get("compaction.enabled", True) or self._compaction_attempts >= 2:
+        """先 L1 清理旧工具输出（不调模型），仍超触发线再做 L2 摘要。返回消息是否被替换。
+        L2 一次 prompt 内最多尝试两次，失败或取消后本轮不再尝试"""
+        if self._compacting or not self.settings.get("compaction.enabled", True):
             return False
         budget = self.compaction_budget()
         if budget is None or not budget.context_window:
             return False
-        if not budget.should_compact(self.context_tokens() + estimate_text_tokens(extra_text)):
-            return False
+        extra = estimate_text_tokens(extra_text)
+        changed = False
+        if budget.should_prune(self.context_tokens() + extra):
+            changed = self.prune(budget, extra)
+        if self._compaction_blocked or self._compaction_attempts >= 2:
+            return changed
+        if not budget.should_compact(self.context_tokens() + extra):
+            return changed
         self._compaction_attempts += 1
-        return await self.compact(reason="threshold") is not None
+        return await self.compact(reason="threshold") is not None or changed
+
+    def prune(self, budget: CompactionBudget | None = None, extra_tokens: int = 0) -> bool:
+        """L1：把受保护区间之外的旧工具输出换成占位，清到目标线以下。同步、不调模型。
+        只能在安全点调用（prompt 开始前 / transform_context 里），否则会和主循环抢消息列表"""
+        budget = budget or self.compaction_budget()
+        if budget is None:
+            return False
+        before = self.context_tokens()
+        plan = plan_prune(self.agent.state.messages, before + extra_tokens, budget.prune_target,
+                          budget.protect, budget.prune_min_tokens)
+        if not plan.tool_call_ids:
+            return False
+        messages, count = apply_prune(self.agent.state.messages, plan.tool_call_ids)
+        self._swap_messages(messages)
+        self._pruned_ids.update(plan.tool_call_ids)
+        self.session.append_custom_entry(
+            PRUNE_ENTRY_TYPE, {"toolCallIds": plan.tool_call_ids, "tokensSaved": plan.tokens_saved}
+        )
+        # 之前那些回复报的 usage 都是清理前的
+        self._anchor_floor = len(messages)
+        self._emit(ContextPrunedEvent(count=count, tokens_before=before,
+                                      tokens_after=self.context_tokens()))
+        return True
 
     async def compact(
             self, custom_instructions: str | None = None, reason: str = "manual"
@@ -339,6 +401,7 @@ class AgentSession:
         state_message = outcome.state_message()
         self._persisted.add(id(state_message))
         self.agent.state.messages = [state_message, *retained]
+        self._anchor_floor = 0          # 保留尾部的旧 usage 由状态消息的 tailLength 排除
         self._compaction_state = outcome.state
         live = {id(m) for m in self.agent.state.messages}
         self._entry_ids = {k: v for k, v in self._entry_ids.items() if k in live}

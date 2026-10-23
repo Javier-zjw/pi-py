@@ -498,6 +498,87 @@ async def case_manual_compact() -> None:
               reopened.messages[0].details.get("tailLength") == len(reopened.messages) - 1)
 
 
+def read_script(n: int) -> list[list]:
+    return [[ToolCall(id=f"r{i}", name="read", arguments={"path": f"f{i}.txt"})] for i in range(n)] \
+        + [[TextContent(text="都读完了")]]
+
+
+def write_files(cwd: Path, n: int) -> None:
+    for i in range(n):
+        (cwd / f"f{i}.txt").write_text("\n".join(f"第{i}个文件" + "内容" * 30 for _ in range(40)),
+                                       "utf-8")
+
+
+async def case_prune_in_tool_loop() -> None:
+    """长工具链把上下文撑到 60%：先清理旧工具输出（不调模型），不必走 L2 摘要。"""
+    with Sandbox() as cwd:
+        write_files(cwd, 6)
+        manager = file_manager(cwd)
+        session, provider = compaction_session(cwd, read_script(6), tools=["read"],
+                                               session_manager=manager, usage=Usage())
+        session.settings.set("compaction.prune.protectTokens", 3000)
+        events = record(session)
+        await session.prompt("把 f0 到 f5 都读一遍")
+        types = [e.type for e in events]
+        check("清理: 触发了 L1", "context_pruned" in types, str(types))
+        check("清理: 没有走 L2 摘要", "compaction_start" not in types, str(types))
+        check("清理: 没有额外的模型调用", len(provider.calls) == 7, str(len(provider.calls)))
+        pruned = next(e for e in events if e.type == "context_pruned")
+        check("清理: 事件带前后大小", pruned.count >= 1 and pruned.tokens_after < pruned.tokens_before,
+              f"{pruned.count}: {pruned.tokens_before} → {pruned.tokens_after}")
+        last_call = provider.calls[-1]["context"].messages
+        texts = [m.text() for m in last_call if getattr(m, "role", "") == "toolResult"]
+        check("清理: 最旧的输出换成占位", texts[0].startswith("[已清理的 read 输出") and "f0.txt" in texts[0],
+              texts[0][:60])
+        check("清理: 最近的输出保留原文", "第5个文件" in texts[-1])
+        check("清理: 这一轮正常结束", session.messages[-1].text() == "都读完了")
+
+        entries = manager.get_entries()
+        prunes = [e for e in entries if e.type == "custom" and e.custom_type == "context_prune"]
+        check("清理: 写入 context_prune 条目", len(prunes) >= 1 and "r0" in prunes[0].data["toolCallIds"],
+              str([e.data for e in prunes]))
+        check("清理: 条目数和事件数一致", len(prunes) == types.count("context_pruned"))
+        disk = [e.message.text() for e in entries
+                if e.type == "message" and getattr(e.message, "role", "") == "toolResult"]
+        check("清理: 会话文件保留原文", "第0个文件" in disk[0])
+
+        reopened = AgentSession(session.services, SessionManager.open(cwd / "s.jsonl"),
+                                model=MID_MODEL, tools=["read"])
+        check("清理: 恢复后内容一致", [m.text() for m in reopened.messages]
+              == [m.text() for m in session.messages])
+        check("清理: 恢复后旧 usage 仍不当锚", reopened._anchor_floor > 0, str(reopened._anchor_floor))
+
+
+async def case_prune_ignores_stale_usage() -> None:
+    with Sandbox() as cwd:
+        write_files(cwd, 6)
+        session, _ = compaction_session(cwd, read_script(6), tools=["read"], usage=Usage())
+        session.settings.set("compaction.prune.protectTokens", 3000)
+        await session.prompt("读文件")
+        floor = session._anchor_floor
+        check("清理: 记下了计量下限", 0 < floor <= len(session.messages), str(floor))
+        for m in session.messages[:floor]:
+            if isinstance(m, AssistantMessage):
+                m.usage = Usage(input=14_000)   # 清理前报的大数
+        session.messages.append(AssistantMessage(content=[TextContent(text="新回复")],
+                                                 usage=Usage(input=5_000), stop_reason="stop"))
+        check("清理: 清理之后的新 usage 才当锚", session.context_tokens() == 5_000,
+              str(session.context_tokens()))
+        session.messages.pop()
+        check("清理: 清理之前的 usage 不当锚", session.context_tokens() < 14_000,
+              str(session.context_tokens()))
+
+
+async def case_prune_disabled() -> None:
+    with Sandbox() as cwd:
+        write_files(cwd, 6)
+        session, _ = compaction_session(cwd, read_script(6), tools=["read"], usage=Usage())
+        session.settings.set("compaction.prune.enabled", False)
+        events = record(session)
+        await session.prompt("读文件")
+        check("清理: 关闭后不触发", "context_pruned" not in [e.type for e in events])
+
+
 async def case_compaction_no_gain() -> None:
     """内容太少、压缩后反而更大时不替换历史。"""
     with Sandbox() as cwd:
@@ -962,6 +1043,18 @@ def test_manual_compact() -> None:
     asyncio.run(case_manual_compact())
 
 
+def test_prune_in_tool_loop() -> None:
+    asyncio.run(case_prune_in_tool_loop())
+
+
+def test_prune_ignores_stale_usage() -> None:
+    asyncio.run(case_prune_ignores_stale_usage())
+
+
+def test_prune_disabled() -> None:
+    asyncio.run(case_prune_disabled())
+
+
 def test_compaction_no_gain() -> None:
     asyncio.run(case_compaction_no_gain())
 
@@ -1036,6 +1129,9 @@ async def main() -> int:
     test_diagnostics_surface()
     print("压缩接入")
     await case_manual_compact()
+    await case_prune_in_tool_loop()
+    await case_prune_ignores_stale_usage()
+    await case_prune_disabled()
     await case_compaction_no_gain()
     await case_double_compaction_resume()
     await case_compact_before_prompt()

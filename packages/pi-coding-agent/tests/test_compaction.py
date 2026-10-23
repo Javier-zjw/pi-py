@@ -46,6 +46,13 @@ from pi_coding_agent.compaction.budget import (  # noqa: E402
     estimate_text_tokens,
 )
 from pi_coding_agent.compaction.cut import chunk_ranges, find_cut, is_valid_boundary  # noqa: E402
+from pi_coding_agent.compaction.prune import (  # noqa: E402
+    STUB_PREFIX,
+    apply_prune,
+    is_pruned,
+    plan_prune,
+    stub_text,
+)
 from pi_coding_agent.compaction.engine import (  # noqa: E402
     CompactionCancelled,
     CompactionFailed,
@@ -140,6 +147,11 @@ def test_context_tokens() -> None:
     after.append(assistant("b", usage=Usage(input=3000)))
     check("计量: 压缩后的新 usage 可当锚", context_tokens(after) == 3000, str(context_tokens(after)))
 
+    pruned = [UserMessage(content="q"), assistant("a", usage=Usage(input=90_000)),
+              UserMessage(content="x" * 400)]
+    check("计量: min_anchor 之前的 usage 不当锚（清理之后）",
+          context_tokens(pruned, min_anchor=2) < 1000, str(context_tokens(pruned, min_anchor=2)))
+
 
 def test_budget() -> None:
     b = CompactionBudget(context_window=200_000)
@@ -154,11 +166,18 @@ def test_budget() -> None:
     check("预算: 摘要上限", b.summary_budget(10_000_000) == 8_000)
     check("预算: 达到触发线才压缩", b.should_compact(b.trigger) and not b.should_compact(b.trigger - 1))
     check("预算: 无窗口不压缩", not CompactionBudget(context_window=0).should_compact(10**9))
+    check("预算: 清理触发线 60%", b.prune_trigger == int(b.usable * 0.6))
+    check("预算: 清理目标 40%", b.prune_target == int(b.usable * 0.4))
+    check("预算: 保护区取较小值", b.protect == 40_000 and small.protect == 4_800)
+    check("预算: 到线才清理", b.should_prune(b.prune_trigger) and not b.should_prune(b.prune_trigger - 1))
+    check("预算: 可关闭清理",
+          not CompactionBudget(context_window=200_000, prune_enabled=False).should_prune(10**9))
 
-    settings = {"compaction.threshold": 0.7, "compaction.keepRecentTokens": 5000}
+    settings = {"compaction.threshold": 0.7, "compaction.keepRecentTokens": 5000,
+                "compaction.prune.triggerRatio": 0.5}
     fb = CompactionBudget.from_settings(BIG_MODEL, lambda k, d: settings.get(k, d))
     check("预算: 从设置读取", fb.trigger_ratio == 0.7 and fb.keep_recent_tokens == 5000
-          and fb.context_window == 200_000)
+          and fb.context_window == 200_000 and fb.prune_trigger_ratio == 0.5)
 
 
 # --------------------------------------------------------------------------- #
@@ -663,6 +682,77 @@ def test_engine_shrinks_tail() -> None:
     asyncio.run(case_engine_shrinks_tail())
 
 
+# --------------------------------------------------------------------------- #
+# 5. L1 清理旧工具输出
+# --------------------------------------------------------------------------- #
+
+
+def prune_history() -> list:
+    msgs: list = [UserMessage(content="重构认证模块")]
+    for i in range(10):
+        msgs += tool_turn(f"r{i}", "read", {"path": f"src/m{i}.py"}, "源码" * 600,
+                          {"path": f"/w/src/m{i}.py"})
+    msgs += tool_turn("b1", "bash", {"command": "pytest -q"}, "失败日志" * 400,
+                      {"command": "pytest -q", "exit_code": 1})
+    msgs += tool_turn("s1", "ls", {"path": "."}, "a b c", {"path": "/w"})
+    msgs.append(assistant("看完了"))
+    return msgs
+
+
+def test_stub_text() -> None:
+    read = ToolResultMessage(tool_call_id="1", tool_name="read",
+                             content=[TextContent(text="x")], details={"path": "/w/a.py"})
+    call = ToolCall(id="1", name="read", arguments={"path": "a.py", "offset": 10, "limit": 50})
+    text = stub_text(read, call, 8200)
+    check("占位: read 带路径和行号", "/w/a.py（第 10-59 行）" in text and "8.2k" in text, text)
+    check("占位: 以固定前缀开头", text.startswith(STUB_PREFIX))
+    bash = ToolResultMessage(tool_call_id="2", tool_name="bash", content=[TextContent(text="x")],
+                             details={"command": "make test", "exit_code": 2})
+    text = stub_text(bash, None, 500)
+    check("占位: bash 带命令和退出码", "`make test`，exit 2" in text and "副作用" in text, text)
+    err = ToolResultMessage(tool_call_id="3", tool_name="grep", is_error=True,
+                            content=[TextContent(text="regex parse error: (")])
+    text = stub_text(err, ToolCall(id="3", name="grep", arguments={"pattern": "("}), 300)
+    check("占位: 报错保留开头", "regex parse error" in text and "'pattern': '('" in text, text)
+
+
+def test_plan_prune() -> None:
+    msgs = prune_history()
+    from pi_coding_agent.compaction.budget import estimate_tokens
+    now = estimate_tokens(msgs)
+    plan = plan_prune(msgs, tokens_now=now, target_tokens=now // 2, protect_tokens=3000)
+    check("清理: 从最旧的开始", plan.tool_call_ids[:2] == ["r0", "r1"], str(plan.tool_call_ids))
+    check("清理: 降到目标以下就停", now - plan.tokens_saved <= now // 2
+          and "r9" not in plan.tool_call_ids, f"{now} - {plan.tokens_saved}; {plan.tool_call_ids}")
+    check("清理: 小结果不清", "s1" not in plan.tool_call_ids)
+
+    everything = plan_prune(msgs, tokens_now=now, target_tokens=0, protect_tokens=3000)
+    check("清理: 受保护的最近区间不动", "b1" not in everything.tool_call_ids
+          and "r9" not in everything.tool_call_ids, str(everything.tool_call_ids))
+    check("清理: 目标为 0 时清掉全部可清的", "r8" in everything.tool_call_ids)
+    check("清理: 统计节省量", everything.tokens_saved > now // 2, str(everything.tokens_saved))
+    check("清理: 已在目标以下不清", plan_prune(msgs, now, now, 3000).tool_call_ids == [])
+
+
+def test_apply_prune() -> None:
+    msgs = prune_history()
+    out, count = apply_prune(msgs, ["r0", "b1"])
+    check("替换: 条数", count == 2)
+    r0 = next(m for m in out if getattr(m, "tool_call_id", "") == "r0")
+    check("替换: 内容换成占位", is_pruned(r0) and "src/m0.py" in r0.text(), r0.text())
+    check("替换: details 保留", r0.details == {"path": "/w/src/m0.py"})
+    original = next(m for m in msgs if getattr(m, "tool_call_id", "") == "r0")
+    check("替换: 原对象不动（会话文件 / 分支用的是它）", not is_pruned(original))
+    check("替换: 工具调用本身保留", len(out) == len(msgs)
+          and all(a is b for a, b in zip(msgs, out) if not isinstance(a, ToolResultMessage)))
+    again, count = apply_prune(out, ["r0"])
+    check("替换: 不重复处理", count == 0 and again[2] is out[2])
+    facts = extract_facts(out, cwd="/w")
+    check("替换: 不影响文件记录提取", "src/m0.py" in facts["fileLedger"]["read"])
+    cut = find_cut(out, 300)
+    check("替换: 切点仍不落在工具结果上", cut is not None and is_valid_boundary(out, cut.cut))
+
+
 async def main() -> int:
     print("计量与预算")
     test_estimate()
@@ -695,6 +785,10 @@ async def main() -> int:
     await case_engine_incremental()
     await case_engine_chunked()
     await case_engine_shrinks_tail()
+    print("L1 清理")
+    test_stub_text()
+    test_plan_prune()
+    test_apply_prune()
 
     print()
     if FAILURES:

@@ -19,8 +19,11 @@ DEFAULT_SETTINGS : dict[str, Any] = {
     "toolExecution": "parallel",
     # threshold：上下文达到"可用窗口（窗口 - reserveTokens）"的这个比例时压缩
     # thinking：压缩调用的思考档位，"inherit" 表示沿用会话当前档位
+    # prune：L1 清理旧工具输出（不调模型），到 triggerRatio 时清到 targetRatio 以下，最近 protectTokens 不动
     "compaction": {"enabled": True, "threshold": 0.85, "reserveTokens": 16384,
-                   "keepRecentTokens": 20000, "maxSummaryTokens": 8000, "thinking": "off"},
+                   "keepRecentTokens": 20000, "maxSummaryTokens": 8000, "thinking": "off",
+                   "prune": {"enabled": True, "triggerRatio": 0.6, "targetRatio": 0.4,
+                             "protectTokens": 40000, "minTokens": 200}},
     "retry": {"enabled": True, "maxRetries": 3},
     "extensions": [],
     "disabledExtensions": [],

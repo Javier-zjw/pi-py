@@ -103,10 +103,14 @@ def _reported_prompt_tokens(message: AssistantMessage) -> int:
 def context_tokens(
         messages: Sequence[AgentMessage],
         system_prompt: str | None = "",
-        tools: Sequence[Tool] = ()
+        tools: Sequence[Tool] = (),
+        min_anchor: int = 0,
 ) -> int:
-    """下一次请求的上下文大小（tokens）。"""
-    start = anchor_start(messages)
+    """下一次请求的上下文大小（tokens）。
+
+    ``min_anchor``：此下标之前的 usage 不可信——比如清理旧工具输出之后，
+    之前那些回复报的 usage 还是清理前的大小。"""
+    start = max(anchor_start(messages), min_anchor)
     for i in range(len(messages) - 1, start - 1, -1):
         m = messages[i]
         if (
@@ -130,6 +134,12 @@ class CompactionBudget:
     keep_recent_tokens: int = 20_000
     trigger_ratio: float = 0.85
     max_summary_tokens: int = 8_000
+    # L1 清理旧工具输出：到 prune_trigger_ratio 时清，清到 prune_target_ratio 以下
+    prune_enabled: bool = True
+    prune_trigger_ratio: float = 0.6
+    prune_target_ratio: float = 0.4
+    protect_tokens: int = 40_000
+    prune_min_tokens: int = 200
 
     @property
     def usable(self) -> int:
@@ -143,6 +153,22 @@ class CompactionBudget:
     @property
     def keep_recent(self) -> int:
         return max(1, min(self.keep_recent_tokens, int(self.usable * 0.2)))
+
+    @property
+    def prune_trigger(self) -> int:
+        return int(self.usable * self.prune_trigger_ratio)
+
+    @property
+    def prune_target(self) -> int:
+        return int(self.usable * self.prune_target_ratio)
+
+    @property
+    def protect(self) -> int:
+        """最近这段工具输出不清理：模型很可能还要用"""
+        return max(1, min(self.protect_tokens, int(self.usable * 0.3)))
+
+    def should_prune(self, tokens: int) -> bool:
+        return self.prune_enabled and self.context_window > 0 and tokens >= self.prune_trigger
 
     def summary_budget(self, summarized_tokens: int) -> int:
         """被压缩内容的 6%，夹在 [1.5k, min(上限, 5% 可用预算)] 之间。"""
@@ -160,4 +186,9 @@ class CompactionBudget:
             keep_recent_tokens=int(get("compaction.keepRecentTokens", 20_000)),
             trigger_ratio=float(get("compaction.threshold", 0.85)),
             max_summary_tokens=int(get("compaction.maxSummaryTokens", 8_000)),
+            prune_enabled=bool(get("compaction.prune.enabled", True)),
+            prune_trigger_ratio=float(get("compaction.prune.triggerRatio", 0.6)),
+            prune_target_ratio=float(get("compaction.prune.targetRatio", 0.4)),
+            protect_tokens=int(get("compaction.prune.protectTokens", 40_000)),
+            prune_min_tokens=int(get("compaction.prune.minTokens", 200)),
         )

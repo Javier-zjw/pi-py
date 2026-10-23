@@ -163,7 +163,7 @@ def test_live_slot() -> None:
     check("活动区: 工具顶掉思考", "bash" in text and "列目录" not in text, text)
     check("活动区: 不显示工具参数", "ls -la" not in text, text)
     check("活动区: 用时行带工具次数", "执行工具 · 1 次工具" in text, text)
-    renderer.on_event(ev("tool_execution_end", tool_call_id="t1", is_error=False,
+    renderer.on_event(ev("tool_execution_end", tool_call_id="t1", tool_name="bash", is_error=False,
                          result=SimpleNamespace(content=[], details=None)))
     check("活动区: 工具跑完显示 ✓，等下一步", "✓ bash" in live(), live())
 
@@ -241,6 +241,52 @@ def test_prune_and_notice() -> None:
     check("清理: 下一轮重新计数", "清理" not in out.getvalue().splitlines()[-3:][0], out.getvalue())
 
 
+def plan_event(call_id: str, plan: list[tuple[str, str]], is_error: bool = False):
+    steps = [{"step": step, "status": status} for step, status in plan]
+    return ev("tool_execution_end", tool_call_id=call_id, tool_name="update_plan", is_error=is_error,
+              result=SimpleNamespace(content=[], details=None if is_error else {"plan": steps}))
+
+
+def test_plan_display() -> None:
+    """update_plan 不算工具：运行中勾选单常驻活动区，回答开始前写在用时行下面，展开时按顺序出现"""
+    out = io.StringIO()
+    renderer = SessionRenderer(theme=Theme(ColorMode.NONE), stream=out)
+    renderer.on_event(ev("agent_start"))
+    renderer.on_event(ev("tool_execution_start", tool_call_id="p1", tool_name="update_plan",
+                         arguments={}))
+    renderer.on_event(plan_event("p1", [("读取项目结构", "completed"), ("分析压缩模块", "in_progress"),
+                                        ("总结", "pending")]))
+    live = "\n".join(renderer._live_lines())
+    check("计划: 活动区显示勾选单", "✓ 读取项目结构" in live and "▸ 分析压缩模块" in live
+          and "○ 总结" in live, live)
+    check("计划: 不算工具调用", renderer.state.tool_total == 0 and "次工具" not in live, live)
+    renderer.on_event(ev("tool_execution_start", tool_call_id="t1", tool_name="read",
+                         arguments={"path": "a.py"}))
+    live = "\n".join(renderer._live_lines())
+    check("计划: 执行别的工具时勾选单还在", "▸ 分析压缩模块" in live and "read" in live, live)
+    renderer.on_event(ev("tool_execution_end", tool_call_id="t1", tool_name="read", is_error=False,
+                         result=SimpleNamespace(content=[], details=None)))
+    renderer.on_event(plan_event("p2", [("全部", "in_progress"), ("一起", "in_progress")], is_error=True))
+    check("计划: 被拒绝的更新不显示", "▸ 分析压缩模块" in "\n".join(renderer._live_lines()))
+    renderer.on_event(plan_event("p3", [("读取项目结构", "completed"), ("分析压缩模块", "completed"),
+                                        ("总结", "in_progress")]))
+    renderer.on_event(delta("text_delta", "结论。"))
+    renderer.on_event(ev("message_end", message=SimpleNamespace(
+        role="assistant", content=[], stop_reason="stop", usage=None, text=lambda: "结论。")))
+    renderer.on_event(ev("agent_end", reason="stop"))
+    lines = out.getvalue().splitlines()
+    summary = next(i for i, line in enumerate(lines) if line.startswith("✻ "))
+    check("计划: 用时行只数真正的工具", "1 次工具 read" in lines[summary], lines[summary])
+    check("计划: 最终勾选单写在用时行下面、回答上面",
+          lines[summary + 1:summary + 4] == ["  ✓ 读取项目结构", "  ✓ 分析压缩模块", "  ▸ 总结"]
+          and out.getvalue().index("▸ 总结") < out.getvalue().index("● 结论"), str(lines))
+    before = len(out.getvalue())
+    renderer.expand_last_turn()
+    expanded = out.getvalue()[before:]
+    check("计划: 展开时按顺序出现", expanded.index("☰ 计划") < expanded.index("✓ read")
+          < expanded.rindex("☰ 计划"), expanded)
+
+
 def test_running_status() -> None:
     """运行中只显示正在执行的那个工具：名字 + 时长，不带参数"""
     renderer = SessionRenderer(theme=Theme(ColorMode.NONE), stream=io.StringIO())
@@ -306,6 +352,7 @@ async def main() -> int:
     print("活动区")
     test_live_slot()
     test_prune_and_notice()
+    test_plan_display()
     print("展开")
     await case_expand()
     print("状态行与回显")

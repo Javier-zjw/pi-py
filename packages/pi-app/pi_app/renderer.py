@@ -69,6 +69,8 @@ ANSWER_MARK = "●"
 INDENT = "  "
 SLOT_LINES = 6        # 活动区里思考 / 过渡话最多显示几行（只显示最新的）
 PREVIEW_ROWS = 12     # 回答还没定稿的部分（半行、没收齐的表格）在活动区里最多显示几行
+PLAN_TOOL = "update_plan"   # 任务计划（内置扩展 todo）：不算工具调用，显示成勾选单
+PLAN_ROWS = 8         # 计划最多显示几步
 
 
 def summarize_arguments(arguments: Any) -> str:
@@ -131,6 +133,7 @@ class TurnRecord:
     """一轮的过程记录。ctrl+o 展开的就是它。
 
     steps 按发生顺序：("thinking", (全文, 秒)) / ("text", 过渡话) / ("tool", ToolRecord)
+    / ("plan", 计划步骤列表)
     """
 
     thinking: list[tuple[str, float]] = field(default_factory=list)
@@ -153,6 +156,8 @@ class RenderState:
     shown: str = ""                 # slot 为 thinking / text 时显示的文字
     batch: list[ToolRecord] = field(default_factory=list)   # slot 为 tools 时的这一批
     summary_done: bool = False      # 本轮的「✻ 用时 · 工具」已经写出
+    # 本轮 update_plan 的最新计划：运行中常驻活动区，回答开始前写在用时行下面
+    plan: list[dict] | None = None
     turn_started: float = 0.0
     label: str = "思考中"
     detail: str = ""
@@ -265,6 +270,11 @@ class SessionRenderer:
                 lines += [f"{t.thinking('│')} {t.muted(line)}" for line in wrap(text.strip(), width - 2)]
             elif kind == "text":
                 lines += [f"{t.muted('◦')} {t.muted(line)}" for line in wrap(value, width - 2)]
+            elif kind == "plan":
+                marks = {"completed": "✓", "in_progress": "▸"}
+                lines.append(t.accent("☰ 计划"))
+                lines += [f"  {marks.get(item.get('status'), '○')} {truncate(str(item.get('step', '')), width - 4)}"
+                          for item in value]
             else:
                 record = value
                 mark = t.error("✗") if record.is_error else t.success("✓")
@@ -375,6 +385,8 @@ class SessionRenderer:
     def _on_tool_execution_start(self, event) -> None:
         self._commit_thinking()
         self._end_answer()
+        if event.tool_name == PLAN_TOOL:
+            return      # 计划更新不算工具调用，等结果出来再显示（被拒绝的更新不显示）
         record = ToolRecord(event.tool_call_id, event.tool_name, event.arguments, time.time())
         self.state.running[event.tool_call_id] = record
         if self.state.slot != "tools":
@@ -391,6 +403,13 @@ class SessionRenderer:
         self._repaint()
 
     def _on_tool_execution_end(self, event) -> None:
+        if event.tool_name == PLAN_TOOL:
+            details = getattr(event.result, "details", None)
+            if not event.is_error and isinstance(details, dict) and details.get("plan"):
+                self.state.plan = details["plan"]
+                self.turn.steps.append(("plan", details["plan"]))
+                self._repaint()
+            return
         record = self.state.running.pop(event.tool_call_id, None)
         if record is None:
             return
@@ -591,7 +610,7 @@ class SessionRenderer:
             return
         self.state.summary_done = True
         self.live.finalize()
-        self._emit([self._turn_summary()])
+        self._emit([self._turn_summary(), *self._plan_lines()])
         self._prune_times = self._pruned_tokens = 0
 
     def _begin_answer(self, text: str) -> None:
@@ -671,7 +690,7 @@ class SessionRenderer:
             head += t.muted(f" · {self.state.tool_total} 次工具")
         if self._prune_times:
             head += t.muted(f" · 清理 {self._prune_times} 次")
-        lines = [head + detail]
+        lines = [head + detail, *self._plan_lines()]
         slot = self.state.slot
         if slot == "tools" and self.state.batch:
             lines.append(self._tools_line())
@@ -679,6 +698,27 @@ class SessionRenderer:
             lines += [t.thinking(f"{INDENT}{line}", italic=True) for line in self._slot_lines(self.state.shown)]
         elif slot == "text":
             lines += [f"{INDENT}{line}" for line in self._slot_lines(self.state.shown)]
+        return lines
+
+    def _plan_lines(self) -> list[str]:
+        """计划勾选单：✓ 做完的、▸ 正在做的、○ 还没做的。步骤太多只显示前几步"""
+        plan = self.state.plan
+        if not plan:
+            return []
+        t = self.theme
+        width = max(self.width - 6, 10)
+        lines = []
+        for item in plan[:PLAN_ROWS]:
+            step = truncate(str(item.get("step", "")), width)
+            status = item.get("status")
+            if status == "completed":
+                lines.append(f"{INDENT}{t.success('✓')} {t.muted(step)}")
+            elif status == "in_progress":
+                lines.append(f"{INDENT}{t.accent('▸', bold=True)} {t.bold(step)}")
+            else:
+                lines.append(f"{INDENT}{t.muted('○ ' + step)}")
+        if len(plan) > PLAN_ROWS:
+            lines.append(f"{INDENT}{t.muted(f'… 还有 {len(plan) - PLAN_ROWS} 步')}")
         return lines
 
     def _tools_line(self) -> str:

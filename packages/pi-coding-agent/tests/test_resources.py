@@ -46,7 +46,9 @@ from pi_coding_agent.skills import (  # noqa: E402
 from pi_coding_agent.text import read_text_lenient  # noqa: E402
 
 VERBOSE = "-v" in sys.argv
-UNDER_PYTEST = "PYTEST_CURRENT_TEST" in os.environ
+def under_pytest() -> bool:
+    # 必须在调用时判断：import（收集）阶段 pytest 还没设置这个环境变量
+    return "PYTEST_CURRENT_TEST" in os.environ
 FAILURES: list[str] = []
 
 
@@ -56,7 +58,7 @@ def check(name: str, cond: bool, detail: str = "") -> None:
         return
     FAILURES.append(f"{name}: {detail}")
     print(f"  FAIL {name} {detail}")
-    if UNDER_PYTEST:
+    if under_pytest():
         raise AssertionError(f"{name}: {detail}")
 
 
@@ -468,7 +470,7 @@ def test_resource_loader() -> None:
         check("资源: 发现上下文文件",
               any("项目约定" in f.content for f in loader.get_context_files()))
         check("资源: 加载扩展",
-              [e.name for e in loader.get_extensions()] == ["demo-ext"],
+              [e.name for e in loader.get_extensions()] == ["plan_mode", "demo-ext"],
               str([(e.name, e.error) for e in loader.get_extensions()]))
         check("资源: 扩展注册的工具可取",
               [t.name for t in loader.get_extension_api().tools] == ["hello"])

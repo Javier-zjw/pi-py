@@ -9,11 +9,14 @@ from .loop import (
     LoopConfig,
     agent_loop_continue,
     default_convert_to_llm,
+    ensure_tool_results,
     execute_tool_calls,
-    run_agent_loop
+    find_missing_tool_results,
+    interrupted_tool_result,
+    run_agent_loop,
 )
 from .queue import PendingMessageQueue
-from .serde import agent_message_to_dict, agent_message_from_dict
+from .serde import agent_message_from_dict, agent_message_to_dict
 from .types import (
     AfterToolCall,
     AfterToolCallResult,
@@ -42,10 +45,9 @@ from .types import (
     ToolExecutionStartEvent,
     ToolExecutionUpdateEvent,
     TransformContext,
+    TurnEndEvent,
     TurnStartEvent,
-    TurnEndEvent
 )
-
 from .validation import ValidationError, validate_tool_arguments
 
 __version__ = "0.1.0"
@@ -88,7 +90,10 @@ __all__ = [
     "agent_message_from_dict",
     "agent_message_to_dict",
     "default_convert_to_llm",
+    "ensure_tool_results",
     "execute_tool_calls",
+    "find_missing_tool_results",
+    "interrupted_tool_result",
     "run_agent_loop",
     "validate_tool_arguments",
 ]

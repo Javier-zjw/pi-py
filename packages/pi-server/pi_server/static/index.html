@@ -638,6 +638,19 @@ createApp({
           // 用户在模型运行途中插入的消息（steering / follow-up）
           if (turn) turn.injected.push(frame.text);
           break;
+        case 'compaction_start':
+          // 免构建页面只给文字状态；完整的横幅和压缩卡片在 pi-web 里
+          if (turn) turn.injected.push(`⟳ 正在压缩上下文（压缩前 ${frame.tokensBefore} tokens）…`);
+          break;
+        case 'context_pruned':
+          if (turn) turn.injected.push(`已清理 ${frame.count} 个旧工具输出：${frame.tokensBefore} → ${frame.tokensAfter} tokens`);
+          break;
+        case 'compaction_end':
+          if (!turn) break;
+          if (frame.ok) turn.injected.push(`✓ 上下文已压缩：${frame.tokensBefore} → ${frame.tokensAfter} tokens`);
+          else if (frame.error) turn.injected.push(`压缩未执行：${frame.error}`);
+          else if (frame.cancelled) turn.injected.push('已取消压缩，上下文保持原样');
+          break;
         case 'message_end':
           if (!turn) return;
           turn.usage = frame.usage || {};

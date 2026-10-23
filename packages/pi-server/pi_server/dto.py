@@ -53,6 +53,28 @@ def usage_dto(usage: Any) -> dict[str, Any]:
     }
 
 
+def compaction_dto(event: Any) -> dict[str, Any]:
+    """压缩结果。实时事件（CompactionEndEvent）和历史条目共用这一份形状。"""
+    state = getattr(event, "state", None) or {}
+    return {
+        "ok": bool(getattr(event, "ok", True)),
+        "reason": getattr(event, "reason", ""),
+        "tokensBefore": getattr(event, "tokens_before", 0),
+        "tokensAfter": getattr(event, "tokens_after", None),
+        "summary": getattr(event, "summary", ""),
+        "seq": state.get("seq"),
+        "llm": state.get("llm"),
+        "fileLedger": state.get("fileLedger"),
+        "userMessages": len(state.get("userMessages") or []),
+        "rehydratedFiles": list((state.get("meta") or {}).get("rehydratedFiles") or []),
+        "degraded": bool(getattr(event, "degraded", False)),
+        "restored": list(getattr(event, "restored", None) or []),
+        "error": getattr(event, "error", None),
+        "cancelled": bool(getattr(event, "cancelled", False)),
+        "skipped": bool(getattr(event, "skipped", False)),
+    }
+
+
 @dataclass
 class EventTranslator:
     """把一轮 prompt 的事件流翻译成前端帧。
@@ -163,6 +185,36 @@ class EventTranslator:
                 "plan": details.get("plan"),
             }
         ]
+
+    # -- 压缩：start → progress* → end，前端据此显示横幅和压缩卡片 ---------- #
+
+    def _on_compaction_start(self, event) -> list[dict]:
+        return [{
+            "type": "compaction_start",
+            "reason": event.reason,
+            "tokensBefore": event.tokens_before,
+            "contextWindow": event.context_window,
+        }]
+
+    def _on_compaction_progress(self, event) -> list[dict]:
+        return [{
+            "type": "compaction_progress",
+            "phase": event.phase,
+            "chunk": event.chunk,
+            "chunks": event.chunks,
+            "text": event.delta,
+        }]
+
+    def _on_compaction_end(self, event) -> list[dict]:
+        return [{"type": "compaction_end", **compaction_dto(event)}]
+
+    def _on_context_pruned(self, event) -> list[dict]:
+        return [{
+            "type": "context_pruned",
+            "count": event.count,
+            "tokensBefore": event.tokens_before,
+            "tokensAfter": event.tokens_after,
+        }]
 
     def _on_agent_end(self, event) -> list[dict]:
         return [{"type": "done", "reason": event.reason, "elapsed": self.elapsed}]

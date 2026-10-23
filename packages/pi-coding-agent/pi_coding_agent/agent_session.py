@@ -6,6 +6,8 @@ AgentSession — 组合聚合层。
 
 from __future__ import annotations
 
+import asyncio
+import dataclasses
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
@@ -18,17 +20,47 @@ from pi_agent import (
     AgentTool,
     CustomMessage,
     MessageEndEvent,
-    TurnEndEvent
+    TurnEndEvent,
+    find_missing_tool_results,
+    interrupted_tool_result,
+)
+from pi_ai import (
+    AssistantMessage,
+    ImageContent,
+    Model,
+    ThinkingLevel,
+    Tool,
+    ToolResultMessage,
+    Usage,
+    UserMessage,
+    is_context_overflow,
 )
 
-from pi_ai import ImageContent, Model, ThinkingLevel, Usage
-
-from .compaction import CompactionResult, compact, should_compact
+from .compaction import (
+    CompactionBudget,
+    CompactionCancelled,
+    CompactionEndEvent,
+    CompactionFailed,
+    CompactionOutcome,
+    CompactionProgress,
+    CompactionProgressEvent,
+    CompactionRequest,
+    CompactionStartEvent,
+    ContextPrunedEvent,
+    apply_prune,
+    context_tokens,
+    estimate_text_tokens,
+    plan_prune,
+    run_compaction,
+)
+from .compaction.prune import PRUNE_ENTRY_TYPE
 from .model_runtime import ModelRuntime
 from .resources import DefaultResourceLoader, ResourceLoader
+from .session.entries import CustomEntry
 from .session.manager import SessionManager
 from .settings import SettingsManager
 from .tools import DEFAULT_TOOL_NAMES, create_tools
+
 
 @dataclass
 class AgentSessionServices:
@@ -89,6 +121,9 @@ class AgentSession:
         active_tools = [t for t in all_tools if t.name not in excluded]
 
         restored = self.session.build_session_context()
+        # 上次在工具执行中退出：补上"被中断"的结果并写回文件（发请求时 pi-agent 也会兜底补，
+        # 这里落盘是为了历史里看得到这一步没做完）
+        self.interrupted_tool_calls = self._repair_interrupted(restored)
         if model is None and restored["model"]:
             model = self.model_runtime.get_model(*restored["model"])
         if model is None:
@@ -109,11 +144,35 @@ class AgentSession:
             initial_state=state,
             tool_execution=self.settings.get("toolExecution", "parallel"),
             transform_context=self._transform_context,
+            on_stream_error=self._on_stream_error,
         )
 
-        self._listeners: list[Callable[[AgentEvent], None]] = []
+        self._listeners: list[Callable[[Any], None]] = []
         self._persisted: set[int] = set()
+        # id(message) → 会话条目 id，压缩时用来写 firstKeptEntryId
+        self._entry_ids: dict[int, str] = {
+            id(m): entry_id
+            for m, entry_id in zip(state.messages, restored.get("entry_ids") or [])
+            if entry_id
+        }
+        # L1 清理过的工具结果；之前那些回复的 usage 是清理前的，不能当计量锚
+        self._pruned_ids: set[str] = set()
+        self._anchor_floor = 0
+        self._restore_prune(restored.get("entry_ids") or [])
+        latest = self.session.latest_compaction()
+        # 上一次压缩的结构化状态，下一次压缩在它的基础上增量合并
+        self._compaction_state: dict[str, Any] | None = (
+            latest.details.get("state") if latest and isinstance(latest.details, dict) else None
+        )
         self._compacting = False
+        # 压缩期间进来的 prompt 要等它做完，否则压缩结果会覆盖掉这一轮的消息
+        self._compaction_idle = asyncio.Event()
+        self._compaction_idle.set()
+        self._in_loop = False
+        self._compaction_cancel: asyncio.Event | None = None
+        self._compaction_attempts = 0
+        self._compaction_blocked = False
+        self._overflow_recovered = False
         # 当前工作模式。核心不解释它的含义，具体行为由扩展的 Mode.apply 决定
         self.mode: str = "chat"
         self._base_system_prompt = state.system_prompt or ""
@@ -122,13 +181,56 @@ class AgentSession:
         self.resources.get_extension_api().session = self
 
 
+    def _repair_interrupted(self, restored: dict[str, Any]) -> list[str]:
+        """只处理末尾那次：结果追加到分支末尾刚好紧跟在调用之后。更早的缺口由请求出口兜底"""
+        messages: list[AgentMessage] = restored["messages"]
+        missing = find_missing_tool_results(messages)
+        if not missing or missing[-1][0] != len(messages):
+            return []
+        entry_ids = restored.setdefault("entry_ids", [])
+        repaired: list[str] = []
+        for call in missing[-1][1]:
+            result = interrupted_tool_result(call)
+            entry_ids.append(self.session.append_message(result))
+            messages.append(result)
+            repaired.append(call.id)
+        return repaired
+
+    def _restore_prune(self, entry_ids: list[str | None]) -> None:
+        """恢复会话：重放 context_prune 条目，让发给模型的内容和中断前一致"""
+        branch = self.session.get_branch()
+        position = {e.id: i for i, e in enumerate(branch)}
+        last_prune = -1
+        for i, e in enumerate(branch):
+            if isinstance(e, CustomEntry) and e.custom_type == PRUNE_ENTRY_TYPE:
+                self._pruned_ids.update((e.data or {}).get("toolCallIds") or [])
+                last_prune = i
+        if not self._pruned_ids:
+            return
+        self._swap_messages(apply_prune(self.agent.state.messages, self._pruned_ids)[0])
+        before = [i for i, entry_id in enumerate(entry_ids)
+                  if entry_id and position.get(entry_id, -1) < last_prune]
+        self._anchor_floor = before[-1] + 1 if before else 0
+
+    def _swap_messages(self, messages: list[AgentMessage]) -> None:
+        """换成新列表；被替换成副本的消息沿用原条目 id，且永远不会再落盘"""
+        for old, new in zip(self.agent.state.messages, messages):
+            if new is not old:
+                if id(old) in self._entry_ids:
+                    self._entry_ids[id(new)] = self._entry_ids[id(old)]
+                self._persisted.add(id(new))
+        self.agent.state.messages = messages
+
     def _on_agent_event(self, event: AgentEvent) -> None:
         if isinstance(event, MessageEndEvent) and event.message is not None:
             self._persist(event.message)
         elif isinstance(event, TurnEndEvent):
             for result in event.tool_results:
                 self._persist(result)
+        self._emit(event)
 
+    def _emit(self, event: Any) -> None:
+        """agent 事件和会话自己的事件（如压缩）走同一条订阅通道，按 event.type 区分"""
         self.resources.get_extension_api().dispatch(event)
         for listener in list(self._listeners):
             try:
@@ -141,13 +243,14 @@ class AgentSession:
             return
         self._persisted.add(id(message))
         if isinstance(message, CustomMessage):
-            self.session.append_custom_message_entry(
+            entry_id = self.session.append_custom_message_entry(
                 message.custom_type, message.content, message.display, message.details
             )
         else:
-            self.session.append_message(message)
+            entry_id = self.session.append_message(message)
+        self._entry_ids[id(message)] = entry_id
 
-    def subscribe(self, listener: Callable[[AgentEvent], None]) -> Callable[[], None]:
+    def subscribe(self, listener: Callable[[Any], None]) -> Callable[[], None]:
         self._listeners.append(listener)
 
         def unsubscribe() -> None:
@@ -157,50 +260,234 @@ class AgentSession:
         return unsubscribe
 
     async def _transform_context(self, messages: list[AgentMessage]) -> list[AgentMessage]:
-        """自动上下文压缩钩子，由Agent主循环在每次调用LLM之前触发"""
-        messages = await self.resources.get_extension_api().run_context_hook(messages)
+        """每次调用 LLM 之前由 Agent 主循环触发：长工具链在一轮内长满时在这里压缩"""
+        self._in_loop = True
+        try:
+            if await self._maybe_compact():
+                messages = list(self.agent.state.messages)
+        finally:
+            self._in_loop = False
+        return await self.resources.get_extension_api().run_context_hook(messages)
+
+    async def _on_stream_error(self, message: AssistantMessage) -> bool:
+        """服务商报上下文超长（说明估算偏小，或单个工具输出特别大）：
+        激进清理 + 摘要压缩，然后让主循环重试本轮。每次 prompt 只救一次，再超就照常报错"""
+        if self._overflow_recovered or not is_context_overflow(message):
+            return False
         if self._compacting or not self.settings.get("compaction.enabled", True):
-            return messages
-        model = self.agent.state.model
-        if model is None:
-            return messages
+            return False
+        budget = self.compaction_budget()
+        if budget is None:
+            return False
+        self._overflow_recovered = True
+        self._in_loop = True
+        try:
+            # L1 全清：受保护区间缩到保留尾部那么大，目标 0
+            pruned = self.prune(budget, target_tokens=0, protect_tokens=budget.keep_recent)
+            outcome = await self.compact(reason="overflow",
+                                         keep_recent_tokens=max(1, budget.keep_recent // 2))
+        finally:
+            self._in_loop = False
+        return outcome is not None or pruned
 
-        threshold = float(self.settings.get("compaction.threshold", 0.85))
-        if not should_compact(messages, model, threshold):
-            return messages
-        await self.compact()
-        return list(self.agent.state.messages)
+    # -- 压缩 ---------------------------------------------------------- #
 
-    async def compact(self, custom_instructions: str | None = None) -> CompactionResult | None:
+    def compaction_budget(self) -> CompactionBudget | None:
         model = self.agent.state.model
         if model is None:
             return None
-        self._compacting = True
-        try:
-            result = await compact(
-                list(self.agent.state.messages),
-                model,
-                self.model_runtime.models.complete_simple,
-                keep_last_turns=int(self.settings.get("compaction.keepLastTurns", 4)),
-                custom_instructions=custom_instructions
-            )
-        finally:
-            self._compacting = False
+        return CompactionBudget.from_settings(model, self.settings.get)
 
+    def _llm_tools(self) -> list[Tool]:
+        return [Tool(name=t.name, description=t.description, parameters=t.parameters)
+                for t in self.agent.state.tools]
+
+    def context_tokens(self) -> int:
+        """下一次请求的上下文大小（以服务商实报 usage 为锚）"""
+        return context_tokens(self.agent.state.messages, self.agent.state.system_prompt,
+                              self._llm_tools(), min_anchor=self._anchor_floor)
+
+    async def _maybe_compact(self, extra_text: str = "") -> bool:
+        """先 L1 清理旧工具输出（不调模型），仍超触发线再做 L2 摘要。返回消息是否被替换。
+        L2 一次 prompt 内最多尝试两次，失败或取消后本轮不再尝试"""
+        if self._compacting or not self.settings.get("compaction.enabled", True):
+            return False
+        budget = self.compaction_budget()
+        if budget is None or not budget.context_window:
+            return False
+        extra = estimate_text_tokens(extra_text)
+        changed = False
+        if budget.should_prune(self.context_tokens() + extra):
+            changed = self.prune(budget, extra)
+        if self._compaction_blocked or self._compaction_attempts >= 2:
+            return changed
+        if not budget.should_compact(self.context_tokens() + extra):
+            return changed
+        self._compaction_attempts += 1
+        return await self.compact(reason="threshold") is not None or changed
+
+    def prune(
+            self,
+            budget: CompactionBudget | None = None,
+            extra_tokens: int = 0,
+            target_tokens: int | None = None,
+            protect_tokens: int | None = None,
+    ) -> bool:
+        """L1：把受保护区间之外的旧工具输出换成占位，清到目标线以下。同步、不调模型。
+        只能在安全点调用（prompt 开始前 / transform_context 里），否则会和主循环抢消息列表"""
+        budget = budget or self.compaction_budget()
+        if budget is None:
+            return False
+        before = self.context_tokens()
+        plan = plan_prune(
+            self.agent.state.messages, before + extra_tokens,
+            budget.prune_target if target_tokens is None else target_tokens,
+            budget.protect if protect_tokens is None else protect_tokens,
+            budget.prune_min_tokens,
+        )
+        if not plan.tool_call_ids:
+            return False
+        messages, count = apply_prune(self.agent.state.messages, plan.tool_call_ids)
+        self._swap_messages(messages)
+        self._pruned_ids.update(plan.tool_call_ids)
+        self.session.append_custom_entry(
+            PRUNE_ENTRY_TYPE, {"toolCallIds": plan.tool_call_ids, "tokensSaved": plan.tokens_saved}
+        )
+        # 之前那些回复报的 usage 都是清理前的
+        self._anchor_floor = len(messages)
+        self._emit(ContextPrunedEvent(count=count, tokens_before=before,
+                                      tokens_after=self.context_tokens()))
+        return True
+
+    async def compact(
+            self,
+            custom_instructions: str | None = None,
+            reason: str = "manual",
+            keep_recent_tokens: int | None = None,
+    ) -> CompactionOutcome | None:
+        """同步压缩，全程发事件。任何失败都保持原历史不变并返回 None，不会打断这一轮"""
+        model = self.agent.state.model
+        budget = self.compaction_budget()
+        if model is None or budget is None or self._compacting:
+            return None
+        if keep_recent_tokens is not None:
+            budget = dataclasses.replace(budget, keep_recent_tokens=keep_recent_tokens)
+
+        tokens_before = self.context_tokens()
+        if self.agent.is_streaming and not self._in_loop:
+            # 主循环正在改消息列表，此时替换会丢消息；只能在循环的安全点（transform_context）压缩
+            self._emit(CompactionEndEvent(reason=reason, tokens_before=tokens_before,
+                                          error="agent 正在运行，请等这一轮结束后再压缩"))
+            return None
+
+        thinking = self.settings.get("compaction.thinking", "off")
+        extra_context, hook_errors = await self.resources.get_extension_api().run_compaction_context(
+            self
+        )
+        for note in hook_errors:
+            self.services.diagnostics.append(f"compaction_context 失败：{note}")
+        rehydrate = bool(self.settings.get("compaction.rehydrate.enabled", True))
+        request = CompactionRequest(
+            messages=list(self.agent.state.messages),
+            model=model,
+            stream_fn=self.model_runtime.stream_fn,
+            budget=budget,
+            system_prompt=self.agent.state.system_prompt,
+            tools=self._llm_tools(),
+            previous_state=self._compaction_state,
+            cwd=self.cwd,
+            reason=reason,
+            custom_instructions=custom_instructions,
+            reasoning=self.agent.state.thinking_level if thinking == "inherit" else thinking,
+            rehydrate_max_files=int(self.settings.get("compaction.rehydrate.maxFiles", 5))
+            if rehydrate else 0,
+            rehydrate_max_tokens=min(int(self.settings.get("compaction.rehydrate.maxTokens", 10_000)),
+                                     int(budget.usable * 0.08)),
+            extra_context=extra_context,
+        )
+
+        def on_progress(p: CompactionProgress) -> None:
+            self._emit(CompactionProgressEvent(phase=p.phase, chunk=p.chunk, chunks=p.chunks,
+                                               delta=p.delta))
+
+        self._compacting = True
+        self._compaction_idle.clear()
+        self._compaction_cancel = asyncio.Event()
+        self._emit(CompactionStartEvent(reason=reason, tokens_before=tokens_before,
+                                        context_window=budget.context_window))
+        end = CompactionEndEvent(reason=reason, tokens_before=tokens_before)
+        outcome: CompactionOutcome | None = None
+        try:
+            outcome = await run_compaction(request, on_progress, self._compaction_cancel)
+        except CompactionCancelled:
+            end.cancelled = True
+        except CompactionFailed as exc:
+            end.error = str(exc)
+        except Exception as exc:  # 压缩是附加能力，自身的 bug 不能让这一轮跑不起来
+            end.error = f"{type(exc).__name__}: {exc}"
+        finally:
+            # 之后到替换消息之间没有 await，此处放行等待中的 prompt 是安全的；
+            # 放在 finally 里，任务被取消（CancelledError）时也不会让后续 prompt 永远等下去
+            self._compacting = False
+            self._compaction_cancel = None
+            self._compaction_idle.set()
+
+        if outcome is not None and outcome.tokens_after >= outcome.tokens_before:
+            # 没变小就不替换：原始历史信息更全
+            end.error = f"压缩后没有变小（{outcome.tokens_before} → {outcome.tokens_after}），保持原样"
+            outcome = None
+
+        if outcome is None:
+            end.skipped = not (end.cancelled or end.error)
+            self._compaction_blocked = True
+            self._emit(end)
+            return None
+
+        self._apply_compaction(outcome)
+        end.tokens_after = outcome.tokens_after
+        end.summary = outcome.summary
+        end.state = outcome.state
+        end.degraded = outcome.degraded
+        end.restored = list(outcome.restored)
+        self._emit(end)
+        return outcome
+
+    def _apply_compaction(self, outcome: CompactionOutcome) -> None:
+        """落盘 + 替换内存消息，两步紧挨着做，中间没有 await"""
+        retained = outcome.retained
+        first_kept = self._entry_ids.get(id(retained[0])) if retained else None
+        ledger = outcome.state.get("fileLedger") or {}
+        details = {
+            "version": 1,
+            "state": outcome.state,
+            # 与 TS 版 pi 同名的字段，保证互读
+            "readFiles": list(ledger.get("read") or []),
+            "modifiedFiles": [m["path"] for m in ledger.get("modified") or []],
+            "reason": outcome.state.get("meta", {}).get("reason"),
+            "tokensAfter": outcome.tokens_after,
+            "degraded": outcome.degraded,
+            "restored": outcome.restored,
+            "trimmed": outcome.trimmed,
+            "chunks": outcome.chunks,
+            # 补回的上下文和状态一起放进状态消息；恢复会话时原样拼回
+            "rehydration": outcome.rehydration.text or None,
+            "rehydratedFiles": outcome.rehydration.files,
+        }
         self.session.append_compaction(
-            summary=result.summary,
-            tokens_before=result.tokens_before,
-            retained_tail=result.retained_tail,
-            details=result.details,
-            usage=result.usage,
+            summary=outcome.summary,
+            tokens_before=outcome.tokens_before,
+            retained_tail=() if first_kept else retained,
+            details=details,
+            usage=outcome.usage,
+            first_kept_entry_id=first_kept,
         )
-        summary_message = CustomMessage(
-            custom_type="compaction_summary",
-            content="Summary of the earlier conversation, which has been compacted:\n\n" + result.summary
-        )
-        self._persisted.add(id(summary_message))
-        self.agent.state.messages = [summary_message, *result.retained_tail]
-        return result
+        state_message = outcome.state_message()
+        self._persisted.add(id(state_message))
+        self.agent.state.messages = [state_message, *retained]
+        self._anchor_floor = 0          # 保留尾部的旧 usage 由状态消息的 tailLength 排除
+        self._compaction_state = outcome.state
+        live = {id(m) for m in self.agent.state.messages}
+        self._entry_ids = {k: v for k, v in self._entry_ids.items() if k in live}
 
     def expand_prompt_template(self, text: str) -> str:
         """``/deploy 附加参数`` —— 模板正文与传入参数结合使用。"""
@@ -244,11 +531,35 @@ class AgentSession:
     ) -> list[AgentMessage]:
         if expand_prompt_templates:
             text = self.expand_prompt_template(text)
+        await self._compaction_idle.wait()
+        # 先压缩、后执行：新请求本身不参与压缩，压缩完成后才追加
+        await self._prepare_run(extra_text=text)
+        return await self.agent.prompt(text, images)
+
+    async def _prepare_run(self, extra_text: str = "") -> None:
+        """每次运行前（新请求或续跑）：模式、扩展钩子、按需压缩"""
         await self._apply_mode()
         errors = await self.resources.get_extension_api().run_before_start(self)
         for note in errors:
             self.services.diagnostics.append(f"before_agent_start 失败：{note}")
-        return await self.agent.prompt(text, images)
+        self._compaction_attempts = 0
+        self._compaction_blocked = False
+        self._overflow_recovered = False
+        await self._maybe_compact(extra_text=extra_text)
+
+    @property
+    def can_continue(self) -> bool:
+        """上次在一轮中途中断：最后一条是工具结果，或是还没得到回复的用户消息"""
+        last = self.agent.state.messages[-1] if self.agent.state.messages else None
+        return isinstance(last, (ToolResultMessage, UserMessage))
+
+    async def continue_(self) -> list[AgentMessage]:
+        """不追加新消息，从断点接着跑完上次没做完的那一轮。准备工作和 prompt() 相同（先压后跑）"""
+        await self._compaction_idle.wait()
+        if not self.can_continue:
+            raise RuntimeError("没有可以继续的任务：上一轮已经完成")
+        await self._prepare_run()
+        return await self.agent.continue_()
 
     async def run_command(self, name: str, rest: str = "") -> str | None:
         """执行扩展注册的斜杠命令,终端和网页共用这一条路径"""
@@ -269,7 +580,13 @@ class AgentSession:
         self.agent.follow_up(text)
 
     def abort(self) -> None:
+        if self._compaction_cancel is not None:
+            self._compaction_cancel.set()
         self.agent.abort()
+
+    @property
+    def is_compacting(self) -> bool:
+        return self._compacting
 
 
     def set_model(self, model: Model) -> None:

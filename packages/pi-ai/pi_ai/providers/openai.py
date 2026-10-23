@@ -23,6 +23,7 @@ from ..events import (
     ToolCallEndEvent,
     ToolCallStartEvent,
 )
+from ..errors import describe_llm_error
 from ..json_parse import parse_streaming_json
 from ..transport import HttpTransport, LLMError, default_transport
 from ..types import (
@@ -135,6 +136,8 @@ def build_payload(model: Model, context: Context, options: StreamOptions) -> dic
             }
             for t in context.tools
         ]
+        if options.tool_choice:
+            payload["tool_choice"] = options.tool_choice
 
     reasoning = getattr(options, "reasoning", "off")
 
@@ -297,8 +300,8 @@ class OpenAIProvider:
                     stop_reason = _STOP_REASONS.get(choice["finish_reason"], "stop")
 
         except LLMError as exc:
-            message.error_message = str(exc)
-            yield ErrorEvent(error=str(exc), message=finalize(message, model, "error"))
+            message.error_message = describe_llm_error(exc)
+            yield ErrorEvent(error=message.error_message, message=finalize(message, model, "error"))
             return
 
         if think_index is not None and text_index is None:

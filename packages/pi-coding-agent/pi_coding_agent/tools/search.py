@@ -25,7 +25,7 @@ MAX_MATCHES = 200
 
 async def _run(cmd: list[str], cwd: str | Path) -> tuple[int, str]:
     process = await asyncio.create_subprocess_exec(
-        *cmd, cwd=str(cmd), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL
+        *cmd, cwd=str(cwd), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL
     )
     out, _ = await process.communicate()
     return process.returncode or 0, out.decode("utf-8", "replace")

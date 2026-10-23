@@ -6,6 +6,7 @@ import SideBar from "./components/SideBar.vue";
 import TurnBlock from "./components/TurnBlock.vue";
 import Composer from "./components/Composer.vue";
 import FileViewer from "./components/FileViewer.vue";
+import CompactionCard from "./components/CompactionCard.vue";
 
 const meta = reactive({
   cwd: "", models: [], tools: [], skills: [], diagnostics: [],
@@ -20,6 +21,10 @@ const plan = ref(null);
 const notices = ref([]);
 // 压缩之后，之前那些轮次的用量不再代表当前上下文占用
 const contextBase = ref(0);
+// 压缩刚结束、还没有新的模型回复时，用后端算好的压缩后大小
+const contextAfterCompaction = ref(0);
+// 正在进行的压缩：{ reason, tokensBefore, phase, chunk, chunks, preview }
+const compaction = ref(null);
 const files = ref(null);
 const openFile = ref(null);
 const session = ref(null);
@@ -37,9 +42,9 @@ const contextUsed = computed(() => {
   // 继续用旧数字会让占用一直虚高
   for (let i = turns.value.length - 1; i >= contextBase.value; i--) {
     const u = turns.value[i].usage;
-    if (u && u.input) return u.input + (u.output || 0);
+    if (u && u.input) return u.input + (u.cacheRead || 0) + (u.output || 0);
   }
-  return 0;
+  return contextAfterCompaction.value;
 });
 const totalTokens = computed(() =>
   turns.value.reduce((sum, t) => sum + (t.usage.input || 0) + (t.usage.output || 0), 0)
@@ -97,11 +102,12 @@ watch(() => draft.model, async (spec) => {
 
 function newTurn(user) {
   return {
-    user, thinking: "", text: "", tools: [], injected: [], usage: {}, elapsed: 0,
+    user, thinking: "", text: "", tools: [], injected: [], notes: [], usage: {}, elapsed: 0,
     phase: "waiting", folded: false, thinkOpen: false, toolsOpen: false, error: "",
   };
 }
 const current = () => turns.value[turns.value.length - 1];
+const kTokens = (n) => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : `${n ?? "?"}`);
 
 function scrollDown() {
   nextTick(() => {
@@ -149,13 +155,46 @@ function handle(frame) {
       }
       break;
     }
-    case "compacted":
-      // 压缩完成：把基线挪到当前位置，之前的用量不再计入上下文占用
-      contextBase.value = turns.value.length;
-      turns.value.push({
-        ...newTurn(""), phase: "done", folded: true,
-        text: `（上下文已压缩，压缩前 ${frame.tokensBefore} tokens）\n\n${frame.summary}`,
-      });
+    case "compaction_start":
+      compaction.value = {
+        reason: frame.reason, tokensBefore: frame.tokensBefore,
+        phase: "summarizing", chunk: 1, chunks: 1, preview: "",
+      };
+      break;
+    case "compaction_progress":
+      if (!compaction.value) return;
+      Object.assign(compaction.value, { phase: frame.phase, chunk: frame.chunk, chunks: frame.chunks });
+      // 只留最后一段，流式预览不需要整份 JSON
+      compaction.value.preview = (compaction.value.preview + frame.text).slice(-600);
+      return;                       // 进度帧很密，不必每次都滚动
+    case "compaction_end":
+      compaction.value = null;
+      if (frame.ok) {
+        // 卡片插在进行中的这一轮之前，不能 push 到末尾：handle() 总把帧写进最后一个 turn，
+        // 循环内压缩时后续正文会流进卡片里
+        const card = { ...newTurn(""), kind: "compaction", compaction: frame, phase: "done" };
+        const running = turn && turn.phase !== "done";
+        if (running) turns.value.splice(turns.value.length - 1, 0, card);
+        else turns.value.push(card);
+        contextBase.value = turns.value.length - (running ? 1 : 0);
+        contextAfterCompaction.value = frame.tokensAfter || 0;
+      } else if (frame.error) {
+        notices.value.push(`压缩未执行：${frame.error}`);
+        error.value = `压缩未执行：${frame.error}`;
+      } else if (frame.cancelled) {
+        error.value = "已取消压缩，上下文保持原样";
+      }
+      break;
+    case "context_pruned":
+      // L1 清理不调模型、瞬间完成：记在当轮里，不打断，不插卡片
+      if (turn) {
+        turn.notes.push(`已清理 ${frame.count} 个旧工具输出（可重新读取）：`
+          + `${kTokens(frame.tokensBefore)} → ${kTokens(frame.tokensAfter)} tokens`);
+      }
+      if (turn && turn.phase !== "done" && !turn.usage.input) {
+        contextBase.value = turns.value.length - 1;
+        contextAfterCompaction.value = frame.tokensAfter || 0;
+      }
       break;
     case "mode":
       mode.value = frame.mode;
@@ -225,6 +264,22 @@ async function send(text) {
   }
 }
 
+// 恢复的会话上次在一轮中途中断了：不用再输入，直接接着跑
+async function continueRun() {
+  if (busy.value || !session.value?.canContinue) return;
+  error.value = "";
+  turns.value.push(newTurn("（继续上次未完成的任务）"));
+  busy.value = true;
+  session.value = { ...session.value, canContinue: false };
+  scrollDown();
+  try {
+    await api.continueRun(session.value.id);
+  } catch (e) {
+    error.value = e.message;
+    busy.value = false;
+  }
+}
+
 async function switchMode(id) {
   mode.value = id;
   if (!session.value) return;      // 还没会话，等新建时带上
@@ -280,6 +335,8 @@ function newSession() {
   openFile.value = null;
   plan.value = null;
   contextBase.value = 0;
+  contextAfterCompaction.value = 0;
+  compaction.value = null;
 }
 
 async function resume(item) {
@@ -287,6 +344,12 @@ async function resume(item) {
     newSession();
     const detail = await api.historyDetail(item.file);
     turns.value = detail.turns.map((t) => ({ ...newTurn(t.user), ...t }));
+    // 历史里最后一次压缩之前的轮次不再占用上下文
+    const last = turns.value.map((t) => t.kind).lastIndexOf("compaction");
+    if (last >= 0) {
+      contextBase.value = last + 1;
+      contextAfterCompaction.value = turns.value[last].compaction?.tokensAfter || 0;
+    }
     const created = await api.createSession({
       model: draft.model || null,
       thinking: draft.thinking,
@@ -319,14 +382,22 @@ async function showFile(path) {
 }
 
 async function compact() {
-  if (!session.value) return;
+  if (!session.value || compaction.value) return;
+  error.value = "";
   try {
-    const r = await api.compact(session.value.id);
-    if (r.ok) turns.value.push({ ...newTurn(""), phase: "done", text: "（上下文已压缩）" });
+    // 过程和结果都走 SSE 的 compaction_* 帧，这里不用再自己插卡片
+    await api.compact(session.value.id);
   } catch (e) {
     error.value = e.message;
   }
 }
+
+const compactionLabel = computed(() => {
+  const c = compaction.value;
+  if (!c) return "";
+  const step = c.phase === "retrying" ? "校验未通过，重试中" : "生成摘要";
+  return c.chunks > 1 ? `${step}（第 ${c.chunk}/${c.chunks} 块）` : step;
+});
 
 async function refreshHistory() {
   try {
@@ -422,7 +493,9 @@ onMounted(async () => {
         </span>
         <span v-if="totalTokens" class="chip">{{ totalTokens }} tok</span>
         <span v-if="totalCost" class="chip">¥{{ totalCost.toFixed(4) }}</span>
-        <button v-if="session" class="ghost" @click="compact">压缩</button>
+        <button v-if="session" class="ghost" :disabled="!!compaction || busy" @click="compact">
+          压缩
+        </button>
         <span v-if="error" class="chip warn" :title="error">{{ error }}</span>
       </header>
 
@@ -432,15 +505,34 @@ onMounted(async () => {
             <h2>开始一个新会话</h2>
             <p>左侧勾选技能和工具，然后在下面输入你的任务</p>
           </div>
-          <TurnBlock
-            v-for="(turn, i) in turns" :key="i" :turn="turn"
-            @toggle="(what) => toggle(turn, what)"
-          />
+          <template v-for="(turn, i) in turns" :key="i">
+            <CompactionCard v-if="turn.kind === 'compaction'" :data="turn.compaction" />
+            <TurnBlock v-else :turn="turn" @toggle="(what) => toggle(turn, what)" />
+          </template>
         </div>
       </div>
 
+      <div v-if="session?.canContinue && !busy" class="resume-bar">
+        <span>
+          上次的任务在一轮中途中断了<template v-if="session.interruptedToolCalls?.length">
+            （{{ session.interruptedToolCalls.length }} 个工具调用没有返回结果）</template>
+        </span>
+        <button class="primary" @click="continueRun">继续执行</button>
+      </div>
+
+      <!-- 压缩是同步的：期间不执行任务，必须让用户看得到、能取消 -->
+      <div v-if="compaction" class="compacting">
+        <div class="line">
+          <span class="spin">⟳</span>
+          <span>正在压缩上下文 · {{ compactionLabel }}</span>
+          <span class="chip">压缩前 {{ compaction.tokensBefore }} tokens</span>
+          <button class="ghost" @click="abort">取消</button>
+        </div>
+        <pre v-if="compaction.preview" class="preview">{{ compaction.preview }}</pre>
+      </div>
+
       <Composer
-        :busy="busy" :has-session="!!session"
+        :busy="busy || !!compaction" :has-session="!!session"
         :modes="meta.modes" :mode="mode" :commands="meta.commands" :plan="plan"
         @send="send" @abort="abort" @switch-mode="switchMode"
         @run-command="runCommand" @build="buildPlan"
@@ -492,6 +584,31 @@ onMounted(async () => {
 .meter .bar i { display: block; height: 100%; background: var(--accent); transition: width 0.3s; }
 
 .chat { flex: 1; min-height: 0; overflow-y: auto; scroll-behavior: smooth; }
+
+.resume-bar {
+  flex-shrink: 0; max-width: 820px; width: calc(100% - 48px); margin: 0 auto 8px;
+  display: flex; align-items: center; gap: 12px; font-size: 13px;
+  border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 8px 12px;
+  background: var(--panel);
+}
+.resume-bar span { flex: 1; color: var(--text-2); }
+.resume-bar .primary {
+  border: none; background: var(--accent); color: #fff; font-size: 12.5px;
+  padding: 5px 14px; border-radius: var(--radius-sm); cursor: pointer;
+}
+.compacting {
+  flex-shrink: 0; max-width: 820px; width: calc(100% - 48px); margin: 0 auto 8px;
+  border: 1px solid var(--accent); border-radius: var(--radius-sm);
+  background: var(--accent-bg); padding: 8px 12px; font-size: 13px;
+}
+.compacting .line { display: flex; align-items: center; gap: 10px; }
+.compacting .line > span:nth-child(2) { flex: 1; }
+.compacting .spin { display: inline-block; animation: spin 1s linear infinite; color: var(--accent); }
+.compacting .preview {
+  margin: 6px 0 0; max-height: 72px; overflow: hidden; font-size: 11.5px;
+  color: var(--muted); white-space: pre-wrap; word-break: break-all;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
 .chat .inner { max-width: 820px; margin: 0 auto; padding: 28px 24px 40px; }
 .welcome { text-align: center; padding: 90px 20px; color: var(--muted); }
 .welcome h2 { font-size: 19px; font-weight: 500; color: var(--text-2); margin: 0 0 8px; }

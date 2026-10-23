@@ -42,7 +42,8 @@ def _model_from_json(d: dict[str, Any]) -> Model:
         context_window=d.get("contextWindow", 128_000),
         max_tokens=d.get("maxTokens", 8192),
         reasoning=d.get("reasoning", False),
-        base_url=d.get("baseUrl")
+        base_url=d.get("baseUrl"),
+        prompt_cache=d.get("promptCache"),
     )
 
 class ModelRuntime:

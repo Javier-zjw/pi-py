@@ -33,6 +33,7 @@ def parse_streaming_json(fragment: str) -> dict[str, Any]:
                 escaped = True
             elif ch == '"':
                 in_string = False
+            continue
         if ch == '"':
             in_string = True
         elif ch in "{[":

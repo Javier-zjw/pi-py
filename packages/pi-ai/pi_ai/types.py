@@ -13,6 +13,8 @@ from typing import Any, Literal, Union
 Api = Literal["anthropic-messages", "openai-completions"]
 StopReason = Literal["pending", "stop", "length", "toolUse", "error", "aborted"]
 ThinkingLevel = Literal["off", "minimal", "low", "medium", "high", "xhigh", "max"]
+# auto：模型自行决定；none：带着工具定义但禁止调用（保持前缀缓存）；required：必须调用工具
+ToolChoice = Literal["auto", "none", "required"]
 
 THINKING_LEVELS: tuple[str, ...] = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
 
@@ -185,6 +187,9 @@ class Model:
     input_modalities: tuple[str, ...] = ("text",)
     base_url: str | None = None
     thinking_level_map: dict[str, Any] = field(default_factory=dict)
+    # Anthropic 前缀缓存断点（cache_control）。None = 自动：官方 Anthropic 才开；
+    # 兼容 anthropic-messages 的第三方端点不一定认这个字段，需要在 models.json 里显式 "promptCache": true
+    prompt_cache: bool | None = None
 
     @property
     def key(self) -> str:
@@ -198,6 +203,8 @@ class StreamOptions:
     """
     max_tokens: int | None = None
     temperature: float | None = None
+    # 只在 context.tools 非空时下发；None 表示不传，沿用服务商默认（auto）
+    tool_choice: ToolChoice | None = None
     api_key: str | None = None
     base_url: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)

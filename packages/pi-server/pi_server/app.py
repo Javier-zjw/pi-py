@@ -177,6 +177,15 @@ def create_app(cwd: str | Path = ".", agent_dir: str | Path | None = None) -> Fa
             raise HTTPException(409, str(exc)) from exc
         return {"ok": True}
 
+    @app.post("/api/sessions/{session_id}/continue")
+    async def continue_session(session_id: str) -> dict[str, Any]:
+        live = require(session_id)
+        try:
+            await registry.continue_(live)
+        except RuntimeError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        return {"ok": True}
+
     @app.post("/api/sessions/{session_id}/abort")
     def abort(session_id: str) -> dict[str, Any]:
         registry.abort(require(session_id))
@@ -185,15 +194,13 @@ def create_app(cwd: str | Path = ".", agent_dir: str | Path | None = None) -> Fa
     @app.post("/api/sessions/{session_id}/compact")
     async def compact(session_id: str) -> dict[str, Any]:
         live = require(session_id)
+        # 过程和结果都通过 compaction_* 事件帧推给前端，这里只回一个结论
         result = await live.session.compact()
-        if result:
-            # 关键：告诉前端"上下文已经重置"，否则页面上的占用还按旧的累计
-            live.publish({
-                "type": "compacted",
-                "tokensBefore": result.tokens_before,
-                "summary": result.summary[:200],
-            })
-        return {"ok": bool(result), "tokensBefore": result.tokens_before if result else 0}
+        return {
+            "ok": bool(result),
+            "tokensBefore": result.tokens_before if result else 0,
+            "tokensAfter": result.tokens_after if result else None,
+        }
 
     # -- 模式与命令 ------------------------------------------------ #
 

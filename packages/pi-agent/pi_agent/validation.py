@@ -65,6 +65,9 @@ def _check(value: Any, schema: dict[str, Any], path: str, errors: list[str]) -> 
             if key in value:
                 value[key] = _check(value[key], sub, f"{path}.{key}", errors)
 
+    if expected == "array" and isinstance(value, list) and isinstance(schema.get("items"), dict):
+        value = [_check(item, schema["items"], f"{path}[{i}]", errors) for i, item in enumerate(value)]
+
     return value
 
 def validate_tool_arguments(schema: dict[str, Any], arguments: dict[str, Any]) -> dict[str, Any]:

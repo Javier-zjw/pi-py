@@ -6,7 +6,6 @@ Provider 协议，所以整条链路都能在不联网的情况下跑通。
 
 from __future__ import annotations
 
-import os
 import shutil
 import sys
 import tempfile
@@ -32,8 +31,6 @@ from pi_ai import (  # noqa: E402
     ToolCallEndEvent,
     Usage,
 )
-
-UNDER_PYTEST = "PYTEST_CURRENT_TEST" in os.environ
 
 FAKE_MODEL = Model(
     id="fake-1",

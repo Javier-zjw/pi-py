@@ -81,6 +81,9 @@ class ExtensionAPI:
     modes: dict[str, Mode] = field(default_factory=dict)
     before_start_hooks: list[Callable[[Any], Awaitable[None]]] = field(default_factory=list)
     context_hooks: list[Callable[[list], Awaitable[list]]] = field(default_factory=list)
+    compaction_context_hooks: list[Callable[[Any], Awaitable[str | None]]] = field(
+        default_factory=list
+    )
     owner: str = ""
     # 当前正在 activate 的扩展名，用于把注册项归属到扩展上
     ownership: dict[str, list[str]] = field(default_factory=dict)
@@ -155,6 +158,28 @@ class ExtensionAPI:
         """
         self.context_hooks.append(handler)
         self._own("hook", "transform_context")
+
+    def compaction_context(self, handler: Callable[[Any], Awaitable[str | None]]) -> None:
+        """
+        上下文压缩之后要补回给模型的内容（Markdown 片段，返回 None 表示没有）。
+        入参是 AgentSession。比如计划模式在这里提供当前计划——压缩后模型仍知道在执行哪份计划
+        """
+        self.compaction_context_hooks.append(handler)
+        self._own("hook", "compaction_context")
+
+    async def run_compaction_context(self, session: Any) -> tuple[list[str], list[str]]:
+        """返回 (各扩展给出的片段, 错误)；单个失败不影响压缩"""
+        sections: list[str] = []
+        errors: list[str] = []
+        for handler in list(self.compaction_context_hooks):
+            try:
+                section = await handler(session)
+            except Exception as exc:
+                errors.append(f"{type(exc).__name__}: {exc}")
+                continue
+            if isinstance(section, str) and section.strip():
+                sections.append(section)
+        return sections, errors
 
     async def run_before_start(self, session: Any) -> list[str]:
         """依次跑钩子，单个失败不影响其它 -- 一个坏扩展不该让整轮跑不起来"""

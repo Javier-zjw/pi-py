@@ -62,6 +62,9 @@ pip install -e packages/pi-server
   ]
 }
 ```
+可选字段 `"promptCache": true`：给 Anthropic 协议的请求加前缀缓存断点（`cache_control`）。
+不填时只对官方 Anthropic 开启；第三方兼容端点确认支持后再打开，否则可能被拒绝。
+
 ~/.pi/agent/auth.json:
 ```json
 {
@@ -77,7 +80,11 @@ importable and testable without it.
 TUI
 ```bash
 pi-tui
+pi-tui --continue              # 打开当前目录最近一次的会话
+pi-tui --resume <会话文件.jsonl>
 ```
+会话在一轮中途中断（比如工具执行时进程退出）时，重新打开后输入 `/continue` 接着执行；
+网页里从历史打开这样的会话会出现"继续执行"按钮。
 web
 ```bash
 # Terminal 1: Backend pi‑web‑server

@@ -20,6 +20,7 @@ HERE = Path(__file__).resolve()
 sys.path.insert(0, str(HERE.parents[1]))                    # packages/pi-agent
 sys.path.insert(0, str(HERE.parents[2] / "pi-ai"))          # packages/pi-ai
 
+from pi_agent.loop import MAX_ERROR_RETRIES  # noqa: E402
 from pi_agent import (  # noqa: E402
     AfterToolCallResult,
     Agent,
@@ -58,7 +59,9 @@ from pi_ai import (  # noqa: E402
 )
 
 VERBOSE = "-v" in sys.argv
-UNDER_PYTEST = "PYTEST_CURRENT_TEST" in os.environ
+def under_pytest() -> bool:
+    # 必须在调用时判断：import（收集）阶段 pytest 还没设置这个环境变量
+    return "PYTEST_CURRENT_TEST" in os.environ
 FAILURES: list[str] = []
 
 MODEL = Model(
@@ -77,7 +80,7 @@ def check(name: str, cond: bool, detail: str = "") -> None:
         return
     FAILURES.append(f"{name}: {detail}")
     print(f"  FAIL {name} {detail}")
-    if UNDER_PYTEST:
+    if under_pytest():
         raise AssertionError(f"{name}: {detail}")
 
 
@@ -657,6 +660,128 @@ async def case_stream_error() -> None:
     check("流出错: 错误写进 state", agent.state.error_message == "provider 挂了")
 
 
+def flaky_stream(errors: int, text: str = "好了"):
+    """前 errors 次调用出错，之后正常回答"""
+    calls = {"n": 0}
+
+    def stream_fn(model, context, options=None):
+        calls["n"] += 1
+        failing = calls["n"] <= errors
+
+        async def gen():
+            from pi_ai import ErrorEvent
+
+            message = AssistantMessage(api=model.api, provider=model.provider, model=model.id)
+            yield StartEvent(partial=message)
+            if failing:
+                message.stop_reason = "error"
+                message.error_message = "HTTP 400: prompt is too long"
+                yield ErrorEvent(error=message.error_message, message=message)
+                return
+            message.content.append(TextContent(text=text))
+            message.stop_reason = "stop"
+            yield DoneEvent(reason="stop", message=message)
+
+        return gen(), calls
+
+    def call(model, context, options=None):
+        return stream_fn(model, context, options)[0]
+
+    return call, calls
+
+
+async def case_stream_error_hook() -> None:
+    seen: list = []
+
+    async def recover(message) -> bool:
+        seen.append(message.error_message)
+        return True
+
+    stream, calls = flaky_stream(errors=1)
+    agent = Agent(stream_fn=stream, initial_state=AgentState(model=MODEL), on_stream_error=recover)
+    events: list = []
+    agent.subscribe(events.append)
+    await agent.prompt("go")
+    check("出错钩子: 收到失败的回复", seen == ["HTTP 400: prompt is too long"], str(seen))
+    check("出错钩子: 处理后重试成功", events[-1].reason == "stop" and agent.state.messages[-1].text() == "好了")
+    check("出错钩子: 失败的回复不进 transcript",
+          [m.role for m in agent.state.messages] == ["user", "assistant"],
+          str([m.role for m in agent.state.messages]))
+    ended = [e.message for e in events if e.type == "message_end"]
+    check("出错钩子: 失败的回复不发 message_end",
+          all(getattr(m, "stop_reason", "") != "error" for m in ended))
+    check("出错钩子: 一共调了两次模型", calls["n"] == 2, str(calls["n"]))
+
+    async def decline(message) -> bool:
+        return False
+
+    stream, calls = flaky_stream(errors=1)
+    agent = Agent(stream_fn=stream, initial_state=AgentState(model=MODEL), on_stream_error=decline)
+    events = []
+    agent.subscribe(events.append)
+    await agent.prompt("go")
+    check("出错钩子: 返回 False 时照旧结束", events[-1].reason == "error" and calls["n"] == 1)
+    check("出错钩子: 返回 False 时错误照旧入 transcript", agent.state.messages[-1].stop_reason == "error")
+
+    stream, calls = flaky_stream(errors=99)
+    agent = Agent(stream_fn=stream, initial_state=AgentState(model=MODEL), on_stream_error=recover)
+    events = []
+    agent.subscribe(events.append)
+    await agent.prompt("go")
+    check("出错钩子: 有重试上限，不会死循环",
+          events[-1].reason == "error" and calls["n"] == MAX_ERROR_RETRIES + 1, str(calls["n"]))
+
+
+def test_tool_result_pairing() -> None:
+    from pi_agent import ensure_tool_results
+    from pi_agent.loop import INTERRUPTED_TOOL_TEXT
+
+    def call(i: str) -> ToolCall:
+        return ToolCall(id=i, name="bash", arguments={"command": "ls"})
+
+    def result(i: str) -> ToolResultMessage:
+        return ToolResultMessage(tool_call_id=i, tool_name="bash", content=[TextContent(text="ok")])
+
+    aborted = AssistantMessage(content=[call("a")], stop_reason="aborted")
+    msgs = [UserMessage(content="q"), aborted, UserMessage(content="继续")]
+    out = default_convert_to_llm(msgs)
+    check("配对: 缺结果的调用补上中断结果",
+          [m.role for m in out] == ["user", "assistant", "toolResult", "user"], str([m.role for m in out]))
+    check("配对: 补的结果标明被中断",
+          out[2].tool_call_id == "a" and out[2].is_error and out[2].text() == INTERRUPTED_TOOL_TEXT)
+
+    partial = [UserMessage(content="q"), AssistantMessage(content=[call("x"), call("y")]), result("x")]
+    out = ensure_tool_results(partial)
+    check("配对: 部分缺失时补在已有结果之后",
+          [getattr(m, "tool_call_id", m.role) for m in out] == ["user", "assistant", "x", "y"],
+          str([getattr(m, "tool_call_id", m.role) for m in out]))
+
+    complete = [UserMessage(content="q"), AssistantMessage(content=[call("z")]), result("z")]
+    check("配对: 完整的不动（同一个列表）", ensure_tool_results(complete) is complete)
+    check("配对: 原列表不被修改", len(msgs) == 3 and len(partial) == 3)
+
+
+async def case_agent_continue() -> None:
+    agent = Agent(stream_fn=scripted_stream([[TextContent(text="接着做完了")]]),
+                  initial_state=AgentState(model=MODEL))
+    agent.state.messages = [
+        UserMessage(content="跑测试"),
+        AssistantMessage(content=[ToolCall(id="t1", name="echo", arguments={})], stop_reason="toolUse"),
+        ToolResultMessage(tool_call_id="t1", tool_name="echo", content=[TextContent(text="ok")]),
+    ]
+    events: list = []
+    agent.subscribe(events.append)
+    await agent.continue_()
+    check("续跑: 不追加新的用户消息", [m.role for m in agent.state.messages]
+          == ["user", "assistant", "toolResult", "assistant"], str([m.role for m in agent.state.messages]))
+    check("续跑: 正常结束", events[-1].type == "agent_end" and events[-1].reason == "stop")
+    try:
+        await agent.continue_()
+        check("续跑: 以 assistant 结尾时拒绝", False, "没有抛")
+    except ValidationError:
+        check("续跑: 以 assistant 结尾时拒绝", True)
+
+
 async def case_no_terminal_event() -> None:
     """provider 异常退出、一个终止事件都没发——必须有兜底。"""
     def truncated(model, context, options=None):
@@ -812,6 +937,14 @@ def test_stream_error() -> None:
     asyncio.run(case_stream_error())
 
 
+def test_stream_error_hook() -> None:
+    asyncio.run(case_stream_error_hook())
+
+
+def test_agent_continue() -> None:
+    asyncio.run(case_agent_continue())
+
+
 def test_no_terminal_event() -> None:
     asyncio.run(case_no_terminal_event())
 
@@ -854,6 +987,9 @@ async def main() -> int:
     await case_max_turns()
     print("错误路径")
     await case_stream_error()
+    await case_stream_error_hook()
+    test_tool_result_pairing()
+    await case_agent_continue()
     await case_no_terminal_event()
     await case_loop_continue()
     print("订阅与输入")

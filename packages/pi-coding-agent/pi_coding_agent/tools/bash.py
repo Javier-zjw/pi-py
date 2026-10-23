@@ -100,14 +100,14 @@ async def run_bash(
             await asyncio.sleep(0.05)
 
     cancelled = False
-    time_out = False
+    timed_out = False
     watcher = asyncio.create_task(watch_cancel())
 
     try:
         await asyncio.wait_for(pump(), timeout=timeout)
         await process.wait()
     except asyncio.TimeoutError:
-        time_out = True
+        timed_out = True
         kill_process_tree(process)
     except asyncio.CancelledError:
         cancelled = True
@@ -134,7 +134,7 @@ async def run_bash(
         "output": body,
         "exit_code": process.returncode,
         "cancelled": cancelled,
-        "time_out": time_out,
+        "timed_out": timed_out,
         "truncated": truncated,
         "full_output_path": full_path
     }
@@ -142,17 +142,18 @@ async def run_bash(
 def create_bash_tool(cwd: str | Path = ".", timeout: float = DEFAULT_TIMEOUT) -> AgentTool:
     async def execute(args: dict[str, Any], ctx: ToolContext) -> AgentToolResult:
         command = args["command"]
-        result = await run_bash(command, cwd, ctx, timeout=float(args.get("timeout") or timeout))
+        limit = float(args.get("timeout") or timeout)
+        result = await run_bash(command, cwd, ctx, timeout=limit)
         text = result["output"] or "(no output)"
-        if result["time_out"]:
-            text += f"\n[timed out after {timeout}s and was killed]"
+        if result["timed_out"]:
+            text += f"\n[timed out after {limit}s and was killed]"
         if result["cancelled"]:
             text += "\n[aborted by user]"
         if result["exit_code"] not in (0, None):
             text += f"\n[exit code {result['exit_code']}]"
         return AgentToolResult(
             content=[TextContent(text=text)],
-            is_error=bool(result["exit_code"]) or result["time_out"],
+            is_error=bool(result["exit_code"]) or result["timed_out"],
             details={"command": command, **result}
         )
 

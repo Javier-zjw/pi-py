@@ -23,6 +23,7 @@ from ..events import (
     ToolCallEndEvent
 )
 
+from ..errors import describe_llm_error
 from ..json_parse import parse_streaming_json
 from ..transport import HttpTransport, LLMError, default_transport
 from ..types import (
@@ -69,6 +70,9 @@ def _content_to_blocks(content: Any) -> list[dict[str, Any]]:
             )
 
     return blocks
+
+
+_ANTHROPIC_TOOL_CHOICE = {"auto": "auto", "none": "none", "required": "any"}
 
 
 def build_payload(model: Model, context: Context, options: StreamOptions) -> dict[str, Any]:
@@ -123,6 +127,8 @@ def build_payload(model: Model, context: Context, options: StreamOptions) -> dic
             {"name": t.name, "description": t.description, "input_schema": t.parameters}
             for t in context.tools
         ]
+        if options.tool_choice:
+            payload["tool_choice"] = {"type": _ANTHROPIC_TOOL_CHOICE[options.tool_choice]}
 
     if options.temperature is not None:
         payload["temperature"] = options.temperature
@@ -137,9 +143,52 @@ def build_payload(model: Model, context: Context, options: StreamOptions) -> dic
     elif model.reasoning:
         payload["thinking"] = {"type": "disabled"}
 
+    if prompt_cache_enabled(model):
+        _add_cache_breakpoints(payload)
+
     payload.update(options.extra)
 
     return payload
+
+
+_EPHEMERAL = {"type": "ephemeral"}
+MAX_MESSAGE_BREAKPOINTS = 2
+
+
+def prompt_cache_enabled(model: Model) -> bool:
+    if model.prompt_cache is not None:
+        return model.prompt_cache
+    return model.provider == "anthropic" or "anthropic.com" in (model.base_url or "")
+
+
+def _add_cache_breakpoints(payload: dict[str, Any]) -> None:
+    """
+    最多 4 个断点：system、最后一个工具、最后两条 user 角色消息（含工具结果）。
+    请求按 tools → system → messages 的顺序构成前缀；最后一条消息上的断点让这次请求的
+    整段前缀写进缓存，倒数第二条让下一次请求（多了一轮）还能命中上一次写入的位置。
+    上下文压缩的请求和正文共用前缀，也是靠这些断点命中缓存。
+    """
+    system = payload.get("system")
+    if isinstance(system, str) and system:
+        payload["system"] = [{"type": "text", "text": system, "cache_control": dict(_EPHEMERAL)}]
+    tools = payload.get("tools")
+    if tools:
+        tools[-1]["cache_control"] = dict(_EPHEMERAL)
+
+    marked = 0
+    for message in reversed(payload.get("messages") or []):
+        if marked >= MAX_MESSAGE_BREAKPOINTS:
+            break
+        if message.get("role") != "user" or not isinstance(message.get("content"), list):
+            continue
+        block = next(
+            (b for b in reversed(message["content"])
+             if b.get("type") != "text" or b.get("text")),
+            None,
+        )
+        if block is not None:
+            block["cache_control"] = dict(_EPHEMERAL)
+            marked += 1
 
 
 class AnthropicProvider:
@@ -302,8 +351,8 @@ class AnthropicProvider:
                     return
 
         except LLMError as exc:
-            message.error_message = str(exc)
-            yield ErrorEvent(error=str(exc), message=finalize(message, model, "error"))
+            message.error_message = describe_llm_error(exc)
+            yield ErrorEvent(error=message.error_message, message=finalize(message, model, "error"))
             return
 
         yield DoneEvent(reason=stop_reason, message=finalize(message, model, stop_reason))

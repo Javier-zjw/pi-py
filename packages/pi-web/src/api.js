@@ -25,6 +25,7 @@ export const api = {
   getSession: (id) => request("GET", `/api/sessions/${id}`),
   closeSession: (id) => request("DELETE", `/api/sessions/${id}`),
   prompt: (id, text) => request("POST", `/api/sessions/${id}/prompt`, { text }),
+  continueRun: (id) => request("POST", `/api/sessions/${id}/continue`),
   abort: (id) => request("POST", `/api/sessions/${id}/abort`),
   compact: (id) => request("POST", `/api/sessions/${id}/compact`),
   setModel: (id, spec) => request("POST", `/api/sessions/${id}/model`, { spec }),

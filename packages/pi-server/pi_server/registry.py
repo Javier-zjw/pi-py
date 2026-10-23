@@ -329,6 +329,24 @@ class SessionRegistry:
 
         live.running = asyncio.create_task(run())
 
+    async def continue_(self, live: LiveSession) -> None:
+        """接着执行上次中断的那一轮（不追加新消息）。立刻返回，事件从 SSE 出去。"""
+        if live.busy:
+            raise RuntimeError("会话正忙")
+        if not live.session.can_continue:
+            raise RuntimeError("没有可以继续的任务：上一轮已经完成")
+
+        async def run() -> None:
+            try:
+                await live.session.continue_()
+            except asyncio.CancelledError:
+                live.publish({"type": "aborted"})
+                raise
+            except Exception as exc:
+                live.publish({"type": "error", "message": f"{type(exc).__name__}: {exc}"})
+
+        live.running = asyncio.create_task(run())
+
     def abort(self, live: LiveSession) -> None:
         live.session.abort()
 
@@ -351,4 +369,7 @@ class SessionRegistry:
                 "cost": round(usage.cost.total, 6),
             },
             "contextWindow": model.context_window if model else 0,
+            # 上次在一轮中途中断（崩溃 / 进程退出），前端据此显示"继续执行"
+            "canContinue": session.can_continue,
+            "interruptedToolCalls": list(session.interrupted_tool_calls),
         }

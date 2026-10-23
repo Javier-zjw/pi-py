@@ -177,6 +177,15 @@ def create_app(cwd: str | Path = ".", agent_dir: str | Path | None = None) -> Fa
             raise HTTPException(409, str(exc)) from exc
         return {"ok": True}
 
+    @app.post("/api/sessions/{session_id}/continue")
+    async def continue_session(session_id: str) -> dict[str, Any]:
+        live = require(session_id)
+        try:
+            await registry.continue_(live)
+        except RuntimeError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        return {"ok": True}
+
     @app.post("/api/sessions/{session_id}/abort")
     def abort(session_id: str) -> dict[str, Any]:
         registry.abort(require(session_id))

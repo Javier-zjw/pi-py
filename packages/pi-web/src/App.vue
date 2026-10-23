@@ -264,6 +264,22 @@ async function send(text) {
   }
 }
 
+// 恢复的会话上次在一轮中途中断了：不用再输入，直接接着跑
+async function continueRun() {
+  if (busy.value || !session.value?.canContinue) return;
+  error.value = "";
+  turns.value.push(newTurn("（继续上次未完成的任务）"));
+  busy.value = true;
+  session.value = { ...session.value, canContinue: false };
+  scrollDown();
+  try {
+    await api.continueRun(session.value.id);
+  } catch (e) {
+    error.value = e.message;
+    busy.value = false;
+  }
+}
+
 async function switchMode(id) {
   mode.value = id;
   if (!session.value) return;      // 还没会话，等新建时带上
@@ -496,6 +512,14 @@ onMounted(async () => {
         </div>
       </div>
 
+      <div v-if="session?.canContinue && !busy" class="resume-bar">
+        <span>
+          上次的任务在一轮中途中断了<template v-if="session.interruptedToolCalls?.length">
+            （{{ session.interruptedToolCalls.length }} 个工具调用没有返回结果）</template>
+        </span>
+        <button class="primary" @click="continueRun">继续执行</button>
+      </div>
+
       <!-- 压缩是同步的：期间不执行任务，必须让用户看得到、能取消 -->
       <div v-if="compaction" class="compacting">
         <div class="line">
@@ -561,6 +585,17 @@ onMounted(async () => {
 
 .chat { flex: 1; min-height: 0; overflow-y: auto; scroll-behavior: smooth; }
 
+.resume-bar {
+  flex-shrink: 0; max-width: 820px; width: calc(100% - 48px); margin: 0 auto 8px;
+  display: flex; align-items: center; gap: 12px; font-size: 13px;
+  border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 8px 12px;
+  background: var(--panel);
+}
+.resume-bar span { flex: 1; color: var(--text-2); }
+.resume-bar .primary {
+  border: none; background: var(--accent); color: #fff; font-size: 12.5px;
+  padding: 5px 14px; border-radius: var(--radius-sm); cursor: pointer;
+}
 .compacting {
   flex-shrink: 0; max-width: 820px; width: calc(100% - 48px); margin: 0 auto 8px;
   border: 1px solid var(--accent); border-radius: var(--radius-sm);

@@ -17,7 +17,9 @@ from pi_tui import LineReader, Theme, missing_dependency_hint, terminal_width
 
 from .renderer import SessionRenderer
 
-BUILTIN_COMMANDS = {"help", "model", "think", "tools", "compact", "usage", "session", "exit", "quit"}
+BUILTIN_COMMANDS = {
+    "help", "model", "think", "tools", "compact", "continue", "usage", "session", "exit", "quit",
+}
 
 HELP = """
   /help              显示本帮助
@@ -26,6 +28,7 @@ HELP = """
   /think <level>     思考档位：off minimal low medium high xhigh max
   /tools             列出当前启用的工具
   /compact [说明]    立即压缩上下文，可附加压缩重点
+  /continue          接着执行上次中断的那一轮
   /usage             本次会话的 token 与费用
   /session           当前会话文件路径
   /exit              退出
@@ -38,6 +41,10 @@ async def run(session, renderer: SessionRenderer) -> int:
     renderer.status.hint = "/help"
     renderer.header(session.cwd, renderer.status.model, session.thinking_level)
     session.subscribe(renderer.on_event)
+    if session.can_continue:
+        note = (f"（{len(session.interrupted_tool_calls)} 个工具调用没有返回结果）"
+                if session.interrupted_tool_calls else "")
+        print(renderer.theme.warn(f"  上次的任务在一轮中途中断了{note}，输入 /continue 接着执行"))
 
     reader = LineReader(history_file=Path.home() / ".pi" / "agent" / "history")
     hint = missing_dependency_hint(renderer.theme)
@@ -84,6 +91,17 @@ async def run(session, renderer: SessionRenderer) -> int:
                     await session.compact(rest or None)
                 except KeyboardInterrupt:
                     session.abort()
+            elif cmd == "continue":
+                if not session.can_continue:
+                    print(renderer.theme.muted("  没有可以继续的任务：上一轮已经完成"))
+                    continue
+                turns += 1
+                try:
+                    await session.continue_()
+                except KeyboardInterrupt:
+                    session.abort()
+                except Exception as exc:
+                    print(renderer.theme.error(f"  ✗ {type(exc).__name__}: {exc}"))
             elif cmd == "usage":
                 u = session.usage()
                 print(renderer.theme.muted(f"  ↑{u.input} ↓{u.output} ¥{u.cost.total:.4f}"))
@@ -125,12 +143,22 @@ async def main_async(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-thinking", action="store_true", help="不显示思考内容")
     parser.add_argument("--no-diff", action="store_true", help="不显示 diff")
     parser.add_argument("--no-session", action="store_true")
+    parser.add_argument("--continue", dest="continue_recent", action="store_true",
+                        help="打开当前目录最近一次的会话")
+    parser.add_argument("--resume", help="打开指定的会话文件（.jsonl）")
     parser.add_argument("--agent-dir")
     args = parser.parse_args(argv)
 
     cwd = str(Path(args.cwd).expanduser().resolve())
     services = create_agent_session_services(cwd=cwd, agent_dir=args.agent_dir)
-    manager = SessionManager.in_memory(cwd) if args.no_session else SessionManager.create(cwd, args.agent_dir)
+    if args.no_session:
+        manager = SessionManager.in_memory(cwd)
+    elif args.resume:
+        manager = SessionManager.open(args.resume, args.agent_dir)
+    elif args.continue_recent:
+        manager = SessionManager.continue_recent(cwd, args.agent_dir)
+    else:
+        manager = SessionManager.create(cwd, args.agent_dir)
     session = create_agent_session(
         services=services, session_manager=manager, model=args.model, thinking_level=args.think
     )

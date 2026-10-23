@@ -143,6 +143,7 @@ HELP = """Commands:
   /skills            list discovered skills
   /commands          list slash commands from prompts and extensions
   /compact [notes]   compact the context now
+  /continue          resume the last turn if it was interrupted
   /usage             token and cost totals
   /session           session file path
   /exit              quit
@@ -188,6 +189,11 @@ async def handle_command(session: AgentSession, line: str) -> bool:
     elif name == "compact":
         # 进度与结果由事件打印（make_printer 的 compaction_* 分支）
         await session.compact(rest or None)
+    elif name == "continue":
+        if session.can_continue:
+            await session.continue_()
+        else:
+            print(f"{DIM}nothing to continue: the last turn finished{RESET}")
     elif name == "usage":
         usage = session.usage()
         print(
@@ -211,6 +217,10 @@ async def run_interactive(session: AgentSession, show_thinking: bool) -> None:
     model = session.model
     print(f"{BOLD}pi-coding-agent{RESET} {DIM}{session.cwd}{RESET}")
     print(f"{DIM}model: {model.key if model else 'none'} · /help for commands{RESET}\n")
+    if session.can_continue:
+        note = (f" ({len(session.interrupted_tool_calls)} tool call(s) never returned)"
+                if session.interrupted_tool_calls else "")
+        print(f"{YELLOW}The last turn was interrupted{note}. Type /continue to resume it.{RESET}\n")
 
     loop = asyncio.get_running_loop()
     while True:
@@ -227,7 +237,7 @@ async def run_interactive(session: AgentSession, show_thinking: bool) -> None:
             name = line[1:].partition(" ")[0]
             builtin = name in {
                 "help", "model", "think", "tools", "skills", "commands",
-                "compact", "usage", "session", "exit", "quit",
+                "compact", "continue", "usage", "session", "exit", "quit",
             }
             if builtin or name in session.resources.get_extension_api().commands:
                 if not await handle_command(session, line):

@@ -11,7 +11,7 @@ uv sync                                   # 工作区安装（或对每个 packa
 pip install -e packages/pi-server         # web 后端需要 fastapi/uvicorn
 
 pi                                        # 朴素 CLI（pi_coding_agent.cli）：交互 / --mode print / --mode json
-pi-tui                                    # 终端 UI（pi_app.app）
+pi-tui                                    # 终端 UI（pi_app.app）；--continue / --resume <jsonl> 恢复会话
 pi-web [-C DIR] [--port 8848]             # HTTP+SSE 后端（pi_server.app），默认 127.0.0.1:8848
 
 cd packages/pi-web && npm install
@@ -70,9 +70,11 @@ pi-web（Vue 3 + Vite，只通过 HTTP/SSE 与 pi-server 通信）
   - steering 在工具批次后注入（打断），follow-up 在模型要停时注入（续接）。
   - 事件约定：Start = 消息开始（可能流式），End = 定稿；生来完整的消息也成对发，订阅方只听 `message_end`。
   - 全程使用 `AgentMessage`，只在 provider 边界 `convert_to_llm`；`CustomMessage.include_in_context` 控制是否给模型看。
+  - `default_convert_to_llm` 末尾会 `ensure_tool_results`：没有结果的 tool_call（中途取消、进程在工具执行中退出）补一条"被中断"的结果，否则服务商拒绝整个请求。`Agent.continue_()` 不追加消息、从现有 transcript 续跑。
   - `LoopConfig.on_stream_error`：模型调用出错时询问上层，返回 True 则丢弃失败回复（不入 transcript、不发 `message_end`）并重试本轮，每次运行最多 `MAX_ERROR_RETRIES` 次。
 - **pi-coding-agent**：
   - `AgentSession`（`agent_session.py`）是组合点：`AgentSessionServices`（ModelRuntime + SettingsManager + ResourceLoader，按 cwd 解析一次）+ `SessionManager` + `Agent`。持久化靠订阅 agent 事件。会话自己的事件（如压缩）和 agent 事件走同一条 `subscribe` 通道，按 `event.type` 区分。
+  - 恢复会话：上下文以工具结果或未回复的用户消息结尾 = 上次在一轮中途中断（`can_continue`）；末尾缺结果的工具调用在打开时补上中断结果并写回文件（`interrupted_tool_calls`）。`continue_()` 和 `prompt()` 共用 `_prepare_run()`（模式、钩子、先压后跑），入口：CLI / pi-tui 的 `/continue`、网页 `POST /api/sessions/{id}/continue`。
   - 模式：`_apply_mode()` 每轮先把系统提示和工具集**从 `_base_system_prompt` / `_base_tools` 基线重建**，再调用模式的 `apply`——不要在上一轮结果上叠加。
   - 会话（`session/`）：JSONL **树**（`id`/`parentId`），分支=移动 leaf；存于 `~/.pi/agent/sessions/<项目目录名>/`。磁盘格式与 TS 版 pi 保持一致（camelCase 键、v3 entry 类型），改格式会破坏互操作。compaction entry 写 `firstKeptEntryId`（旧文件里的 `retainedTail` 仍可读），`details.state` 存结构化状态。模型/思考档位从完整分支读取，而非裁剪后的上下文。
   - 工具（`tools/`）：`read write edit bash grep find ls`。参数是纯 JSON Schema dict，由 `pi_agent.validation` 校验（会把 `"3"` 纠正为 `3`）；非必填字段一律 `args.get()`；`details` 必须可 JSON 序列化（`Path` 先转 `str`）。grep/find 有 rg/fd 时用二进制，否则纯 Python 回退。所有来自 OS 的字符串先过 `text.sanitize`；bash 输出用增量解码器（中文跨块）。

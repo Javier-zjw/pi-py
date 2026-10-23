@@ -221,7 +221,9 @@ async def case_openai_text_tools_reasoning() -> None:
     calls = msg.tool_calls()
     check("openai: 跨块参数拼装", calls and calls[0].arguments == {"city": "杭州"}, str(calls))
     check("openai: 停止原因", msg.stop_reason == "toolUse", msg.stop_reason)
-    check("openai: 用量", msg.usage.input == 30 and msg.usage.cache_read == 5)
+    # prompt_tokens 包含命中缓存的 5 个：input 只记没命中的 25 个，否则上下文计量和费用都会把缓存算两遍
+    check("openai: 用量（缓存不重复计）", msg.usage.input == 25 and msg.usage.cache_read == 5
+          and msg.usage.input + msg.usage.cache_read == 30, str(msg.usage))
     check("openai: 流末补 toolcall_end", "toolcall_end" in kinds, str(kinds))
     check("openai: system 进 messages", transport.payload["messages"][0]["role"] == "system")
     check("openai: 方舟私有参数透传", transport.payload.get("thinking") == {"type": "enabled"}, str(transport.payload.get("thinking")))
@@ -252,6 +254,35 @@ def test_openai_payload_shapes() -> None:
     payload = build_payload(OPENAI_MODEL, Context(messages=[UserMessage(content="q")]),
                             SimpleStreamOptions(tool_choice="none"))
     check("openai: 无工具时不传 tool_choice", "tool_choice" not in payload)
+
+
+def test_openai_usage_variants() -> None:
+    """各家 OpenAI 兼容端点的缓存用量写法：input 永远不含缓存命中部分"""
+    from pi_ai.providers.openai import apply_openai_usage
+    from pi_ai.types import Usage
+
+    u = Usage()
+    apply_openai_usage(u, {"prompt_tokens": 35328, "completion_tokens": 205,
+                           "prompt_tokens_details": {"cached_tokens": 32512}})
+    check("openai usage: 实际上下文 = input + cache_read（不翻倍）",
+          u.input == 2816 and u.cache_read == 32512 and u.input + u.cache_read == 35328, str(u))
+    u = Usage()
+    apply_openai_usage(u, {"prompt_tokens": 1000, "completion_tokens": 10,
+                           "prompt_cache_hit_tokens": 640, "prompt_cache_miss_tokens": 360})
+    check("openai usage: DeepSeek 的 prompt_cache_hit_tokens", u.input == 360 and u.cache_read == 640, str(u))
+    u = Usage()
+    apply_openai_usage(u, {"prompt_tokens": 500, "completion_tokens": 3})
+    check("openai usage: 没有缓存信息时 input = prompt_tokens", u.input == 500 and u.cache_read == 0)
+
+    from pi_ai.cost import apply_cost
+    from pi_ai.types import Model, ModelCost
+    model = Model(id="m", provider="p", api="openai-completions",
+                  cost=ModelCost(input=1.0, output=0.0, cache_read=0.1))
+    u = Usage()
+    apply_openai_usage(u, {"prompt_tokens": 1_000_000, "prompt_tokens_details": {"cached_tokens": 900_000}})
+    apply_cost(model, u)
+    check("openai usage: 费用按未命中 + 命中分别计（不再把命中部分按全价再算一遍）",
+          abs(u.cost.total - (0.1 + 0.09)) < 1e-9, str(u.cost.total))
 
 
 def test_prompt_cache_breakpoints() -> None:
@@ -441,6 +472,7 @@ async def main() -> int:
     await case_anthropic_text()
     await case_anthropic_tools_and_thinking()
     test_anthropic_payload_shapes()
+    test_openai_usage_variants()
     test_prompt_cache_breakpoints()
     print("openai-completions")
     await case_openai_text_tools_reasoning()

@@ -140,6 +140,9 @@ class CompactionBudget:
     prune_target_ratio: float = 0.4
     protect_tokens: int = 40_000
     prune_min_tokens: int = 200
+    # 一次清理至少要省下可用窗口的这个比例才做：清理会改动前面的消息，前缀缓存整段失效，
+    # 省一两千 token 却让下一次请求全价重算，得不偿失；不够就等它涨到 L2 摘要线
+    prune_min_batch_ratio: float = 0.1
 
     @property
     def usable(self) -> int:
@@ -161,6 +164,10 @@ class CompactionBudget:
     @property
     def prune_target(self) -> int:
         return int(self.usable * self.prune_target_ratio)
+
+    @property
+    def prune_min_batch(self) -> int:
+        return int(self.usable * self.prune_min_batch_ratio)
 
     @property
     def protect(self) -> int:
@@ -191,4 +198,5 @@ class CompactionBudget:
             prune_target_ratio=float(get("compaction.prune.targetRatio", 0.4)),
             protect_tokens=int(get("compaction.prune.protectTokens", 40_000)),
             prune_min_tokens=int(get("compaction.prune.minTokens", 200)),
+            prune_min_batch_ratio=float(get("compaction.prune.minBatchRatio", 0.1)),
         )

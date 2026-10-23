@@ -25,6 +25,7 @@ for _p in (HERE.parents[1], PACKAGES / "pi-tui", PACKAGES / "pi-coding-agent",
 
 from fakes import FAKE_MODEL, Sandbox, fake_models  # noqa: E402
 
+from pi_agent import CustomMessage
 from pi_ai import TextContent, ThinkingContent, ToolCall, Usage, UserMessage  # noqa: E402
 from pi_tui import Theme  # noqa: E402
 from pi_tui.theme import ColorMode  # noqa: E402
@@ -217,6 +218,29 @@ async def case_expand() -> None:
     check("展开: 还没有轮次时给提示", "没有可展开" in out.getvalue())
 
 
+def test_prune_and_notice() -> None:
+    """清理旧工具输出不再一行一行刷屏：计数并进「✻ 用时」行；扩展的提醒显示成一行说明"""
+    out = io.StringIO()
+    renderer = SessionRenderer(theme=Theme(ColorMode.NONE), stream=out)
+    renderer.on_event(ev("context_pruned", count=3, tokens_before=40_000, tokens_after=30_000))
+    renderer.on_event(ev("agent_start"))
+    renderer.on_event(ev("context_pruned", count=1, tokens_before=35_000, tokens_after=33_000))
+    check("清理: 运行中显示在活动区第一行", "清理 2 次" in renderer._live_lines()[0], renderer._live_lines()[0])
+    check("清理: 不往 scrollback 里一行一行写", "已清理" not in out.getvalue(), out.getvalue())
+    renderer.on_event(ev("message_end", message=CustomMessage(
+        custom_type="tool_budget", content="[系统提醒] 给模型看的全文",
+        details={"notice": "已调用 40 次工具，提醒模型尽快给出回答"})))
+    text = out.getvalue()
+    check("提醒: 显示一行说明", "⚑ 已调用 40 次工具" in text, text)
+    check("提醒: 不把给模型的全文当用户的话回显", "给模型看的全文" not in text and "❯" not in text, text)
+    renderer.on_event(ev("agent_end", reason="stop"))
+    summary = next(line for line in out.getvalue().splitlines() if line.startswith("✻ "))
+    check("清理: 次数和省下的 tokens 并进用时行", "清理旧输出 2 次 −12.0k" in summary, summary)
+    renderer.on_event(ev("agent_start"))
+    renderer.on_event(ev("agent_end", reason="stop"))
+    check("清理: 下一轮重新计数", "清理" not in out.getvalue().splitlines()[-3:][0], out.getvalue())
+
+
 def test_running_status() -> None:
     """运行中只显示正在执行的那个工具：名字 + 时长，不带参数"""
     renderer = SessionRenderer(theme=Theme(ColorMode.NONE), stream=io.StringIO())
@@ -281,6 +305,7 @@ async def main() -> int:
     await case_interim_text()
     print("活动区")
     test_live_slot()
+    test_prune_and_notice()
     print("展开")
     await case_expand()
     print("状态行与回显")

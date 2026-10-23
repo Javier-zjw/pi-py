@@ -127,6 +127,10 @@ class EventTranslator:
         message = event.message
         role = getattr(message, "role", "")
         if role in ("user", "custom"):
+            notice = (getattr(message, "details", None) or {}) if role == "custom" else {}
+            if isinstance(notice, dict) and notice.get("notice"):
+                # 扩展插进来的提醒（如 tool_budget）：显示一句说明，不显示给模型看的全文
+                return [{"type": "injected", "text": notice["notice"], "notice": True}]
             text = message.text()
             if text.strip() and text.strip() == self.own_prompt.strip():
                 # 用户自己提交的那条：前端在 send() 时就已经渲染了

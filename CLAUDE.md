@@ -63,11 +63,14 @@ pi-web（Vue 3 + Vite，只通过 HTTP/SSE 与 pi-server 通信）
 ### 各层职责
 
 - **pi-ai**：单次 LLM 调用。`Context` 可序列化；`Models` 注册表提供 `stream`/`complete`（provider 原生）与 `stream_simple`/`complete_simple`（统一 `reasoning`）。provider 只有 `anthropic-messages` 和 `openai-completions`（兼容端点）。凭证优先级：运行时 override > `auth.json` > 环境变量。
+  - `errors.py`：HTTP 错误经 `describe_llm_error` 把响应体里的原因写进 `error_message`；`is_context_overflow` 识别各家"上下文超长"（不含限流）。
+  - Anthropic 前缀缓存：`Model.prompt_cache`（models.json `"promptCache"`）为 None 时只对官方 Anthropic 开启；第三方 anthropic-messages 端点可能不认 `cache_control`，需显式开启。断点：system、最后一个工具、最后两条 user 角色消息。
 - **pi-agent**：`loop.py::run_agent_loop` 回合状态机 + `execute_tool_calls`（校验 → `before_tool_call` → 并行/串行执行 → `after_tool_call`）；`Agent` 管状态、事件、steering/follow-up 队列、abort。
   - 并行工具的双序语义：`tool_execution_end` 按完成顺序发，结果消息按请求顺序存（写入 `results[index]`，不能用 `gather` 返回值）。
   - steering 在工具批次后注入（打断），follow-up 在模型要停时注入（续接）。
   - 事件约定：Start = 消息开始（可能流式），End = 定稿；生来完整的消息也成对发，订阅方只听 `message_end`。
   - 全程使用 `AgentMessage`，只在 provider 边界 `convert_to_llm`；`CustomMessage.include_in_context` 控制是否给模型看。
+  - `LoopConfig.on_stream_error`：模型调用出错时询问上层，返回 True 则丢弃失败回复（不入 transcript、不发 `message_end`）并重试本轮，每次运行最多 `MAX_ERROR_RETRIES` 次。
 - **pi-coding-agent**：
   - `AgentSession`（`agent_session.py`）是组合点：`AgentSessionServices`（ModelRuntime + SettingsManager + ResourceLoader，按 cwd 解析一次）+ `SessionManager` + `Agent`。持久化靠订阅 agent 事件。会话自己的事件（如压缩）和 agent 事件走同一条 `subscribe` 通道，按 `event.type` 区分。
   - 模式：`_apply_mode()` 每轮先把系统提示和工具集**从 `_base_system_prompt` / `_base_tools` 基线重建**，再调用模式的 `apply`——不要在上一轮结果上叠加。
@@ -78,7 +81,7 @@ pi-web（Vue 3 + Vite，只通过 HTTP/SSE 与 pi-server 通信）
   - 分工：`budget`（CJK 感知计量，以实报 usage 为锚）→ `cut`（按 token 预算保留尾部，不拆工具调用/结果）→ `engine`（只计算结果、不改会话）→ `AgentSession._apply_compaction`（落盘 + 替换消息，中间无 await）。
   - 压缩请求复用正文的 system prompt + tools + 消息前缀、`tool_choice="none"`，指令追加在末尾（`prompt.py`），为了命中前缀缓存；改动请求构造时保持前缀一致。
   - 状态磁盘存 JSON、给模型渲染成 Markdown（`state.py`）。用户原话、文件记录、命令由代码提取，模型只写需要理解的字段；`constraints/decisions/knowledge` 被模型漏掉时由代码补回。
-  - 分层：L1 `prune`（到 60% 时把受保护区间外的旧工具输出换成占位，清到 40%，不调模型）→ 仍超 85% 才 L2 摘要 → L3 `rehydrate`（摘要后把最近改过的文件当前内容和扩展片段附进状态消息）。
+  - 分层：L1 `prune`（到 60% 时把受保护区间外的旧工具输出换成占位，清到 40%，不调模型）→ 仍超 85% 才 L2 摘要 → L3 `rehydrate`（摘要后把最近改过的文件当前内容和扩展片段附进状态消息）→ L4 超长兜底（服务商报超长时经 `on_stream_error`：L1 全清 + 保留尾部减半的 L2，重试本轮；每次 prompt 只救一次）。
   - 触发点：`prompt()` 先压后跑（新请求不进压缩）、`transform_context` 每次调模型前检查。服务商出错、取消、没变小都保持原历史；格式两次不合格才降级。压缩期间到来的 `prompt()` 会等待它结束。
   - L1 只把内存里的消息换成**副本**（会话条目里的原对象不动，文件保留原文），清理集合存为 `context_prune` 条目、恢复时重放；清理前报的 usage 不能当锚（`AgentSession._anchor_floor` / `context_tokens(min_anchor=)`）。
   - 保留尾部里 assistant 的 usage 是压缩前的，状态消息 `details.tailLength` 标出这段，计量时不能当锚——否则会反复压缩。

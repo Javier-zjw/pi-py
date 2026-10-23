@@ -62,6 +62,9 @@ pip install -e packages/pi-server
   ]
 }
 ```
+可选字段 `"promptCache": true`：给 Anthropic 协议的请求加前缀缓存断点（`cache_control`）。
+不填时只对官方 Anthropic 开启；第三方兼容端点确认支持后再打开，否则可能被拒绝。
+
 ~/.pi/agent/auth.json:
 ```json
 {

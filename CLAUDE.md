@@ -31,6 +31,7 @@ ruff check packages                       # line-length 100, py310
 python packages/pi-ai/tests/test_offline.py
 python packages/pi-agent/tests/test_offline.py [-v]
 python packages/pi-coding-agent/tests/test_tools.py      # 另有 test_session / test_resources / test_runtime / test_compaction / test_agent_session
+python packages/pi-app/tests/test_renderer.py            # 终端渲染：真会话 + 假模型，检查实际输出
 ```
 
 pytest 下 `check()` 失败会抛 AssertionError（`under_pytest()` 必须在调用时判断环境变量，不能在 import 时求值，否则 pytest 会假绿）。pi-ai 和 pi-agent 的测试文件都叫 `test_offline.py` 且没有 `__init__.py`，必须**按包分别运行**，一次性收集会报 import file mismatch：
@@ -88,7 +89,8 @@ pi-web（Vue 3 + Vite，只通过 HTTP/SSE 与 pi-server 通信）
   - L1 只把内存里的消息换成**副本**（会话条目里的原对象不动，文件保留原文），清理集合存为 `context_prune` 条目、恢复时重放；清理前报的 usage 不能当锚（`AgentSession._anchor_floor` / `context_tokens(min_anchor=)`）。
   - 保留尾部里 assistant 的 usage 是压缩前的，状态消息 `details.tailLength` 标出这段，计量时不能当锚——否则会反复压缩。
   - 前端契约：`compaction_start/progress/end`、`context_pruned` 帧（`pi_server/dto.py::compaction_dto`，历史回放共用）。网页里压缩卡片必须插在进行中的那一轮之前——`handle()` 总把帧写进最后一个 turn。
-- **pi-tui**：零依赖终端渲染原语（`prompt_toolkit` 为可选 extra）。**pi-app**：把 AgentSession 事件渲染到 pi-tui。
+- **pi-tui**：零依赖终端渲染原语（`prompt_toolkit` 为可选 extra）。`LineReader` 支持额外快捷键（在输入行上方打印、不丢正在输入的字）和 `erase_when_done`；不要用 prompt_toolkit 的 `bottom_toolbar`——它固定在屏幕最底行，会在输入行下方留出大片空白。
+- **pi-app**：把 AgentSession 事件渲染到 pi-tui（`renderer.py`）。过程收起、结论突出：运行中底部只有一行状态（正在执行的工具名闪烁，不显示参数）；思考和工具每段收成一行摘要，`ctrl+o` / `/expand` 展开上一轮（`TurnRecord`）；回答以 ● 开头；每轮一行亮色统计。输入框是带提示的分隔线 + `❯`，提交后擦掉、由 `user_echo` 回显。
 - **pi-server**：`dto.py`（事件 → SSE 帧，**前后端唯一契约**）、`registry.py`（会话注册 + 事件扇出）、`workspace.py`（历史解析、文件浏览，`resolve_within()` 越界 403）都**不 import fastapi**，`app.py` 只是薄路由层。前端优先用 `pi_server/web/`（Vite 构建产物），不存在时回退 `pi_server/static/index.html`。新增 SSE 帧类型要同时改 `dto.py` 和 `pi-web/src/App.vue` 的 `handle()`。
 
 ### 扩展系统（加功能的默认方式）

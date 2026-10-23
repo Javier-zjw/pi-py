@@ -792,6 +792,67 @@ async def case_abort_mid_tool_call_stream() -> None:
         check("取消后: 发出的请求里调用都有结果", dangling_calls(sent) == set(), str([m.role for m in sent]))
 
 
+async def case_continue_after_crash() -> None:
+    """工具执行中退出 → 恢复 → 不用再说话，直接从断点接着做完这一轮"""
+    with Sandbox() as cwd:
+        manager = file_manager(cwd)
+        session, _ = make_session(
+            cwd, [[ToolCall(id="c1", name="bash", arguments={"command": "sleep 5"})]],
+            tools=["bash"], session_manager=manager)
+        task = asyncio.create_task(session.prompt("部署一下"))
+        await asyncio.sleep(0.3)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        reopened, provider = make_session(cwd, [[TextContent(text="上次的命令被中断了，我重新检查后完成了部署")]],
+                                          tools=["bash"], session_manager=SessionManager.open(cwd / "s.jsonl"))
+        check("续跑: 恢复后识别出上次没做完", reopened.can_continue)
+        events = record(reopened)
+        await reopened.continue_()
+        sent = provider.calls[0]["context"].messages
+        check("续跑: 没有追加新的用户消息", [m.role for m in sent] == ["user", "assistant", "toolResult"],
+              str([m.role for m in sent]))
+        check("续跑: 模型看到了中断结果", "工具执行被中断" in sent[-1].text())
+        check("续跑: 这一轮做完", events[-1].type == "agent_end" and events[-1].reason == "stop"
+              and reopened.messages[-1].text().startswith("上次的命令被中断了"))
+        check("续跑: 做完后不能再继续", not reopened.can_continue)
+        try:
+            await reopened.continue_()
+            check("续跑: 没有可继续的任务时报错", False, "没有抛")
+        except RuntimeError:
+            check("续跑: 没有可继续的任务时报错", True)
+        on_disk = [e.message.role for e in SessionManager.open(cwd / "s.jsonl").get_entries()
+                   if e.type == "message"]
+        check("续跑: 落盘完整", on_disk == ["user", "assistant", "toolResult", "assistant"], str(on_disk))
+
+
+async def case_continue_unanswered_prompt_after_compaction() -> None:
+    """压缩过的会话里，最后一条用户消息还没得到回复就退出了：恢复后续跑，状态和前缀都在"""
+    with Sandbox() as cwd:
+        manager = file_manager(cwd)
+        long_answer = "。详细说明" * 300
+        session, _ = compaction_session(
+            cwd, [[TextContent(text="回答一" + long_answer)], [TextContent(text="回答二" + long_answer)],
+                  [TextContent(text="回答三")], [TextContent(text=SUMMARY_JSON)]], session_manager=manager)
+        for q in ("一", "二", "三"):
+            await session.prompt(f"问题{q}")
+        use_estimates(session)
+        await session.compact()
+        manager.append_message(UserMessage(content="问题四：还没来得及回答"))   # 发出后进程就退出了
+
+        reopened, provider = make_session(cwd, [[TextContent(text="回答四")]], model=MID_MODEL,
+                                          session_manager=SessionManager.open(cwd / "s.jsonl"))
+        check("续跑: 压缩后的会话也能识别", reopened.can_continue)
+        await reopened.continue_()
+        sent = provider.calls[0]["context"].messages
+        check("续跑: 请求以压缩状态开头", sent[0].text().startswith("<compacted_state"))
+        check("续跑: 回答的是没答的那个问题", sent[-1].text() == "问题四：还没来得及回答"
+              and reopened.messages[-1].text() == "回答四")
+
+
 async def case_compaction_no_gain() -> None:
     """内容太少、压缩后反而更大时不替换历史。"""
     with Sandbox() as cwd:
@@ -1296,6 +1357,14 @@ def test_abort_mid_tool_call_stream() -> None:
     asyncio.run(case_abort_mid_tool_call_stream())
 
 
+def test_continue_after_crash() -> None:
+    asyncio.run(case_continue_after_crash())
+
+
+def test_continue_unanswered_prompt_after_compaction() -> None:
+    asyncio.run(case_continue_unanswered_prompt_after_compaction())
+
+
 def test_compaction_no_gain() -> None:
     asyncio.run(case_compaction_no_gain())
 
@@ -1380,6 +1449,8 @@ async def main() -> int:
     await case_overflow_other_errors()
     await case_resume_after_crash_mid_tool()
     await case_abort_mid_tool_call_stream()
+    await case_continue_after_crash()
+    await case_continue_unanswered_prompt_after_compaction()
     await case_compaction_no_gain()
     await case_double_compaction_resume()
     await case_compact_before_prompt()

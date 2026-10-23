@@ -30,7 +30,9 @@ from pi_ai import (
     Model,
     ThinkingLevel,
     Tool,
+    ToolResultMessage,
     Usage,
+    UserMessage,
     is_context_overflow,
 )
 
@@ -530,16 +532,34 @@ class AgentSession:
         if expand_prompt_templates:
             text = self.expand_prompt_template(text)
         await self._compaction_idle.wait()
+        # 先压缩、后执行：新请求本身不参与压缩，压缩完成后才追加
+        await self._prepare_run(extra_text=text)
+        return await self.agent.prompt(text, images)
+
+    async def _prepare_run(self, extra_text: str = "") -> None:
+        """每次运行前（新请求或续跑）：模式、扩展钩子、按需压缩"""
         await self._apply_mode()
         errors = await self.resources.get_extension_api().run_before_start(self)
         for note in errors:
             self.services.diagnostics.append(f"before_agent_start 失败：{note}")
-        # 先压缩、后执行：新请求本身不参与压缩，压缩完成后才追加
         self._compaction_attempts = 0
         self._compaction_blocked = False
         self._overflow_recovered = False
-        await self._maybe_compact(extra_text=text)
-        return await self.agent.prompt(text, images)
+        await self._maybe_compact(extra_text=extra_text)
+
+    @property
+    def can_continue(self) -> bool:
+        """上次在一轮中途中断：最后一条是工具结果，或是还没得到回复的用户消息"""
+        last = self.agent.state.messages[-1] if self.agent.state.messages else None
+        return isinstance(last, (ToolResultMessage, UserMessage))
+
+    async def continue_(self) -> list[AgentMessage]:
+        """不追加新消息，从断点接着跑完上次没做完的那一轮。准备工作和 prompt() 相同（先压后跑）"""
+        await self._compaction_idle.wait()
+        if not self.can_continue:
+            raise RuntimeError("没有可以继续的任务：上一轮已经完成")
+        await self._prepare_run()
+        return await self.agent.continue_()
 
     async def run_command(self, name: str, rest: str = "") -> str | None:
         """执行扩展注册的斜杠命令,终端和网页共用这一条路径"""

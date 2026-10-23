@@ -9,7 +9,7 @@ import time
 from typing import Any, Awaitable, Callable, Iterable
 from pi_ai import AssistantMessage, ImageContent, Model, TextContent, ThinkingLevel, UserMessage
 
-from .loop import LoopConfig, default_convert_to_llm, run_agent_loop
+from .loop import LoopConfig, agent_loop_continue, default_convert_to_llm, run_agent_loop
 from .queue import PendingMessageQueue
 from .types import (
     AfterToolCall,
@@ -150,6 +150,20 @@ class Agent:
         self._idle.clear()
         try:
             return await run_agent_loop(self.state, self._emit, self._config(), self._cancel)
+        finally:
+            self._idle.set()
+
+    async def continue_(self) -> list[AgentMessage]:
+        """
+        不追加新消息，从现有 transcript 接着跑。用于上次在一轮中途中断（transcript 以
+        工具结果或还没得到回复的用户消息结尾）的情况；以 assistant 结尾时抛 ValidationError。
+        """
+        if self.state.is_streaming:
+            raise RuntimeError("agent is streaming")
+        self._cancel = asyncio.Event()
+        self._idle.clear()
+        try:
+            return await agent_loop_continue(self.state, self._emit, self._config(), self._cancel)
         finally:
             self._idle.set()
 

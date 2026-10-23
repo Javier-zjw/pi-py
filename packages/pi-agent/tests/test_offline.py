@@ -761,6 +761,27 @@ def test_tool_result_pairing() -> None:
     check("配对: 原列表不被修改", len(msgs) == 3 and len(partial) == 3)
 
 
+async def case_agent_continue() -> None:
+    agent = Agent(stream_fn=scripted_stream([[TextContent(text="接着做完了")]]),
+                  initial_state=AgentState(model=MODEL))
+    agent.state.messages = [
+        UserMessage(content="跑测试"),
+        AssistantMessage(content=[ToolCall(id="t1", name="echo", arguments={})], stop_reason="toolUse"),
+        ToolResultMessage(tool_call_id="t1", tool_name="echo", content=[TextContent(text="ok")]),
+    ]
+    events: list = []
+    agent.subscribe(events.append)
+    await agent.continue_()
+    check("续跑: 不追加新的用户消息", [m.role for m in agent.state.messages]
+          == ["user", "assistant", "toolResult", "assistant"], str([m.role for m in agent.state.messages]))
+    check("续跑: 正常结束", events[-1].type == "agent_end" and events[-1].reason == "stop")
+    try:
+        await agent.continue_()
+        check("续跑: 以 assistant 结尾时拒绝", False, "没有抛")
+    except ValidationError:
+        check("续跑: 以 assistant 结尾时拒绝", True)
+
+
 async def case_no_terminal_event() -> None:
     """provider 异常退出、一个终止事件都没发——必须有兜底。"""
     def truncated(model, context, options=None):
@@ -920,6 +941,10 @@ def test_stream_error_hook() -> None:
     asyncio.run(case_stream_error_hook())
 
 
+def test_agent_continue() -> None:
+    asyncio.run(case_agent_continue())
+
+
 def test_no_terminal_event() -> None:
     asyncio.run(case_no_terminal_event())
 
@@ -964,6 +989,7 @@ async def main() -> int:
     await case_stream_error()
     await case_stream_error_hook()
     test_tool_result_pairing()
+    await case_agent_continue()
     await case_no_terminal_event()
     await case_loop_continue()
     print("订阅与输入")

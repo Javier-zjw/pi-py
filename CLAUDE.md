@@ -67,6 +67,7 @@ pi-web（Vue 3 + Vite，只通过 HTTP/SSE 与 pi-server 通信）
 ### 各层职责
 
 - **pi-ai**：单次 LLM 调用。`Context` 可序列化；`Models` 注册表提供 `stream`/`complete`（provider 原生）与 `stream_simple`/`complete_simple`（统一 `reasoning`）。provider 只有 `anthropic-messages` 和 `openai-completions`（兼容端点）。凭证优先级：运行时 override > `auth.json` > 环境变量。
+  - 推理回传：OpenAI 兼容端点把**调了工具的**回复的思考作为 `reasoning_content` 发回（同 provider 才发）。`Model.reasoning_passback`（models.json `"reasoningPassback"`），None = 自动：DeepSeek / Moonshot(Kimi) 的推理模型开，其余关（严格端点可能拒绝未知字段）。不回传时模型每一步都从头想，长工具链容易跑偏。
   - 用量约定（同 Anthropic）：`usage.input` **不含**命中缓存的部分，上下文大小 = input + cache_read + cache_write。OpenAI 兼容端点的 `prompt_tokens` 包含缓存，必须减掉（`providers/openai.py::apply_openai_usage`，也认 DeepSeek 的 `prompt_cache_hit_tokens`）——曾因此把上下文算成两倍，导致清理/压缩反复误触发。
   - `errors.py`：HTTP 错误经 `describe_llm_error` 把响应体里的原因写进 `error_message`；`is_context_overflow` 识别各家"上下文超长"（不含限流）。
   - Anthropic 前缀缓存：`Model.prompt_cache`（models.json `"promptCache"`）为 None 时只对官方 Anthropic 开启；第三方 anthropic-messages 端点可能不认 `cache_control`，需显式开启。断点：system、最后一个工具、最后两条 user 角色消息。
@@ -83,6 +84,7 @@ pi-web（Vue 3 + Vite，只通过 HTTP/SSE 与 pi-server 通信）
   - 模式：`_apply_mode()` 每轮先把系统提示和工具集**从 `_base_system_prompt` / `_base_tools` 基线重建**，再调用模式的 `apply`——不要在上一轮结果上叠加。
   - 会话（`session/`）：JSONL **树**（`id`/`parentId`），分支=移动 leaf；存于 `~/.pi/agent/sessions/<项目目录名>/`。磁盘格式与 TS 版 pi 保持一致（camelCase 键、v3 entry 类型），改格式会破坏互操作。compaction entry 写 `firstKeptEntryId`（旧文件里的 `retainedTail` 仍可读），`details.state` 存结构化状态。模型/思考档位从完整分支读取，而非裁剪后的上下文。
   - 工具（`tools/`）：`read write edit bash grep find ls`。参数是纯 JSON Schema dict，由 `pi_agent.validation` 校验（会把 `"3"` 纠正为 `3`）；非必填字段一律 `args.get()`；`details` 必须可 JSON 序列化（`Path` 先转 `str`）。grep/find 有 rg/fd 时用二进制，否则纯 Python 回退。所有来自 OS 的字符串先过 `text.sanitize`；bash 输出用增量解码器（中文跨块）。
+  - 系统提示（`prompt.py::BASE_SYSTEM_PROMPT`，英文，结构参照 Codex）：先判断任务大小、范围以用户请求为准（范围外的只记一句）、隔几步自查够不够回答、多步任务用 `update_plan`、批量工具前一句进度说明、读文件用 `read` 而不是 bash、回答跟随用户语言。`test_resources` 断言了这几条，改提示时别删。
   - 配置：`~/.pi/agent/` 下 `models.json`（自定义 provider/模型，`api` 字段决定协议）、`auth.json`（`{provider_id: {apiKey}}`）、`settings.json`；项目级 `<cwd>/.pi/settings.json` 深度合并覆盖全局（默认值见 `settings.py::DEFAULT_SETTINGS`）。`reasoning: true` 只是能力标记；思考档位来源：CLI `-t` > 会话记录 > settings > `off`。
 - **上下文压缩**（`pi_coding_agent/compaction/`，设计取舍见各模块 docstring）：
   - 分工：`budget`（CJK 感知计量，以实报 usage 为锚）→ `cut`（按 token 预算保留尾部，不拆工具调用/结果）→ `engine`（只计算结果、不改会话）→ `AgentSession._apply_compaction`（落盘 + 替换消息，中间无 await）。

@@ -157,6 +157,17 @@ def test_build_system_prompt() -> None:
         prompt = build_system_prompt(cwd, context_files=files, skills_block="<skills>x</skills>")
 
         check("系统提示: 含基础提示", BASE_SYSTEM_PROMPT[:30] in prompt)
+        # 防跑偏的几条要求（长工具链里最容易丢的就是这些），改提示时别删掉
+        for needle, why in [
+            ("Size the task", "先判断任务大小"),
+            ("defines the scope", "范围以用户的请求为准"),
+            ("Do I already have enough to", "隔几步自查、够了就回答"),
+            ("`update_plan`", "多步任务用计划工具"),
+            ("not for `cat`, `sed -n` or `grep`", "读文件用 read 而不是 bash"),
+            ("language the user writes in", "回答跟随用户语言"),
+        ]:
+            check(f"系统提示: {why}", needle in BASE_SYSTEM_PROMPT)
+        check("系统提示: 续行已拼接（没有残留反斜杠）", "\\\n" not in BASE_SYSTEM_PROMPT)
         check("系统提示: 含环境块", "<environment>" in prompt)
         check("系统提示: 含 AGENTS.md 内容", "必须写测试" in prompt)
         check("系统提示: 含技能块", "<skills>" in prompt)

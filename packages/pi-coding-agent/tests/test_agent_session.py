@@ -676,6 +676,56 @@ async def case_todo_plan() -> None:
         check("计划: 全部完成后不再补回", not any("当前任务计划" in s for s in sections), str(sections))
 
 
+class ScriptedSSE:
+    """真 OpenAIProvider 用的假 HTTP：每次请求回放一段 SSE，并记下请求体"""
+
+    def __init__(self, replies: list[list[dict]]) -> None:
+        self.replies = list(replies)
+        self.payloads: list[dict] = []
+
+    async def stream_sse(self, url, headers, payload, timeout=600.0):
+        from pi_ai import SSEEvent
+        self.payloads.append(payload)
+        for data in self.replies.pop(0):
+            yield SSEEvent(None, data)
+
+
+async def case_reasoning_passback_end_to_end() -> None:
+    """DeepSeek 思考模式：第一步流出来的思考，要原样出现在第二步请求里（三层串起来验证）"""
+    from pi_ai import InMemoryCredentialStore, Models, OpenAIProvider
+
+    def chunk(delta, finish=None):
+        return {"choices": [{"delta": delta, "finish_reason": finish}]}
+
+    transport = ScriptedSSE([
+        [chunk({"reasoning_content": "先读入口文件 main.py，"}), chunk({"reasoning_content": "再决定看哪里"}),
+         chunk({"tool_calls": [{"index": 0, "id": "c1", "function": {
+             "name": "read", "arguments": '{"path": "main.py"}'}}]}),
+         chunk({}, "tool_calls")],
+        [chunk({"reasoning_content": "够了"}), chunk({"content": "入口只打印 hi"}), chunk({}, "stop")],
+    ])
+    model = Model(id="deepseek-flash", provider="deepseek-api", api="openai-completions",
+                  reasoning=True, base_url="https://api.deepseek.com")
+    store = InMemoryCredentialStore()
+    store.set("deepseek-api", "k")
+    models = Models(models=[model], credentials=store)
+    models.set_provider(OpenAIProvider(provider_id="deepseek-api", base_url=model.base_url,
+                                       transport=transport))
+    with Sandbox() as cwd:
+        (cwd / "main.py").write_text("print('hi')\n", "utf-8")
+        services = create_agent_session_services(cwd=cwd, agent_dir=cwd / "agent",
+                                                 model_runtime=ModelRuntime(models, cwd / "agent"))
+        session = AgentSession(services, SessionManager.in_memory(cwd), model=model,
+                               thinking_level="low", tools=["read"])
+        await session.prompt("入口文件做了什么")
+        check("回传: 跑完两步", session.messages[-1].text() == "入口只打印 hi", session.messages[-1].text())
+        second = transport.payloads[1]["messages"]
+        calls = [m for m in second if m.get("role") == "assistant" and m.get("tool_calls")]
+        check("回传: 第二步请求里带着第一步的思考",
+              calls and calls[0].get("reasoning_content") == "先读入口文件 main.py，再决定看哪里",
+              json.dumps(calls, ensure_ascii=False)[:300])
+
+
 async def case_prune_disabled() -> None:
     with Sandbox() as cwd:
         write_files(cwd, 6)
@@ -1443,6 +1493,10 @@ def test_todo_plan() -> None:
     asyncio.run(case_todo_plan())
 
 
+def test_reasoning_passback_end_to_end() -> None:
+    asyncio.run(case_reasoning_passback_end_to_end())
+
+
 def test_prune_disabled() -> None:
     asyncio.run(case_prune_disabled())
 
@@ -1562,6 +1616,7 @@ async def main() -> int:
     await case_prune_skips_small_batches()
     await case_tool_budget()
     await case_todo_plan()
+    await case_reasoning_passback_end_to_end()
     await case_prune_disabled()
     await case_rehydrate_after_compaction()
     await case_rehydrate_hook_failure()

@@ -61,7 +61,8 @@ SCRIPT = [
 ]
 
 
-async def run_turn(cwd: Path, script: list[list]) -> tuple[SessionRenderer, io.StringIO, AgentSession]:
+async def run_turn(cwd: Path, script: list[list], show_thinking: bool = True
+                   ) -> tuple[SessionRenderer, io.StringIO, AgentSession]:
     (cwd / "README.md").write_text("# demo\n说明文档\n", "utf-8")
     (cwd / "app.py").write_text("def main():\n    print('hi')\n", "utf-8")
     models, _ = fake_models(script, usage=Usage(input=4130, output=86))
@@ -70,7 +71,7 @@ async def run_turn(cwd: Path, script: list[list]) -> tuple[SessionRenderer, io.S
     session = AgentSession(services, SessionManager.in_memory(cwd), model=FAKE_MODEL,
                            tools=["bash", "read"])
     out = io.StringIO()
-    renderer = SessionRenderer(theme=Theme(ColorMode.NONE), stream=out)
+    renderer = SessionRenderer(theme=Theme(ColorMode.NONE), stream=out, show_thinking=show_thinking)
     session.subscribe(renderer.on_event)
     renderer.state.own_prompt = "查看一下当前代码"
     await session.prompt("查看一下当前代码")
@@ -92,8 +93,9 @@ async def case_collapsed_turn() -> None:
         check("收起: 摘要带名字和次数", "bash ×2" in summary[0] and "read ×2" in summary[0], summary[0])
         check("收起: 失败数醒目标出", "1 失败" in summary[0], summary[0])
         check("收起: 提示怎么展开", "ctrl+o 展开" in summary[0])
-        check("思考: 只留一行时长", any(line.strip().startswith("思考了") for line in lines)
-              and "先列目录" not in text, text)
+        check("思考: 实时显示思考原文", "✻ 思考" in text and "  用户想看代码，我先列目录，再读关键文件。" in lines,
+              text)
+        check("思考: 显示原文时不再打「思考了」", "思考了" not in text, text)
         answer = next((i for i, line in enumerate(lines) if line.startswith("● ")), None)
         check("回答: 以 ● 开头", answer is not None, text)
         check("回答: 续行缩进两格", answer is not None and lines[answer + 1].startswith("  - README.md"),
@@ -108,6 +110,35 @@ async def case_collapsed_turn() -> None:
               footers[0].split(" · ")[0].endswith("s") and not any(
                   word in footers[0] for word in ("用时", "上下文", "输出", "✻")), footers[0])
         check("统计: 不再每次调模型都打一行", "↑4130" not in text)
+
+
+async def case_thinking_order() -> None:
+    """多次调模型：思考 → 工具摘要 → 思考 → 回答，按真实顺序；思考的多余空行被压掉"""
+    script = [
+        [ThinkingContent(thinking="\n\n先看目录。\n\n\n\n再决定读哪个文件。\n\n"),
+         ToolCall(id="t1", name="bash", arguments={"command": "ls"})],
+        [ThinkingContent(thinking="README 最关键。"),
+         ToolCall(id="t2", name="read", arguments={"path": "README.md"})],
+        [ThinkingContent(thinking="可以回答了。"), TextContent(text="这是一个示例项目。")],
+    ]
+    with Sandbox() as cwd:
+        _renderer, out, _ = await run_turn(cwd, script)
+        text = out.getvalue()
+        lines = text.splitlines()
+        marks = [text.index(m) for m in ("先看目录", "1 个工具调用 · bash", "README 最关键",
+                                         "1 个工具调用 · read", "可以回答了", "● 这是一个示例项目")]
+        check("顺序: 思考 → 工具 → 思考 → 工具 → 思考 → 回答", marks == sorted(marks), text)
+        check("思考: 每次调用一个标题", text.count("✻ 思考") == 3, text)
+        check("思考: 开头的空行去掉", lines[lines.index("✻ 思考") + 1] == "  先看目录。", text)
+        check("思考: 连续空行压成一行，续行缩进",
+              "  先看目录。\n  \n  再决定读哪个文件。\n" in text, repr(text))
+        check("思考: 段尾空行不写出", "再决定读哪个文件。\n▸" in text, repr(text))
+
+    with Sandbox() as cwd:
+        _renderer, out, _ = await run_turn(cwd, list(SCRIPT), show_thinking=False)
+        text = out.getvalue()
+        check("--no-thinking: 收成一行时长", "思考了" in text and "先列目录" not in text
+              and "✻ 思考" not in text, text)
 
 
 async def case_expand() -> None:
@@ -176,6 +207,10 @@ def test_expand() -> None:
     asyncio.run(case_expand())
 
 
+def test_thinking_order() -> None:
+    asyncio.run(case_thinking_order())
+
+
 def test_steering_echo() -> None:
     asyncio.run(case_steering_echo())
 
@@ -183,6 +218,8 @@ def test_steering_echo() -> None:
 async def main() -> int:
     print("收起与统计")
     await case_collapsed_turn()
+    print("思考")
+    await case_thinking_order()
     print("展开")
     await case_expand()
     print("状态行与回显")

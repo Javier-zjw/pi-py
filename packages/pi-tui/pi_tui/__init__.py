@@ -25,7 +25,11 @@ from .components import (
     usage_line,
     user_message,
 )
-from .input import HAS_PROMPT_TOOLKIT, LineReader, missing_dependency_hint
+from .input import (
+    HAS_PROMPT_TOOLKIT, LineReader, SlashCommand, SlashCompleter, match_commands,
+    missing_dependency_hint,
+)
+from .picker import PickerItem, PickerState, PickResult, pick
 from .live import LiveRegion, Spinner, StatusBar, Ticker, rendered_rows, TextStreamer
 from .theme import (
     ACCENT,
@@ -53,5 +57,6 @@ __all__ = [
     "detect_color_mode", "diff_block", "display_width", "key_value", "markdown_lite",
     "pad", "rule", "strip_ansi", "terminal_width", "thinking_block", "tool_call",
     "tool_result", "truncate", "usage_line", "user_message", "wrap", "LineReader", "missing_dependency_hint",
-    "Ticker", "answer_start", "TextStreamer"
+    "Ticker", "answer_start", "TextStreamer", "SlashCommand", "SlashCompleter", "match_commands",
+    "PickerItem", "PickerState", "PickResult", "pick",
 ]

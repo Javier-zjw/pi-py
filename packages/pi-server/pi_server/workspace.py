@@ -15,7 +15,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from pi_coding_agent import SessionManager
+from pi_coding_agent.session import list_sessions
 from pi_coding_agent.session.entries import entry_from_dict
 
 from .dto import compaction_dto
@@ -422,37 +422,7 @@ def list_subdirectories(path: str | Path) -> dict[str, Any]:
 def list_session_files(cwd: str | Path, agent_dir: str | Path | None = None,
                        limit: int = 50) -> list[dict[str, Any]]:
     """当前工作目录下的历史会话，附带标题和轮数。"""
-    hidden = load_hidden(agent_dir)
-    out = []
-    for path in SessionManager.list(cwd, agent_dir):
-        if str(path) in hidden:
-            continue
-        if len(out) >= limit:
-            break
-        title, turns = "", 0
-        try:
-            with path.open("r", encoding="utf-8") as fh:
-                for line in fh:
-                    try:
-                        data = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    message = data.get("message") or {}
-                    if data.get("type") == "message" and message.get("role") == "user":
-                        turns += 1
-                        if not title:
-                            content = message.get("content")
-                            text = content if isinstance(content, str) else "".join(
-                                b.get("text", "") for b in content or []
-                            )
-                            title = text.replace("\n", " ")[:60]
-        except OSError:
-            continue
-        out.append({
-            "file": str(path),
-            "name": path.stem,
-            "title": title or path.stem,
-            "turns": turns,
-            "mtime": path.stat().st_mtime,
-        })
-    return out
+    return [
+        {"file": str(s.path), "name": s.name, "title": s.title, "turns": s.turns, "mtime": s.mtime}
+        for s in list_sessions(cwd, agent_dir, limit=limit, exclude=load_hidden(agent_dir))
+    ]

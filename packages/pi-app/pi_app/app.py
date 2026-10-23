@@ -8,142 +8,282 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import re
 import sys
+from collections.abc import Awaitable
 from pathlib import Path
+from typing import Any
 
 from pi_coding_agent import SessionManager, create_agent_session, create_agent_session_services
 from pi_coding_agent.text import sanitize
-from pi_tui import LineReader, Theme, missing_dependency_hint, terminal_width
+from pi_tui import (
+    LineReader,
+    PickerItem,
+    PickResult,
+    SlashCommand,
+    Theme,
+    display_width,
+    missing_dependency_hint,
+    pad,
+    pick,
+    truncate,
+)
 
+from .commands import BUILTIN_COMMANDS, AppCommand
 from .renderer import SessionRenderer
 
-BUILTIN_COMMANDS = {
-    "help", "model", "think", "tools", "compact", "continue", "expand", "usage", "session",
-    "exit", "quit",
-}
+# 像命令名的才报"未知命令"；/usr/bin 这种路径照常发给模型
+COMMAND_NAME = re.compile(r"[A-Za-z][\w-]*")
 
-HELP = """
-  /help              显示本帮助
-  /model             列出可用模型
-  /model <spec>      切换模型，如 /model ark-planing/glm-5.2
-  /think <level>     思考档位：off minimal low medium high xhigh max
-  /tools             列出当前启用的工具
-  /compact [说明]    立即压缩上下文，可附加压缩重点
-  /continue          接着执行上次中断的那一轮
-  /expand            展开上一轮的思考和工具调用（等同 ctrl+o）
-  /usage             本次会话的 token 与费用
-  /session           当前会话文件路径
-  /exit              退出
-"""
+SHORTCUTS = [
+    ("ctrl+o", "展开上一轮的思考和工具调用"),
+    ("Alt+Enter", "换行"),
+    ("↑ ↓", "翻历史；菜单打开时选择命令"),
+    ("Tab", "补全命令名，接着输参数"),
+    ("ctrl+c", "清空输入；空行时退出；运行中中断"),
+]
 
 
-async def run(session, renderer: SessionRenderer) -> int:
-    renderer.status.model = session.model.key if session.model else "none"
-    renderer.status.thinking = session.thinking_level
-    renderer.status.hint = "/help"
-    renderer.header(session.cwd, renderer.status.model, session.thinking_level)
-    session.subscribe(renderer.on_event)
-    if session.can_continue:
-        note = (f"（{len(session.interrupted_tool_calls)} 个工具调用没有返回结果）"
-                if session.interrupted_tool_calls else "")
-        print(renderer.theme.warn(f"  上次的任务在一轮中途中断了{note}，输入 /continue 接着执行"))
+class App:
+    """输入循环 + 斜杠命令分派。命令表见 commands.py；/clear、/resume 会换掉 self.session"""
 
-    reader = LineReader(
-        history_file=Path.home() / ".pi" / "agent" / "history",
-        key_handlers={"c-o": renderer.expand_last_turn},
-        erase_when_done=True,
-    )
-    hint = missing_dependency_hint(renderer.theme)
-    if hint:
-        print(hint)
-    turns = 0
-    while True:
+    def __init__(self, session: Any, renderer: SessionRenderer, *,
+                 agent_dir: str | Path | None = None) -> None:
+        self.session = session
+        self.renderer = renderer
+        self.agent_dir = agent_dir
+        self.commands: list[AppCommand] = list(BUILTIN_COMMANDS)
+        self.turns = 0
+        self.reader: LineReader | None = None
+        self._unsubscribe: Any = None
+        self.attach(session)
+
+    @property
+    def theme(self) -> Theme:
+        return self.renderer.theme
+
+    # -- 输出 ---------------------------------------------------------- #
+
+    def out(self, lines: list[str]) -> None:
+        self.renderer.print_lines(lines)
+
+    def note(self, text: str) -> None:
+        self.out([self.theme.muted(f"  {text}")])
+
+    def error(self, text: str) -> None:
+        self.out([self.theme.error(f"  ✗ {text}")])
+
+    async def pick(self, title: str, items: list[PickerItem], **kwargs: Any) -> PickResult | None:
+        return await pick(title, items, theme=self.theme, width=self.renderer.width, **kwargs)
+
+    # -- 命令表 -------------------------------------------------------- #
+
+    def _extension_commands(self) -> dict[str, Any]:
+        return self.session.resources.get_extension_api().commands
+
+    def find(self, name: str) -> AppCommand | None:
+        return next((c for c in self.commands if name == c.name or name in c.aliases), None)
+
+    def slash_commands(self) -> list[SlashCommand]:
+        """补全菜单的内容：内置命令 > 扩展命令 > 提示模板，同名时前面的优先。每次现取，
+        扩展和模板在运行中可能变化"""
+        out = [SlashCommand(c.name, c.description, c.aliases) for c in self.commands]
+        taken = {c.name for c in out} | {a for c in self.commands for a in c.aliases}
+        for command in self._extension_commands().values():
+            if command.name not in taken:
+                out.append(SlashCommand(command.name, command.description))
+                taken.add(command.name)
+        for template in self.session.resources.get_prompts():
+            if template.name not in taken:
+                out.append(SlashCommand(template.name, template.description or "提示模板"))
+                taken.add(template.name)
+        return out
+
+    def print_help(self) -> None:
+        t = self.theme
+        rows: list[tuple[str, str]] = []
+        for c in self.commands:
+            alias = t.muted(f"  别名 {' '.join('/' + a for a in c.aliases)}") if c.aliases else ""
+            rows.append((f"/{c.name} {c.usage}".rstrip(), c.description + alias))
+        builtin = {c.name for c in self.commands}
+        extension = [c for c in self._extension_commands().values() if c.name not in builtin]
+        templates = self.session.resources.get_prompts()
+        width = min(28, max(display_width(name) for name, _ in rows) + 2)
+
+        def table(pairs: list[tuple[str, str]]) -> list[str]:
+            return [f"  {t.accent(pad(truncate(name, width), width))}{desc}" for name, desc in pairs]
+
+        lines = table(rows)
+        if extension:
+            lines += ["", t.muted("  扩展命令")]
+            # 扩展的 usage 习惯写全（"/plan [需求]"），只写了参数的补上命令名
+            lines += table([(c.usage if c.usage.startswith("/") else f"/{c.name} {c.usage}".rstrip(),
+                             c.description) for c in extension])
+        if templates:
+            lines += ["", t.muted("  提示模板")]
+            lines += table([(f"/{p.name}", p.description) for p in templates])
+        lines += ["", t.muted("  快捷键")]
+        lines += [f"  {t.accent(pad(key, width))}{desc}" for key, desc in SHORTCUTS]
+        self.out(["", *lines, ""])
+
+    # -- 会话 ---------------------------------------------------------- #
+
+    def attach(self, session: Any) -> None:
+        """渲染器改订阅这个会话。换会话（/clear、/resume）时旧会话随之释放"""
+        if self._unsubscribe is not None:
+            self._unsubscribe()
+        if session is not self.session:
+            self.session.dispose()
+        self.session = session
+        self._unsubscribe = session.subscribe(self.renderer.on_event)
+        self.renderer.status.model = session.model.key if session.model else "none"
+        self.renderer.status.thinking = session.thinking_level
+        self.renderer.status.hint = "/help"
+
+    def greet(self) -> None:
+        session = self.session
+        self.renderer.header(session.cwd, self.renderer.status.model, session.thinking_level)
+        self.continue_hint()
+
+    def continue_hint(self) -> None:
+        session = self.session
+        if session.can_continue:
+            note = (f"（{len(session.interrupted_tool_calls)} 个工具调用没有返回结果）"
+                    if session.interrupted_tool_calls else "")
+            self.out([self.theme.warn(f"  上次的任务在一轮中途中断了{note}，输入 /continue 接着执行")])
+
+    def switch_model(self, model: Any, level: str) -> None:
+        session = self.session
+        if model is not None and (session.model is None or model.key != session.model.key):
+            session.set_model(model)
+        if level != session.thinking_level:
+            session.set_thinking_level(level)
+        self.renderer.status.model = session.model.key if session.model else "none"
+        self.renderer.status.thinking = session.thinking_level
+        t = self.theme
+        think = t.highlight(level, bold=True) if level != "off" else t.muted("off")
+        model_key = t.accent(self.renderer.status.model, bold=True)
+        self.out([f"  {t.success('✓')} 模型 {model_key}  {t.muted('·')}  思考 {think}"])
+
+    def _replace_session(self, manager: SessionManager, **kwargs: Any) -> None:
+        old = self.session
+        session = create_agent_session(services=old.services, session_manager=manager, **kwargs)
+        self.attach(session)
+        self.renderer.reset()
+        self.turns = 0
+
+    async def new_session(self) -> None:
+        """/clear：新会话，沿用当前模型和思考档位"""
+        old = self.session
+        manager = (SessionManager.create(old.cwd, self.agent_dir) if old.session.is_persisted()
+                   else SessionManager.in_memory(old.cwd))
+        self._replace_session(manager, model=old.model, thinking_level=old.thinking_level)
+        self.out([""])
+        self.greet()
+
+    async def open_session(self, path: str | Path) -> None:
+        """/resume：打开历史会话，模型和思考档位从会话记录里恢复"""
         try:
-            raw = await reader.read(renderer.input_prompt() if reader.rich else "\033[1m❯ \033[0m")
-        except (EOFError, KeyboardInterrupt):
-            print()
-            break
-        line = sanitize(raw).strip()
-        if line and reader.rich:
-            # 输入框提交后被擦掉了，用紧凑的样式把这句话留在 scrollback 里
-            renderer.user_echo(line)
-        if not line:
-            continue
-
-        if line.startswith("/") and line[1:].partition(" ")[0] in BUILTIN_COMMANDS:
-            cmd, _, rest = line[1:].partition(" ")
-            if cmd in ("exit", "quit"):
-                break
-            if cmd == "help":
-                print(renderer.theme.muted(HELP))
-            elif cmd == "expand":
-                renderer.expand_last_turn()
-            elif cmd == "model":
-                if rest:
-                    model = session.model_runtime.resolve(rest.strip())
-                    if model:
-                        session.set_model(model)
-                        renderer.status.model = model.key
-                    else:
-                        print(renderer.theme.error(f"未知模型：{rest}"))
-                else:
-                    for m in session.model_runtime.available_models():
-                        mark = "*" if session.model and m.key == session.model.key else " "
-                        print(f" {mark} {m.key}")
-            elif cmd == "think":
-                session.set_thinking_level(rest.strip() or "off")
-                renderer.status.thinking = session.thinking_level
-            elif cmd == "tools":
-                for tool in session.agent.state.tools:
-                    print(f"  {tool.name:<10} {tool.description.splitlines()[0][:70]}")
-            elif cmd == "compact":
-                # 进度和结果由渲染器根据 compaction_* 事件显示
-                try:
-                    await session.compact(rest or None)
-                except KeyboardInterrupt:
-                    session.abort()
-            elif cmd == "continue":
-                if not session.can_continue:
-                    print(renderer.theme.muted("  没有可以继续的任务：上一轮已经完成"))
-                    continue
-                turns += 1
-                try:
-                    await session.continue_()
-                except KeyboardInterrupt:
-                    session.abort()
-                except Exception as exc:
-                    print(renderer.theme.error(f"  ✗ {type(exc).__name__}: {exc}"))
-            elif cmd == "usage":
-                u = session.usage()
-                print(renderer.theme.muted(f"  ↑{u.input} ↓{u.output} ¥{u.cost.total:.4f}"))
-            elif cmd == "session":
-                print(renderer.theme.muted(f"  {session.session_file or '(内存)'}"))
-            # if cmd != "help":
-            #     print(renderer.status_line())
-            if cmd in ("model", "think"):
-                print(renderer.status_line())
-            continue
-
-        # 不再调 renderer.prompt_echo(line)：输入行已经把它显示过一遍了，
-        # 再打印一次就是同一句话出现两遍
-        renderer.state.own_prompt = line
-        turns += 1
-        try:
-            await session.prompt(line)
-        except KeyboardInterrupt:
-            session.abort()
+            manager = SessionManager.open(path, self.agent_dir)
         except Exception as exc:
-            print(renderer.theme.error(f"  ✗ {type(exc).__name__}: {exc}"))
-        # print(renderer.status_line())
+            self.error(f"打不开会话：{type(exc).__name__}: {exc}")
+            return
+        self._replace_session(manager)
+        self.out(self.renderer.recap(self.session.messages))
+        self.note(f"已恢复会话 {Path(path).name} · {len(self.session.messages)} 条消息 · "
+                  f"{self.renderer.status.model}")
+        self.continue_hint()
 
-    model = session.model
-    renderer.summary(
-        model.key if model else "none",
-        turns,
-        session.usage().input,
-        model.context_window if model else 0,
-    )
-    return 0
+    # -- 运行 ---------------------------------------------------------- #
+
+    async def run_agent(self, run: Awaitable[Any]) -> None:
+        self.turns += 1
+        try:
+            await run
+        except KeyboardInterrupt:
+            self.session.abort()
+        except Exception as exc:
+            self.error(f"{type(exc).__name__}: {exc}")
+
+    async def send(self, text: str) -> None:
+        # 输入行已经显示过（或 user_echo 回显过）这句话，渲染器不要再打一遍
+        self.renderer.state.own_prompt = text
+        await self.run_agent(self.session.prompt(text))
+
+    async def dispatch(self, line: str) -> bool:
+        """执行一条 / 开头的输入。返回 False 表示退出"""
+        name, _, rest = line[1:].partition(" ")
+        rest = rest.strip()
+        if not name:
+            self.print_help()
+            return True
+        command = self.find(name)
+        if command is not None:
+            try:
+                return await command.handler(self, rest) is not False
+            except Exception as exc:
+                self.error(f"/{name} 失败：{type(exc).__name__}: {exc}")
+                return True
+        if name in self._extension_commands():
+            try:
+                output = await self.session.run_command(name, rest)
+            except Exception as exc:
+                self.error(f"/{name} 失败：{type(exc).__name__}: {exc}")
+                return True
+            if output:
+                self.out([f"  {text}" for text in str(output).splitlines()])
+            return True
+        if any(p.name == name for p in self.session.resources.get_prompts()):
+            await self.send(line)       # 提示模板：AgentSession.prompt 负责展开
+            return True
+        if COMMAND_NAME.fullmatch(name):
+            self.error(f"未知命令 /{name}，输入 /help 查看可用命令")
+            return True
+        await self.send(line)
+        return True
+
+    async def run(self) -> int:
+        self.greet()
+        self.reader = LineReader(
+            history_file=Path.home() / ".pi" / "agent" / "history",
+            key_handlers={"c-o": self.renderer.expand_last_turn},
+            erase_when_done=True,
+            commands=self.slash_commands,
+        )
+        hint = missing_dependency_hint(self.theme)
+        if hint:
+            print(hint)
+        while True:
+            try:
+                prompt = self.renderer.input_prompt() if self.reader.rich else "\033[1m❯ \033[0m"
+                raw = await self.reader.read(prompt)
+            except (EOFError, KeyboardInterrupt):
+                print()
+                break
+            line = sanitize(raw).strip()
+            if not line:
+                continue
+            if self.reader.rich:
+                # 输入框提交后被擦掉了，用紧凑的样式把这句话留在 scrollback 里
+                self.renderer.user_echo(line)
+            if line.startswith("/"):
+                if not await self.dispatch(line):
+                    break
+                continue
+            await self.send(line)
+
+        model = self.session.model
+        self.renderer.summary(
+            model.key if model else "none",
+            self.turns,
+            self.session.usage().input,
+            model.context_window if model else 0,
+        )
+        return 0
+
+
+async def run(session: Any, renderer: SessionRenderer, agent_dir: str | Path | None = None) -> int:
+    return await App(session, renderer, agent_dir=agent_dir).run()
 
 
 async def main_async(argv: list[str] | None = None) -> int:
@@ -180,11 +320,12 @@ async def main_async(argv: list[str] | None = None) -> int:
     renderer = SessionRenderer(
         theme=Theme(), show_thinking=not args.no_thinking, show_diff=not args.no_diff
     )
+    app = App(session, renderer, agent_dir=args.agent_dir)
     try:
-        result = await run(session, renderer)
+        result = await app.run()
     finally:
         renderer.stop()
-        session.dispose()
+        app.session.dispose()
     return result
 
 

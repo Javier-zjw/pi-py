@@ -23,6 +23,7 @@ from ..events import (
     ToolCallEndEvent
 )
 
+from ..errors import describe_llm_error
 from ..json_parse import parse_streaming_json
 from ..transport import HttpTransport, LLMError, default_transport
 from ..types import (
@@ -307,8 +308,8 @@ class AnthropicProvider:
                     return
 
         except LLMError as exc:
-            message.error_message = str(exc)
-            yield ErrorEvent(error=str(exc), message=finalize(message, model, "error"))
+            message.error_message = describe_llm_error(exc)
+            yield ErrorEvent(error=message.error_message, message=finalize(message, model, "error"))
             return
 
         yield DoneEvent(reason=stop_reason, message=finalize(message, model, stop_reason))

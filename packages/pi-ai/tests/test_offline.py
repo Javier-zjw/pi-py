@@ -301,6 +301,69 @@ def test_serde_and_cost() -> None:
     check("cost: 计算", abs(cost.total - 3.0) < 1e-9, str(cost.total))
 
 
+def test_error_classification() -> None:
+    from pi_ai import AssistantMessage, describe_llm_error, is_context_overflow
+
+    anthropic_body = json.dumps({"type": "error", "error": {
+        "type": "invalid_request_error", "message": "prompt is too long: 210000 tokens > 200000 maximum"}})
+    text = describe_llm_error(LLMError("HTTP 400 from x", 400, anthropic_body))
+    check("错误描述: 取出响应体里的原因", text.startswith("HTTP 400: prompt is too long") and
+          "invalid_request_error" in text, text)
+    openai_body = json.dumps({"error": {"message": "This model's maximum context length is 65536 tokens",
+                                        "code": "context_length_exceeded"}})
+    text = describe_llm_error(LLMError("HTTP 400 from x", 400, openai_body))
+    check("错误描述: 带上错误码", "(context_length_exceeded)" in text, text)
+    check("错误描述: 非 JSON 响应体", describe_llm_error(LLMError("x", 502, "<html>Bad   Gateway</html>"))
+          == "HTTP 502: <html>Bad Gateway</html>")
+    check("错误描述: 网络错误原样", describe_llm_error(LLMError("连不上 x")) == "连不上 x")
+
+    overflow = [
+        "HTTP 400: prompt is too long: 210000 tokens > 200000 maximum",
+        "HTTP 400: This model's maximum context length is 65536 tokens (context_length_exceeded)",
+        "HTTP 400: input length and `max_tokens` exceed context limit: 190000 + 16384 > 200000",
+        "HTTP 413: request entity too large",
+        "HTTP 400: Input is too long for requested model.",
+        "HTTP 400: Prompt 超长，请减少输入 (1261)",
+        "HTTP 400: 输入的 token 数超出模型最大上下文长度",
+        "The input exceeds the context window of this model",
+    ]
+    for text in overflow:
+        check(f"超长识别: {text[:40]}", is_context_overflow(text), text)
+    not_overflow = [
+        "HTTP 429: Rate limit reached: too many tokens per minute",
+        "HTTP 401: invalid x-api-key",
+        "连不上 https://api.example.com",
+        "HTTP 500: internal error",
+        "",
+    ]
+    for text in not_overflow:
+        check(f"超长误判: {text[:40] or '(空)'}", not is_context_overflow(text), text)
+
+    message = AssistantMessage(stop_reason="error", error_message=overflow[0])
+    check("超长识别: 接受消息对象", is_context_overflow(message))
+    message.stop_reason = "stop"
+    check("超长识别: 非出错消息不算", not is_context_overflow(message))
+
+
+async def case_http_error_body() -> None:
+    class RejectingTransport:
+        async def stream_sse(self, url, headers, payload, timeout=600.0):
+            raise LLMError("HTTP 400 from x", 400, json.dumps(
+                {"error": {"type": "invalid_request_error", "message": "prompt is too long"}}))
+            yield  # pragma: no cover
+
+    provider = AnthropicProvider(transport=RejectingTransport())
+    context = Context(messages=[UserMessage(content="hi")])
+    events = [e async for e in provider.stream(ANTHROPIC_MODEL, context, SimpleStreamOptions(), api_key="k")]
+    msg = events[-1].message
+    check("错误描述: provider 把响应体写进 error_message",
+          msg.stop_reason == "error" and "prompt is too long" in (msg.error_message or ""), str(msg.error_message))
+
+
+def test_http_error_body() -> None:
+    asyncio.run(case_http_error_body())
+
+
 # ── pytest 兼容层 ───────────────────────────────────────────────────
 # pytest 不装插件跑不了 async def，这里套一层同步壳；
 # 直接 python tests/test_offline.py 时走下面的 main()，不受影响。
@@ -334,6 +397,8 @@ async def main() -> int:
     await case_error_paths()
     test_json_parse()
     test_serde_and_cost()
+    test_error_classification()
+    await case_http_error_body()
 
     print()
     if FAILURES:

@@ -14,6 +14,7 @@ from .auth import (
 )
 from .catalog import BUILTIN_MODELS
 from .cost import apply_cost, calculate_cost
+from .errors import describe_llm_error, is_context_overflow
 from .events import (
     AssistantMessageEvent,
     AssistantMessageEventStream,
@@ -117,9 +118,11 @@ __all__ = [
     "anthropic_provider",
     "apply_cost",
     "calculate_cost",
+    "describe_llm_error",
     "create_models",
     "default_credential_store",
     "get_model",
+    "is_context_overflow",
     "message_from_dict",
     "message_to_dict",
     "openai_compatible_provider",

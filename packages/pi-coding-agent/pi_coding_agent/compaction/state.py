@@ -314,6 +314,9 @@ def render_markdown(state: dict[str, Any]) -> str:
         lines += ["", "## 进行中的请求（原文，本轮尚未完成）", meta["turnRequest"]]
 
     users = state.get("userMessages") or []
+    if meta.get("turnRequest") and users and users[-1]["text"] == _clip_middle(
+            meta["turnRequest"].strip(), USER_MESSAGE_MAX_CHARS):
+        users = users[:-1]          # 已在"进行中的请求"里原文给出，不重复
     if users:
         lines += ["", "## 用户原话（按时间）"]
         lines += [f"{i}. {u['text']}" for i, u in enumerate(users, 1)]
@@ -410,5 +413,13 @@ def trim_to_budget(state: dict[str, Any], budget_tokens: int) -> tuple[dict[str,
         for u in users[:-3]:
             u["text"] = _clip_middle(u["text"], 200)
         steps.append("较早的用户原话截短到 200 字")
+        if state_tokens(state) <= budget_tokens:
+            return state, steps
+
+    if len(users) > 1:
+        # 仍超预算：除最近一条外再截到 500 字（首尾保留，中间标注省略字数）
+        for u in users[:-1]:
+            u["text"] = _clip_middle(u["text"], 500)
+        steps.append("除最近一条外的用户原话截短到 500 字")
 
     return state, steps

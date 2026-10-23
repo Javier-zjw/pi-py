@@ -190,14 +190,18 @@ class SessionManager:
             tokens_before: int,
             retained_tail: Iterable[AgentMessage] = (),
             details: Any = None,
-            usage: Usage | None = None
+            usage: Usage | None = None,
+            first_kept_entry_id: str | None = None
     ) -> str:
+        """``first_kept_entry_id`` 指向保留尾部的第一条（与 TS 版 pi 一致，文件更小）；
+        拿不到条目 id 时退回到把尾部整份写进 ``retained_tail``。"""
         return self._append(
             CompactionEntry(
                 id=new_entry_id(),
                 summary=summary,
                 tokens_before=tokens_before,
                 retained_tail=list(retained_tail),
+                first_kept_entry_id=first_kept_entry_id,
                 details=details,
                 usage=usage
             )
@@ -302,8 +306,10 @@ class SessionManager:
             target._append(clone)
         return target
 
-    def build_context_entries(self) -> List[SessionEntry]:
-        """当前活跃分支条目，已执行压缩处理"""
+    def _split_at_compaction(
+            self
+    ) -> tuple[CompactionEntry | None, List[SessionEntry], List[SessionEntry]]:
+        """(最近的压缩条目, 它保留的尾部条目, 它之后的条目)；没有压缩时为 (None, [], 整条分支)"""
         path = self.get_branch()
         last_compaction = None
         for i, e in enumerate(path):
@@ -311,20 +317,31 @@ class SessionManager:
                 last_compaction = i
 
         if last_compaction is None:
-            return path
+            return None, [], path
 
         compaction = path[last_compaction]
         assert isinstance(compaction, CompactionEntry)
         tail = path[last_compaction + 1:]
-        if compaction.retained_tail:
-            return [compaction, *tail]
-        if compaction.first_kept_entry_id:
+        kept: List[SessionEntry] = []
+        if not compaction.retained_tail and compaction.first_kept_entry_id:
             start = next(
-                (i for i, e in enumerate(path) if e.id == compaction.first_kept_entry_id), 0
+                (i for i, e in enumerate(path) if e.id == compaction.first_kept_entry_id),
+                last_compaction,
             )
-            return [compaction, *path[start: last_compaction], *tail]
+            # 保留区间里可能夹着更早的压缩条目，它已被本次压缩取代
+            kept = [e for e in path[start:last_compaction] if not isinstance(e, CompactionEntry)]
+        return compaction, kept, tail
 
-        return [compaction, *tail]
+    def build_context_entries(self) -> List[SessionEntry]:
+        """当前活跃分支条目，已执行压缩处理"""
+        compaction, kept, tail = self._split_at_compaction()
+        if compaction is None:
+            return tail
+        return [compaction, *kept, *tail]
+
+    def latest_compaction(self) -> CompactionEntry | None:
+        """当前上下文所基于的压缩条目"""
+        return self._split_at_compaction()[0]
 
     def build_session_context(self) -> dict[str, Any]:
         """Messages + model/thinking settings for the LLM"""
@@ -336,22 +353,35 @@ class SessionManager:
             elif isinstance(e, ThinkingLevelChangeEntry):
                 thinking_level = e.thinking_level  # type: ignore[assignment]
 
+        compaction, kept, tail = self._split_at_compaction()
         messages: list[AgentMessage] = []
-        for e in self.build_context_entries():
+        entry_ids: list[str | None] = []
+        if compaction is not None:
+            structured = isinstance(compaction.details, dict) and compaction.details.get("state")
+            kept_messages = list(compaction.retained_tail) + [
+                e.message for e in kept if isinstance(e, MessageEntry) and e.message is not None
+            ]
+            messages.append(
+                CustomMessage(
+                    custom_type="compaction_summary",
+                    content=(
+                        compaction.summary if structured else
+                        "Summary of the earlier conversation, which has been compacted:\n\n"
+                        + compaction.summary
+                    ),
+                    display=True,
+                    # tailLength：保留尾部里的 assistant usage 是压缩前的，计量时不能当锚
+                    details={"tailLength": len(kept_messages)},
+                )
+            )
+            entry_ids.append(None)
+            messages.extend(compaction.retained_tail)
+            entry_ids.extend([None] * len(compaction.retained_tail))
+
+        for e in [*kept, *tail]:
+            before = len(messages)
             if isinstance(e, MessageEntry) and e.message is not None:
                 messages.append(e.message)
-            elif isinstance(e, CompactionEntry):
-                messages.append(
-                    CustomMessage(
-                        custom_type="compaction_summary",
-                        content=(
-                                "Summary of the earlier conversation, which has been compacted:\n\n"
-                                + e.summary
-                        ),
-                        display=True
-                    )
-                )
-                messages.extend(e.retained_tail)
             elif isinstance(e, BranchSummaryEntry):
                 messages.append(
                     CustomMessage(
@@ -368,8 +398,11 @@ class SessionManager:
                         details=e.details
                     )
                 )
+            entry_ids.extend([e.id] * (len(messages) - before))
 
-        return {"messages": messages, "thinking_level": thinking_level, "model": model_ref}
+        # entry_ids 与 messages 一一对应（合成的摘要消息为 None），压缩时用来写 firstKeptEntryId
+        return {"messages": messages, "thinking_level": thinking_level, "model": model_ref,
+                "entry_ids": entry_ids}
 
     def total_usage(self) -> Usage:
         total = Usage()

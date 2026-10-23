@@ -17,7 +17,10 @@ DEFAULT_SETTINGS : dict[str, Any] = {
     "tools": None,
     "excludeTools": [],
     "toolExecution": "parallel",
-    "compaction": {"enabled": True, "threshold": 0.85, "keepLastTurns": 4},
+    # threshold：上下文达到"可用窗口（窗口 - reserveTokens）"的这个比例时压缩
+    # thinking：压缩调用的思考档位，"inherit" 表示沿用会话当前档位
+    "compaction": {"enabled": True, "threshold": 0.85, "reserveTokens": 16384,
+                   "keepRecentTokens": 20000, "maxSummaryTokens": 8000, "thinking": "off"},
     "retry": {"enabled": True, "maxRetries": 3},
     "extensions": [],
     "disabledExtensions": [],

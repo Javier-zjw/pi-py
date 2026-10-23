@@ -10,7 +10,15 @@ from .agent_session import (
     create_agent_session,
     create_agent_session_services,
 )
-from .compaction import CompactionResult, compact, estimate_tokens, should_compact
+from .compaction import (
+    CompactionBudget,
+    CompactionEndEvent,
+    CompactionOutcome,
+    CompactionProgressEvent,
+    CompactionStartEvent,
+    estimate_tokens,
+    run_compaction,
+)
 from .extensions import (
     Command,
     EventBus,
@@ -43,7 +51,11 @@ __all__ = [
     "BASE_SYSTEM_PROMPT",
     "CONFIG_DIR_NAME",
     "Command",
-    "CompactionResult",
+    "CompactionBudget",
+    "CompactionEndEvent",
+    "CompactionOutcome",
+    "CompactionProgressEvent",
+    "CompactionStartEvent",
     "ContextFile",
     "DefaultResourceLoader",
     "EventBus",
@@ -56,7 +68,6 @@ __all__ = [
     "SettingsManager",
     "Skill",
     "build_system_prompt",
-    "compact",
     "create_agent_session",
     "create_agent_session_services",
     "create_all_tools",
@@ -75,7 +86,7 @@ __all__ = [
     "read_text_lenient",
     "sanitize",
     "sanitize_deep",
-    "should_compact",
+    "run_compaction",
     "stream_decoder",
     "skills_block",
 ]

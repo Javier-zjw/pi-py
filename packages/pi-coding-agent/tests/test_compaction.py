@@ -389,7 +389,9 @@ def test_trim() -> None:
     check("裁剪: 已完成合并后保留最近 8 条", len(trimmed["llm"]["progress"]["done"]) == 9)
     check("裁剪: 约束和决策不动", trimmed["llm"]["constraints"] == state["llm"]["constraints"]
           and trimmed["llm"]["decisions"] == state["llm"]["decisions"])
-    check("裁剪: 最近 3 条原话完整", all(len(u["text"]) == 1500 for u in trimmed["userMessages"][-3:]))
+    check("裁剪: 最近一条原话完整", len(trimmed["userMessages"][-1]["text"]) == 1500)
+    check("裁剪: 其余原话截短但保留首尾",
+          all("省略" in u["text"] and len(u["text"]) < 600 for u in trimmed["userMessages"][:-1]))
     check("裁剪: 不改动入参", len(state["llm"]["progress"]["done"]) == 40)
     same, steps = trim_to_budget(state, budget_tokens=10**9)
     check("裁剪: 预算内不动", steps == [] and same == state)

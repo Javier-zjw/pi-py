@@ -27,7 +27,19 @@ sys.path.insert(0, str(HERE.parents[2] / "pi-ai"))
 from fakes import BIG_MODEL, FAKE_MODEL, Sandbox, fake_models  # noqa: E402
 
 from pi_agent import AgentToolResult, CustomMessage, ToolContext  # noqa: E402
-from pi_ai import AssistantMessage, TextContent, ThinkingContent, ToolCall, Usage  # noqa: E402
+from pi_ai import (  # noqa: E402
+    AssistantMessage,
+    DoneEvent,
+    ErrorEvent,
+    Model,
+    ModelCost,
+    StartEvent,
+    TextContent,
+    TextDeltaEvent,
+    ThinkingContent,
+    ToolCall,
+    Usage,
+)
 
 from pi_coding_agent import ModelRuntime, SessionManager, define_tool  # noqa: E402
 from pi_coding_agent.agent_session import (  # noqa: E402
@@ -389,62 +401,285 @@ def test_diagnostics_surface() -> None:
 # --------------------------------------------------------------------------- #
 
 
+SUMMARY_JSON = """```json
+{"task": {"goal": "回答一系列问题", "status": "等待下一个问题"},
+ "constraints": [{"id": "c1", "text": "回答要简短"}],
+ "progress": {"done": [{"id": "p1", "text": "回答了前几个问题"}]},
+ "nextSteps": ["继续回答"]}
+```"""
+
+MID_MODEL = Model(id="fake-mid", provider="fake", api="anthropic-messages", name="Fake Mid",
+                  cost=ModelCost(), context_window=16000, max_tokens=256)
+
+
+def compaction_session(cwd: Path, script: list[list], **kw) -> tuple[AgentSession, object]:
+    """可用预算 15000、触发线 12750、保留尾部 300 tokens 的会话。"""
+    session, provider = make_session(cwd, script, model=MID_MODEL, **kw)
+    session.settings.set("compaction.reserveTokens", 1000)
+    session.settings.set("compaction.keepRecentTokens", 300)
+    return session, provider
+
+
+def record(session: AgentSession) -> list:
+    events: list = []
+    session.subscribe(events.append)
+    return events
+
+
+def use_estimates(session: AgentSession) -> None:
+    """假 provider 报的 usage 只有 15 tokens，会被当成锚；清掉后改用估算。"""
+    for m in session.messages:
+        if isinstance(m, AssistantMessage):
+            m.usage = Usage()
+
+
+def file_manager(cwd: Path) -> SessionManager:
+    manager = SessionManager(cwd=str(cwd), session_file=cwd / "s.jsonl")
+    manager._write_header()
+    return manager
+
+
 async def case_manual_compact() -> None:
     with Sandbox() as cwd:
-        manager = SessionManager(cwd=str(cwd), session_file=cwd / "s.jsonl")
-        manager._write_header()
-        session, _ = make_session(
-            cwd, [[TextContent(text="回答一")], [TextContent(text="摘要内容")]],
+        manager = file_manager(cwd)
+        long_answer = "。详细说明" * 300
+        session, provider = compaction_session(
+            cwd, [[TextContent(text="回答一" + long_answer)], [TextContent(text="回答二" + long_answer)],
+                  [TextContent(text="回答三")], [TextContent(text=SUMMARY_JSON)]],
             session_manager=manager,
         )
-        await session.prompt("问题一")
-        before = len(session.messages)
+        for i in ("一", "二", "三"):
+            await session.prompt(f"问题{i}：" + "x" * 400)
+        use_estimates(session)
+        events = record(session)
 
-        result = await session.compact()
+        result = await session.compact("重点保留约束")
         check("手动压缩: 返回结果", result is not None)
-        check("手动压缩: 上下文变短", len(session.messages) < before + 2,
-              f"{before} → {len(session.messages)}")
-        check("手动压缩: 第一条是摘要",
-              isinstance(session.messages[0], CustomMessage), str(type(session.messages[0])))
-        kinds = [e.type for e in manager.get_entries()]
-        check("手动压缩: 写入 compaction 条目", "compaction" in kinds, str(kinds))
-        check("手动压缩: 摘要不重复落盘",
-              kinds.count("custom_message") == 0, str(kinds))
+        first = session.messages[0]
+        check("手动压缩: 第一条是结构化状态",
+              isinstance(first, CustomMessage) and first.text().startswith("<compacted_state"),
+              str(first)[:80])
+        check("手动压缩: 状态里有模型字段", "回答要简短" in first.text())
+        check("手动压缩: 状态里有用户原话", "问题一" in first.text())
+        check("手动压缩: 保留了最近的原文", session.messages[-1].text() == "回答三")
+
+        types = [e.type for e in events]
+        check("手动压缩: 事件 start → progress → end",
+              types[0] == "compaction_start" and types[-1] == "compaction_end"
+              and "compaction_progress" in types, str(types))
+        end = events[-1]
+        check("手动压缩: 结束事件带结果", end.ok and end.tokens_after < end.tokens_before
+              and end.state["seq"] == 1, f"{end.tokens_before} → {end.tokens_after}")
+        check("手动压缩: 额外要求进了指令",
+              "重点保留约束" in provider.calls[-1]["context"].messages[-1].text())
+        check("手动压缩: 禁止工具调用", provider.calls[-1]["options"].tool_choice is None
+              or provider.calls[-1]["options"].tool_choice == "none")
+
+        entries = manager.get_entries()
+        compaction = [e for e in entries if e.type == "compaction"]
+        check("手动压缩: 写入一条 compaction", len(compaction) == 1)
+        c = compaction[0]
+        check("手动压缩: 写 firstKeptEntryId 而不是整份尾部",
+              c.first_kept_entry_id is not None and c.retained_tail == [], str(c.first_kept_entry_id))
+        check("手动压缩: details 存结构化状态", c.details["state"]["llm"]["task"]["goal"] == "回答一系列问题")
+        check("手动压缩: details 带上游同名字段", "readFiles" in c.details and "modifiedFiles" in c.details)
+        check("手动压缩: 摘要不重复落盘", [e.type for e in entries].count("custom_message") == 0)
+
+        # 恢复：上下文一致、状态可继续增量、旧 usage 不当锚
+        reopened = AgentSession(session.services, SessionManager.open(cwd / "s.jsonl"),
+                                model=MID_MODEL, tools=[])
+        check("恢复: 消息条数一致", len(reopened.messages) == len(session.messages),
+              f"{len(reopened.messages)} vs {len(session.messages)}")
+        check("恢复: 状态消息内容一致", reopened.messages[0].text() == first.text())
+        check("恢复: 尾部原文一致",
+              [m.text() for m in reopened.messages[1:]] == [m.text() for m in session.messages[1:]])
+        check("恢复: 结构化状态可用于下次增量", (reopened._compaction_state or {}).get("seq") == 1)
+        check("恢复: 保留尾部的旧 usage 不当锚",
+              reopened.messages[0].details.get("tailLength") == len(reopened.messages) - 1)
 
 
-async def case_auto_compact() -> None:
-    """上下文逼近窗口时，transform_context 钩子应自动触发压缩。"""
+async def case_compaction_no_gain() -> None:
+    """内容太少、压缩后反而更大时不替换历史。"""
     with Sandbox() as cwd:
-        session, provider = make_session(
-            cwd,
-            [
-                [TextContent(text="快满了")],       # 第一轮，回来的 usage 很大
-                [TextContent(text="这是摘要")],     # 压缩调用
-                [TextContent(text="压缩后的回答")],  # 第二轮
-            ],
-            usage=Usage(input=950, output=10),      # 窗口 1000，阈值 0.85
-        )
-        await session.prompt("第一个问题")
-        check("自动压缩: 第一轮正常", session.messages[-1].text() == "快满了")
+        session, _ = compaction_session(
+            cwd, [[TextContent(text="好")], [TextContent(text="行")], [TextContent(text=SUMMARY_JSON)]])
+        await session.prompt("你好")
+        await session.prompt("在吗")
+        before = [m.text() for m in session.messages]
+        events = record(session)
+        result = await session.compact()
+        check("无收益: 不替换历史", result is None and [m.text() for m in session.messages] == before)
+        check("无收益: 说明原因", "没有变小" in (events[-1].error or ""), str(events[-1:]))
 
-        await session.prompt("第二个问题")
-        texts = [m.text() for m in session.messages]
-        check("自动压缩: 触发了压缩",
-              any(isinstance(m, CustomMessage) for m in session.messages), str(texts))
-        check("自动压缩: 老消息被裁掉", "第一个问题" not in " ".join(texts), str(texts))
-        check("自动压缩: 第二轮仍然回答了", "压缩后的回答" in " ".join(texts), str(texts))
+
+async def case_double_compaction_resume() -> None:
+    """连续两次压缩，第二次的保留区间会跨过第一次的压缩条目；恢复后只能有一份状态。"""
+    with Sandbox() as cwd:
+        manager = file_manager(cwd)
+        session, _ = compaction_session(
+            cwd, [[TextContent(text=f"回答{i}" + "。展开说明" * 200)] for i in range(4)]
+            + [[TextContent(text=SUMMARY_JSON)], [TextContent(text=SUMMARY_JSON)]],
+            session_manager=manager,
+        )
+        for i in range(4):
+            await session.prompt(f"问题{i}：" + "y" * 400)
+        use_estimates(session)
+        session.settings.set("compaction.keepRecentTokens", 2500)   # 第一次多留几轮
+        first = await session.compact()
+        check("二次压缩: 第一次保留了多条", first is not None and len(first.retained) >= 3,
+              str(len(first.retained) if first else None))
+        session.settings.set("compaction.keepRecentTokens", 300)    # 第二次切进上次的保留区
+        second = await session.compact()
+        check("二次压缩: 成功且 seq=2", second is not None and second.state["seq"] == 2)
+        reopened = AgentSession(session.services, SessionManager.open(cwd / "s.jsonl"),
+                                model=MID_MODEL, tools=[])
+        states = [m for m in reopened.messages
+                  if isinstance(m, CustomMessage) and m.custom_type == "compaction_summary"]
+        check("二次压缩: 恢复后只有一份状态", len(states) == 1, str(len(states)))
+        context_entries = SessionManager.open(cwd / "s.jsonl").build_context_entries()
+        check("二次压缩: 上下文条目里只有最新的压缩",
+              [e.type for e in context_entries].count("compaction") == 1,
+              str([e.type for e in context_entries]))
+        check("二次压缩: 恢复后内容一致",
+              [m.text() for m in reopened.messages] == [m.text() for m in session.messages])
+
+
+async def case_compact_before_prompt() -> None:
+    """上下文到线时，新请求进来先压缩、后执行；新请求本身不进压缩。"""
+    with Sandbox() as cwd:
+        session, provider = compaction_session(
+            cwd, [[TextContent(text="回答一")], [TextContent(text="回答二")],
+                  [TextContent(text=SUMMARY_JSON)], [TextContent(text="压缩后的回答")]],
+        )
+        await session.prompt("第一个问题 " + "a" * 1200)
+        await session.prompt("第二个问题 " + "b" * 1200)
+        session.messages[-1].usage = Usage(input=13500, output=10)   # 逼近窗口
+        events = record(session)
+
+        await session.prompt("第三个问题")
+        types = [e.type for e in events]
+        check("先压后跑: 触发了压缩", "compaction_end" in types and events[types.index(
+            "compaction_end")].ok, str(types))
+        check("先压后跑: 压缩在新请求之前",
+              types.index("compaction_end") < types.index("agent_start"), str(types))
+        summarize_call = provider.calls[2]["context"].messages
+        check("先压后跑: 新请求不进压缩",
+              "第三个问题" not in " ".join(m.text() for m in summarize_call))
+        answer_call = provider.calls[3]["context"].messages
+        check("先压后跑: 正文请求以状态开头", answer_call[0].text().startswith("<compacted_state"))
+        check("先压后跑: 正文请求带上新问题", answer_call[-1].text() == "第三个问题")
+        check("先压后跑: 回答正常", session.messages[-1].text() == "压缩后的回答")
+
+
+async def case_compact_mid_loop() -> None:
+    """一轮内工具链把上下文撑满：在下一次调用模型之前压缩，这一轮继续跑完。"""
+    with Sandbox() as cwd:
+        (cwd / "big.txt").write_text("内容" * 50, "utf-8")
+        session, provider = compaction_session(
+            cwd,
+            [[TextContent(text="先读文件"), ToolCall(id="t1", name="read", arguments={"path": "big.txt"})],
+             [TextContent(text=SUMMARY_JSON)],
+             [TextContent(text="读完了")]],
+            tools=["read"], usage=Usage(input=13500, output=10),
+        )
+        events = record(session)
+        await session.prompt("请读 big.txt " + "c" * 1200)
+        types = [e.type for e in events]
+        check("循环内压缩: 发生在工具执行之后",
+              "compaction_start" in types
+              and types.index("tool_execution_end") < types.index("compaction_start"), str(types))
+        check("循环内压缩: 这一轮继续跑完", session.messages[-1].text() == "读完了")
+        check("循环内压缩: 状态在最前", session.messages[0].text().startswith("<compacted_state"))
+        check("循环内压缩: 工具结果被保留",
+              any(getattr(m, "role", "") == "toolResult" for m in session.messages))
+        check("循环内压缩: 一轮只压一次", types.count("compaction_start") == 1, str(types))
+
+
+async def case_compaction_failure_keeps_history() -> None:
+    with Sandbox() as cwd:
+        manager = file_manager(cwd)
+        session, _ = compaction_session(
+            cwd, [[TextContent(text="回答一")], [TextContent(text="回答二")]],
+            session_manager=manager,
+        )
+        await session.prompt("问题一 " + "d" * 1200)
+        await session.prompt("问题二 " + "e" * 1200)
+        before = [m.text() for m in session.messages]
+
+        def failing(model, context, options=None):
+            async def gen():
+                message = AssistantMessage(stop_reason="error", error_message="429 rate limited")
+                yield StartEvent(partial=message)
+                yield ErrorEvent(error="429", message=message)
+            return gen()
+
+        session.model_runtime.models.stream_simple = failing
+        events = record(session)
+        result = await session.compact()
+        check("失败: 返回 None", result is None)
+        check("失败: 历史原样保留", [m.text() for m in session.messages] == before)
+        check("失败: 不写 compaction", all(e.type != "compaction" for e in manager.get_entries()))
+        end = events[-1]
+        check("失败: 结束事件带错误", end.type == "compaction_end" and "429" in (end.error or ""),
+              str(end))
+
+
+async def case_compaction_cancel() -> None:
+    with Sandbox() as cwd:
+        session, _ = compaction_session(
+            cwd, [[TextContent(text="回答一")], [TextContent(text="回答二")]])
+        await session.prompt("问题一 " + "f" * 1200)
+        await session.prompt("问题二 " + "g" * 1200)
+        before = [m.text() for m in session.messages]
+
+        def slow(model, context, options=None):
+            async def gen():
+                message = AssistantMessage()
+                yield StartEvent(partial=message)
+                for _ in range(50):
+                    await asyncio.sleep(0.005)
+                    yield TextDeltaEvent(content_index=0, delta="…", partial=message)
+                message.content.append(TextContent(text=SUMMARY_JSON))
+                message.stop_reason = "stop"
+                yield DoneEvent(reason="stop", message=message)
+            return gen()
+
+        session.model_runtime.models.stream_simple = slow
+        events: list = []
+
+        def on_event(e) -> None:
+            events.append(e)
+            if e.type == "compaction_progress":
+                session.abort()
+
+        session.subscribe(on_event)
+        result = await session.compact()
+        check("取消: 返回 None", result is None)
+        check("取消: 结束事件标记取消", events[-1].type == "compaction_end" and events[-1].cancelled)
+        check("取消: 历史原样保留", [m.text() for m in session.messages] == before)
+        check("取消: 压缩状态复位", not session.is_compacting)
+
+
+async def case_compact_guard_while_streaming() -> None:
+    with Sandbox() as cwd:
+        session, _ = compaction_session(cwd, [[TextContent(text="回答")]])
+        await session.prompt("问题 " + "h" * 1200)
+        events = record(session)
+        session.agent.state.is_streaming = True
+        try:
+            result = await session.compact()
+        finally:
+            session.agent.state.is_streaming = False
+        check("运行中: 不允许从外部压缩", result is None and events[-1].error is not None,
+              str(events[-1:]))
 
 
 async def case_compaction_disabled() -> None:
     with Sandbox() as cwd:
-        models, _ = fake_models([[TextContent(text="一")], [TextContent(text="二")]],
-                                usage=Usage(input=950, output=10))
-        runtime = ModelRuntime(models, cwd / "agent")
-        services = create_agent_session_services(
-            cwd=cwd, agent_dir=cwd / "agent", model_runtime=runtime
-        )
-        services.settings.set("compaction.enabled", False)
-        session = AgentSession(services, SessionManager.in_memory(cwd), model=FAKE_MODEL, tools=[])
+        session, _ = compaction_session(
+            cwd, [[TextContent(text="一")], [TextContent(text="二")]],
+            usage=Usage(input=13500, output=10))
+        session.settings.set("compaction.enabled", False)
         await session.prompt("一")
         await session.prompt("二")
         check("自动压缩: 设置里关掉后不触发",
@@ -687,8 +922,32 @@ def test_manual_compact() -> None:
     asyncio.run(case_manual_compact())
 
 
-def test_auto_compact() -> None:
-    asyncio.run(case_auto_compact())
+def test_compaction_no_gain() -> None:
+    asyncio.run(case_compaction_no_gain())
+
+
+def test_double_compaction_resume() -> None:
+    asyncio.run(case_double_compaction_resume())
+
+
+def test_compact_before_prompt() -> None:
+    asyncio.run(case_compact_before_prompt())
+
+
+def test_compact_mid_loop() -> None:
+    asyncio.run(case_compact_mid_loop())
+
+
+def test_compaction_failure_keeps_history() -> None:
+    asyncio.run(case_compaction_failure_keeps_history())
+
+
+def test_compaction_cancel() -> None:
+    asyncio.run(case_compaction_cancel())
+
+
+def test_compact_guard_while_streaming() -> None:
+    asyncio.run(case_compact_guard_while_streaming())
 
 
 def test_compaction_disabled() -> None:
@@ -733,7 +992,13 @@ async def main() -> int:
     test_diagnostics_surface()
     print("压缩接入")
     await case_manual_compact()
-    await case_auto_compact()
+    await case_compaction_no_gain()
+    await case_double_compaction_resume()
+    await case_compact_before_prompt()
+    await case_compact_mid_loop()
+    await case_compaction_failure_keeps_history()
+    await case_compaction_cancel()
+    await case_compact_guard_while_streaming()
     await case_compaction_disabled()
     print("模板与队列")
     await case_prompt_template()

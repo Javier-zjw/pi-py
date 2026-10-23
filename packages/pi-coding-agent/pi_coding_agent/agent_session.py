@@ -6,6 +6,7 @@ AgentSession — 组合聚合层。
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
@@ -21,9 +22,22 @@ from pi_agent import (
     TurnEndEvent
 )
 
-from pi_ai import ImageContent, Model, ThinkingLevel, Usage
+from pi_ai import ImageContent, Model, ThinkingLevel, Tool, Usage
 
-from .compaction import CompactionResult, compact, should_compact
+from .compaction import (
+    CompactionBudget,
+    CompactionCancelled,
+    CompactionEndEvent,
+    CompactionFailed,
+    CompactionOutcome,
+    CompactionProgress,
+    CompactionProgressEvent,
+    CompactionRequest,
+    CompactionStartEvent,
+    context_tokens,
+    estimate_text_tokens,
+    run_compaction,
+)
 from .model_runtime import ModelRuntime
 from .resources import DefaultResourceLoader, ResourceLoader
 from .session.manager import SessionManager
@@ -111,9 +125,24 @@ class AgentSession:
             transform_context=self._transform_context,
         )
 
-        self._listeners: list[Callable[[AgentEvent], None]] = []
+        self._listeners: list[Callable[[Any], None]] = []
         self._persisted: set[int] = set()
+        # id(message) → 会话条目 id，压缩时用来写 firstKeptEntryId
+        self._entry_ids: dict[int, str] = {
+            id(m): entry_id
+            for m, entry_id in zip(state.messages, restored.get("entry_ids") or [])
+            if entry_id
+        }
+        latest = self.session.latest_compaction()
+        # 上一次压缩的结构化状态，下一次压缩在它的基础上增量合并
+        self._compaction_state: dict[str, Any] | None = (
+            latest.details.get("state") if latest and isinstance(latest.details, dict) else None
+        )
         self._compacting = False
+        self._in_loop = False
+        self._compaction_cancel: asyncio.Event | None = None
+        self._compaction_attempts = 0
+        self._compaction_blocked = False
         # 当前工作模式。核心不解释它的含义，具体行为由扩展的 Mode.apply 决定
         self.mode: str = "chat"
         self._base_system_prompt = state.system_prompt or ""
@@ -128,7 +157,10 @@ class AgentSession:
         elif isinstance(event, TurnEndEvent):
             for result in event.tool_results:
                 self._persist(result)
+        self._emit(event)
 
+    def _emit(self, event: Any) -> None:
+        """agent 事件和会话自己的事件（如压缩）走同一条订阅通道，按 event.type 区分"""
         self.resources.get_extension_api().dispatch(event)
         for listener in list(self._listeners):
             try:
@@ -141,13 +173,14 @@ class AgentSession:
             return
         self._persisted.add(id(message))
         if isinstance(message, CustomMessage):
-            self.session.append_custom_message_entry(
+            entry_id = self.session.append_custom_message_entry(
                 message.custom_type, message.content, message.display, message.details
             )
         else:
-            self.session.append_message(message)
+            entry_id = self.session.append_message(message)
+        self._entry_ids[id(message)] = entry_id
 
-    def subscribe(self, listener: Callable[[AgentEvent], None]) -> Callable[[], None]:
+    def subscribe(self, listener: Callable[[Any], None]) -> Callable[[], None]:
         self._listeners.append(listener)
 
         def unsubscribe() -> None:
@@ -157,50 +190,151 @@ class AgentSession:
         return unsubscribe
 
     async def _transform_context(self, messages: list[AgentMessage]) -> list[AgentMessage]:
-        """自动上下文压缩钩子，由Agent主循环在每次调用LLM之前触发"""
-        messages = await self.resources.get_extension_api().run_context_hook(messages)
-        if self._compacting or not self.settings.get("compaction.enabled", True):
-            return messages
-        model = self.agent.state.model
-        if model is None:
-            return messages
+        """每次调用 LLM 之前由 Agent 主循环触发：长工具链在一轮内长满时在这里压缩"""
+        self._in_loop = True
+        try:
+            if await self._maybe_compact():
+                messages = list(self.agent.state.messages)
+        finally:
+            self._in_loop = False
+        return await self.resources.get_extension_api().run_context_hook(messages)
 
-        threshold = float(self.settings.get("compaction.threshold", 0.85))
-        if not should_compact(messages, model, threshold):
-            return messages
-        await self.compact()
-        return list(self.agent.state.messages)
+    # -- 压缩 ---------------------------------------------------------- #
 
-    async def compact(self, custom_instructions: str | None = None) -> CompactionResult | None:
+    def compaction_budget(self) -> CompactionBudget | None:
         model = self.agent.state.model
         if model is None:
             return None
+        return CompactionBudget.from_settings(model, self.settings.get)
+
+    def _llm_tools(self) -> list[Tool]:
+        return [Tool(name=t.name, description=t.description, parameters=t.parameters)
+                for t in self.agent.state.tools]
+
+    def context_tokens(self) -> int:
+        """下一次请求的上下文大小（以服务商实报 usage 为锚）"""
+        return context_tokens(self.agent.state.messages, self.agent.state.system_prompt,
+                              self._llm_tools())
+
+    async def _maybe_compact(self, extra_text: str = "") -> bool:
+        """超过触发线就同步压缩。一次 prompt 内最多尝试两次，失败或取消后本轮不再尝试"""
+        if self._compacting or self._compaction_blocked:
+            return False
+        if not self.settings.get("compaction.enabled", True) or self._compaction_attempts >= 2:
+            return False
+        budget = self.compaction_budget()
+        if budget is None or not budget.context_window:
+            return False
+        if not budget.should_compact(self.context_tokens() + estimate_text_tokens(extra_text)):
+            return False
+        self._compaction_attempts += 1
+        return await self.compact(reason="threshold") is not None
+
+    async def compact(
+            self, custom_instructions: str | None = None, reason: str = "manual"
+    ) -> CompactionOutcome | None:
+        """同步压缩，全程发事件。任何失败都保持原历史不变并返回 None，不会打断这一轮"""
+        model = self.agent.state.model
+        budget = self.compaction_budget()
+        if model is None or budget is None or self._compacting:
+            return None
+
+        tokens_before = self.context_tokens()
+        if self.agent.is_streaming and not self._in_loop:
+            # 主循环正在改消息列表，此时替换会丢消息；只能在循环的安全点（transform_context）压缩
+            self._emit(CompactionEndEvent(reason=reason, tokens_before=tokens_before,
+                                          error="agent 正在运行，请等这一轮结束后再压缩"))
+            return None
+
+        thinking = self.settings.get("compaction.thinking", "off")
+        request = CompactionRequest(
+            messages=list(self.agent.state.messages),
+            model=model,
+            stream_fn=self.model_runtime.stream_fn,
+            budget=budget,
+            system_prompt=self.agent.state.system_prompt,
+            tools=self._llm_tools(),
+            previous_state=self._compaction_state,
+            cwd=self.cwd,
+            reason=reason,
+            custom_instructions=custom_instructions,
+            reasoning=self.agent.state.thinking_level if thinking == "inherit" else thinking,
+        )
+
+        def on_progress(p: CompactionProgress) -> None:
+            self._emit(CompactionProgressEvent(phase=p.phase, chunk=p.chunk, chunks=p.chunks,
+                                               delta=p.delta))
+
         self._compacting = True
+        self._compaction_cancel = asyncio.Event()
+        self._emit(CompactionStartEvent(reason=reason, tokens_before=tokens_before,
+                                        context_window=budget.context_window))
+        end = CompactionEndEvent(reason=reason, tokens_before=tokens_before)
+        outcome: CompactionOutcome | None = None
         try:
-            result = await compact(
-                list(self.agent.state.messages),
-                model,
-                self.model_runtime.models.complete_simple,
-                keep_last_turns=int(self.settings.get("compaction.keepLastTurns", 4)),
-                custom_instructions=custom_instructions
-            )
+            outcome = await run_compaction(request, on_progress, self._compaction_cancel)
+        except CompactionCancelled:
+            end.cancelled = True
+        except CompactionFailed as exc:
+            end.error = str(exc)
+        except Exception as exc:  # 压缩是附加能力，自身的 bug 不能让这一轮跑不起来
+            end.error = f"{type(exc).__name__}: {exc}"
         finally:
             self._compacting = False
+            self._compaction_cancel = None
 
+        if outcome is not None and outcome.tokens_after >= outcome.tokens_before:
+            # 没变小就不替换：原始历史信息更全
+            end.error = f"压缩后没有变小（{outcome.tokens_before} → {outcome.tokens_after}），保持原样"
+            outcome = None
+
+        if outcome is None:
+            end.skipped = not (end.cancelled or end.error)
+            self._compaction_blocked = True
+            self._emit(end)
+            return None
+
+        self._apply_compaction(outcome)
+        end.tokens_after = outcome.tokens_after
+        end.summary = outcome.summary
+        end.state = outcome.state
+        end.degraded = outcome.degraded
+        end.restored = list(outcome.restored)
+        self._emit(end)
+        return outcome
+
+    def _apply_compaction(self, outcome: CompactionOutcome) -> None:
+        """落盘 + 替换内存消息，两步紧挨着做，中间没有 await"""
+        retained = outcome.retained
+        first_kept = self._entry_ids.get(id(retained[0])) if retained else None
+        ledger = outcome.state.get("fileLedger") or {}
+        details = {
+            "version": 1,
+            "state": outcome.state,
+            # 与 TS 版 pi 同名的字段，保证互读
+            "readFiles": list(ledger.get("read") or []),
+            "modifiedFiles": [m["path"] for m in ledger.get("modified") or []],
+            "reason": outcome.state.get("meta", {}).get("reason"),
+            "tokensAfter": outcome.tokens_after,
+            "degraded": outcome.degraded,
+            "restored": outcome.restored,
+            "trimmed": outcome.trimmed,
+            "chunks": outcome.chunks,
+        }
         self.session.append_compaction(
-            summary=result.summary,
-            tokens_before=result.tokens_before,
-            retained_tail=result.retained_tail,
-            details=result.details,
-            usage=result.usage,
+            summary=outcome.summary,
+            tokens_before=outcome.tokens_before,
+            retained_tail=() if first_kept else retained,
+            details=details,
+            usage=outcome.usage,
+            first_kept_entry_id=first_kept,
         )
-        summary_message = CustomMessage(
-            custom_type="compaction_summary",
-            content="Summary of the earlier conversation, which has been compacted:\n\n" + result.summary
-        )
-        self._persisted.add(id(summary_message))
-        self.agent.state.messages = [summary_message, *result.retained_tail]
-        return result
+        state_message = outcome.state_message()
+        self._persisted.add(id(state_message))
+        self.agent.state.messages = [state_message, *retained]
+        self._compaction_state = outcome.state
+        live = {id(m) for m in self.agent.state.messages}
+        self._entry_ids = {k: v for k, v in self._entry_ids.items() if k in live}
 
     def expand_prompt_template(self, text: str) -> str:
         """``/deploy 附加参数`` —— 模板正文与传入参数结合使用。"""
@@ -248,6 +382,10 @@ class AgentSession:
         errors = await self.resources.get_extension_api().run_before_start(self)
         for note in errors:
             self.services.diagnostics.append(f"before_agent_start 失败：{note}")
+        # 先压缩、后执行：新请求本身不参与压缩，压缩完成后才追加
+        self._compaction_attempts = 0
+        self._compaction_blocked = False
+        await self._maybe_compact(extra_text=text)
         return await self.agent.prompt(text, images)
 
     async def run_command(self, name: str, rest: str = "") -> str | None:
@@ -269,7 +407,13 @@ class AgentSession:
         self.agent.follow_up(text)
 
     def abort(self) -> None:
+        if self._compaction_cancel is not None:
+            self._compaction_cancel.set()
         self.agent.abort()
+
+    @property
+    def is_compacting(self) -> bool:
+        return self._compacting
 
 
     def set_model(self, model: Model) -> None:

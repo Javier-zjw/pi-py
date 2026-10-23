@@ -66,6 +66,7 @@ def compaction_dto(event: Any) -> dict[str, Any]:
         "llm": state.get("llm"),
         "fileLedger": state.get("fileLedger"),
         "userMessages": len(state.get("userMessages") or []),
+        "rehydratedFiles": list((state.get("meta") or {}).get("rehydratedFiles") or []),
         "degraded": bool(getattr(event, "degraded", False)),
         "restored": list(getattr(event, "restored", None) or []),
         "error": getattr(event, "error", None),
@@ -206,6 +207,14 @@ class EventTranslator:
 
     def _on_compaction_end(self, event) -> list[dict]:
         return [{"type": "compaction_end", **compaction_dto(event)}]
+
+    def _on_context_pruned(self, event) -> list[dict]:
+        return [{
+            "type": "context_pruned",
+            "count": event.count,
+            "tokensBefore": event.tokens_before,
+            "tokensAfter": event.tokens_after,
+        }]
 
     def _on_agent_end(self, event) -> list[dict]:
         return [{"type": "done", "reason": event.reason, "elapsed": self.elapsed}]

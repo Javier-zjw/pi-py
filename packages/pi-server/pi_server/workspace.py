@@ -199,6 +199,7 @@ class HistoryTurn:
     tools: list[dict] = None
     usage: dict = None
     compaction: dict | None = None
+    notes: list[str] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         out = {
@@ -209,6 +210,7 @@ class HistoryTurn:
             "usage": self.usage or {},
             "phase": "done",
             "folded": True,
+            "notes": self.notes or [],
         }
         if self.compaction is not None:
             out["kind"] = "compaction"
@@ -257,6 +259,12 @@ def read_session_file(path: str | Path) -> dict[str, Any]:
                 )),
             ))
             current = None
+            continue
+        if entry.type == "custom" and entry.custom_type == "context_prune" and current is not None:
+            data = entry.data if isinstance(entry.data, dict) else {}
+            count = len(data.get("toolCallIds") or [])
+            current.notes = [*(current.notes or []),
+                             f"已清理 {count} 个旧工具输出（约省 {data.get('tokensSaved', 0)} tokens）"]
             continue
         if entry.type != "message" or entry.message is None:
             continue

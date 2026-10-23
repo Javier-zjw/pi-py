@@ -21,7 +21,12 @@ from pi_agent import (
 from pi_ai import TextDeltaEvent, ThinkingDeltaEvent
 
 from .agent_session import AgentSession, create_agent_session, create_agent_session_services
-from .compaction import CompactionEndEvent, CompactionProgressEvent, CompactionStartEvent
+from .compaction import (
+    CompactionEndEvent,
+    CompactionProgressEvent,
+    CompactionStartEvent,
+    ContextPrunedEvent,
+)
 from .session.manager import SessionManager
 from .text import sanitize
 
@@ -65,6 +70,12 @@ def make_printer(show_thinking: bool = False):
             sys.stdout.flush()
         elif isinstance(event, AgentEndEvent):
             sys.stdout.write("\n")
+            sys.stdout.flush()
+        elif isinstance(event, ContextPrunedEvent):
+            sys.stdout.write(
+                f"\n{DIM}pruned {event.count} old tool outputs: "
+                f"{event.tokens_before} → {event.tokens_after} tokens{RESET}\n"
+            )
             sys.stdout.flush()
         elif isinstance(event, CompactionStartEvent):
             sys.stdout.write(f"\n{YELLOW}⟳ compacting context ({event.tokens_before} tokens)…{RESET}")
@@ -112,6 +123,9 @@ def json_printer(event: AgentEvent) -> None:
         payload = {"type": event.type, "tool": event.tool_name, "isError": event.is_error}
     elif isinstance(event, CompactionProgressEvent):
         return
+    elif isinstance(event, ContextPrunedEvent):
+        payload = {"type": event.type, "count": event.count,
+                   "tokensBefore": event.tokens_before, "tokensAfter": event.tokens_after}
     elif isinstance(event, CompactionStartEvent):
         payload = {"type": event.type, "reason": event.reason, "tokensBefore": event.tokens_before}
     elif isinstance(event, CompactionEndEvent):

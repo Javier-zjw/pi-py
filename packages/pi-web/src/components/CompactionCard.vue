@@ -29,6 +29,9 @@ function k(n) {
       <span class="chip">{{ k(data.tokensBefore) }} → {{ k(data.tokensAfter) }} tokens</span>
       <span v-if="saved != null" class="chip">省 {{ saved }}%</span>
       <span v-if="data.degraded" class="chip warn">摘要降级</span>
+      <span v-if="data.rehydratedFiles?.length" class="chip" :title="data.rehydratedFiles.join('\n')">
+        补回 {{ data.rehydratedFiles.length }} 个文件
+      </span>
       <span v-if="data.restored?.length" class="chip" :title="data.restored.join(', ')">
         补回 {{ data.restored.length }} 条
       </span>

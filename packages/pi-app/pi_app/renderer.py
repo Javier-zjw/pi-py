@@ -316,6 +316,12 @@ class SessionRenderer:
         self._emit([*lines, ""])
         self._set_status("等待中...")
 
+    def _on_context_pruned(self, event) -> None:
+        self._emit([self.theme.muted(
+            f"  · 已清理 {event.count} 个旧工具输出（可重新读取）："
+            f"{_k(event.tokens_before)} → {_k(event.tokens_after)} tokens"
+        )])
+
     # -- 汇总 ---------------------------------------------------------- #
 
     def summary(self, model: str, turns: int, context_used: int, context_max: int) -> None:

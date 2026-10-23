@@ -102,11 +102,12 @@ watch(() => draft.model, async (spec) => {
 
 function newTurn(user) {
   return {
-    user, thinking: "", text: "", tools: [], injected: [], usage: {}, elapsed: 0,
+    user, thinking: "", text: "", tools: [], injected: [], notes: [], usage: {}, elapsed: 0,
     phase: "waiting", folded: false, thinkOpen: false, toolsOpen: false, error: "",
   };
 }
 const current = () => turns.value[turns.value.length - 1];
+const kTokens = (n) => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : `${n ?? "?"}`);
 
 function scrollDown() {
   nextTick(() => {
@@ -169,18 +170,30 @@ function handle(frame) {
     case "compaction_end":
       compaction.value = null;
       if (frame.ok) {
-        // 压缩卡片插在这一轮的用户消息之前：压缩先于这一轮发生
+        // 卡片插在进行中的这一轮之前，不能 push 到末尾：handle() 总把帧写进最后一个 turn，
+        // 循环内压缩时后续正文会流进卡片里
         const card = { ...newTurn(""), kind: "compaction", compaction: frame, phase: "done" };
-        const pending = turn && turn.phase === "waiting" && !turn.text && !turn.tools.length;
-        if (pending) turns.value.splice(turns.value.length - 1, 0, card);
+        const running = turn && turn.phase !== "done";
+        if (running) turns.value.splice(turns.value.length - 1, 0, card);
         else turns.value.push(card);
-        contextBase.value = turns.value.length - (pending ? 1 : 0);
+        contextBase.value = turns.value.length - (running ? 1 : 0);
         contextAfterCompaction.value = frame.tokensAfter || 0;
       } else if (frame.error) {
         notices.value.push(`压缩未执行：${frame.error}`);
         error.value = `压缩未执行：${frame.error}`;
       } else if (frame.cancelled) {
         error.value = "已取消压缩，上下文保持原样";
+      }
+      break;
+    case "context_pruned":
+      // L1 清理不调模型、瞬间完成：记在当轮里，不打断，不插卡片
+      if (turn) {
+        turn.notes.push(`已清理 ${frame.count} 个旧工具输出（可重新读取）：`
+          + `${kTokens(frame.tokensBefore)} → ${kTokens(frame.tokensAfter)} tokens`);
+      }
+      if (turn && turn.phase !== "done" && !turn.usage.input) {
+        contextBase.value = turns.value.length - 1;
+        contextAfterCompaction.value = frame.tokensAfter || 0;
       }
       break;
     case "mode":

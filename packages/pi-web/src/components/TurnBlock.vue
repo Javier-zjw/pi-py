@@ -80,6 +80,8 @@ function render(src) {
       <div v-for="(msg, i) in turn.injected" :key="i" class="msg-user inject">{{ msg }}</div>
     </div>
 
+    <div v-for="(note, i) in turn.notes || []" :key="'n' + i" class="note">🧹 {{ note }}</div>
+
     <div v-if="turn.text" class="msg-text" v-html="render(turn.text)"></div>
     <span v-if="turn.phase === 'writing'" class="caret" />
 
@@ -127,6 +129,7 @@ function render(src) {
   animation: rise 0.22s ease both;
 }
 .tools { display: flex; flex-direction: column; gap: 5px; margin-bottom: 12px; }
+.note { font-size: 12px; color: var(--muted); margin: 0 0 10px; }
 .msg-text { font-size: 15.5px; line-height: 1.82; word-break: break-word; }
 .msg-text :deep(p) { margin: 0 0 0.85em; }
 .msg-text :deep(p:last-child) { margin-bottom: 0; }

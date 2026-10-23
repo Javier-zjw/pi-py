@@ -642,6 +642,9 @@ createApp({
           // 免构建页面只给文字状态；完整的横幅和压缩卡片在 pi-web 里
           if (turn) turn.injected.push(`⟳ 正在压缩上下文（压缩前 ${frame.tokensBefore} tokens）…`);
           break;
+        case 'context_pruned':
+          if (turn) turn.injected.push(`已清理 ${frame.count} 个旧工具输出：${frame.tokensBefore} → ${frame.tokensAfter} tokens`);
+          break;
         case 'compaction_end':
           if (!turn) break;
           if (frame.ok) turn.injected.push(`✓ 上下文已压缩：${frame.tokensBefore} → ${frame.tokensAfter} tokens`);

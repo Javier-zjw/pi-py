@@ -7,6 +7,7 @@ AgentSession — 组合聚合层。
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
@@ -21,7 +22,15 @@ from pi_agent import (
     MessageEndEvent,
     TurnEndEvent,
 )
-from pi_ai import ImageContent, Model, ThinkingLevel, Tool, Usage
+from pi_ai import (
+    AssistantMessage,
+    ImageContent,
+    Model,
+    ThinkingLevel,
+    Tool,
+    Usage,
+    is_context_overflow,
+)
 
 from .compaction import (
     CompactionBudget,
@@ -128,6 +137,7 @@ class AgentSession:
             initial_state=state,
             tool_execution=self.settings.get("toolExecution", "parallel"),
             transform_context=self._transform_context,
+            on_stream_error=self._on_stream_error,
         )
 
         self._listeners: list[Callable[[Any], None]] = []
@@ -155,6 +165,7 @@ class AgentSession:
         self._compaction_cancel: asyncio.Event | None = None
         self._compaction_attempts = 0
         self._compaction_blocked = False
+        self._overflow_recovered = False
         # 当前工作模式。核心不解释它的含义，具体行为由扩展的 Mode.apply 决定
         self.mode: str = "chat"
         self._base_system_prompt = state.system_prompt or ""
@@ -236,6 +247,27 @@ class AgentSession:
             self._in_loop = False
         return await self.resources.get_extension_api().run_context_hook(messages)
 
+    async def _on_stream_error(self, message: AssistantMessage) -> bool:
+        """服务商报上下文超长（说明估算偏小，或单个工具输出特别大）：
+        激进清理 + 摘要压缩，然后让主循环重试本轮。每次 prompt 只救一次，再超就照常报错"""
+        if self._overflow_recovered or not is_context_overflow(message):
+            return False
+        if self._compacting or not self.settings.get("compaction.enabled", True):
+            return False
+        budget = self.compaction_budget()
+        if budget is None:
+            return False
+        self._overflow_recovered = True
+        self._in_loop = True
+        try:
+            # L1 全清：受保护区间缩到保留尾部那么大，目标 0
+            pruned = self.prune(budget, target_tokens=0, protect_tokens=budget.keep_recent)
+            outcome = await self.compact(reason="overflow",
+                                         keep_recent_tokens=max(1, budget.keep_recent // 2))
+        finally:
+            self._in_loop = False
+        return outcome is not None or pruned
+
     # -- 压缩 ---------------------------------------------------------- #
 
     def compaction_budget(self) -> CompactionBudget | None:
@@ -272,15 +304,25 @@ class AgentSession:
         self._compaction_attempts += 1
         return await self.compact(reason="threshold") is not None or changed
 
-    def prune(self, budget: CompactionBudget | None = None, extra_tokens: int = 0) -> bool:
+    def prune(
+            self,
+            budget: CompactionBudget | None = None,
+            extra_tokens: int = 0,
+            target_tokens: int | None = None,
+            protect_tokens: int | None = None,
+    ) -> bool:
         """L1：把受保护区间之外的旧工具输出换成占位，清到目标线以下。同步、不调模型。
         只能在安全点调用（prompt 开始前 / transform_context 里），否则会和主循环抢消息列表"""
         budget = budget or self.compaction_budget()
         if budget is None:
             return False
         before = self.context_tokens()
-        plan = plan_prune(self.agent.state.messages, before + extra_tokens, budget.prune_target,
-                          budget.protect, budget.prune_min_tokens)
+        plan = plan_prune(
+            self.agent.state.messages, before + extra_tokens,
+            budget.prune_target if target_tokens is None else target_tokens,
+            budget.protect if protect_tokens is None else protect_tokens,
+            budget.prune_min_tokens,
+        )
         if not plan.tool_call_ids:
             return False
         messages, count = apply_prune(self.agent.state.messages, plan.tool_call_ids)
@@ -296,13 +338,18 @@ class AgentSession:
         return True
 
     async def compact(
-            self, custom_instructions: str | None = None, reason: str = "manual"
+            self,
+            custom_instructions: str | None = None,
+            reason: str = "manual",
+            keep_recent_tokens: int | None = None,
     ) -> CompactionOutcome | None:
         """同步压缩，全程发事件。任何失败都保持原历史不变并返回 None，不会打断这一轮"""
         model = self.agent.state.model
         budget = self.compaction_budget()
         if model is None or budget is None or self._compacting:
             return None
+        if keep_recent_tokens is not None:
+            budget = dataclasses.replace(budget, keep_recent_tokens=keep_recent_tokens)
 
         tokens_before = self.context_tokens()
         if self.agent.is_streaming and not self._in_loop:
@@ -470,6 +517,7 @@ class AgentSession:
         # 先压缩、后执行：新请求本身不参与压缩，压缩完成后才追加
         self._compaction_attempts = 0
         self._compaction_blocked = False
+        self._overflow_recovered = False
         await self._maybe_compact(extra_text=text)
         return await self.agent.prompt(text, images)
 

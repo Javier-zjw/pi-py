@@ -637,6 +637,106 @@ async def case_rehydrate_hook_failure() -> None:
               any("扩展炸了" in d for d in session.services.diagnostics), str(session.services.diagnostics))
 
 
+def overflow_model(limit: int, error: str = "HTTP 400: prompt is too long: 9000 tokens > 8000 maximum"):
+    """上下文估算超过 limit 就报 error；收到压缩指令就回摘要；否则正常回答"""
+    from pi_coding_agent.compaction import estimate_tokens
+
+    calls: list[str] = []
+
+    def stream_fn(model, context, options=None):
+        last = context.messages[-1].text() if context.messages else ""
+        if "<compaction_request>" in last:
+            kind, blocks = "summary", [TextContent(text=SUMMARY_JSON)]
+        elif estimate_tokens(context.messages) > limit:
+            kind, blocks = "overflow", None
+        else:
+            kind, blocks = "answer", [TextContent(text="好了")]
+        calls.append(kind)
+
+        async def gen():
+            message = AssistantMessage(api=model.api, provider=model.provider, model=model.id)
+            yield StartEvent(partial=message)
+            if blocks is None:
+                message.stop_reason = "error"
+                message.error_message = error
+                yield ErrorEvent(error=error, message=message)
+                return
+            message.content.extend(blocks)
+            message.stop_reason = "stop"
+            yield DoneEvent(reason="stop", message=message)
+
+        return gen()
+
+    return stream_fn, calls
+
+
+async def overflow_session(cwd: Path, limit: int, **kw):
+    """预先灌好一段长历史；把主动压缩的阈值调高，只让超长兜底起作用"""
+    error = kw.pop("error", None)
+    long_answer = "。详细说明" * 300
+    session, _ = compaction_session(
+        cwd, [[TextContent(text=f"回答{i}" + long_answer)] for i in range(3)], usage=Usage(), **kw)
+    for i in range(3):
+        await session.prompt(f"问题{i}")
+    session.settings.set("compaction.threshold", 0.99)
+    session.settings.set("compaction.prune.triggerRatio", 0.99)
+    fake, calls = overflow_model(limit, **({"error": error} if error else {}))
+    session.agent.stream_fn = fake
+    session.model_runtime.models.stream_simple = fake
+    return session, calls
+
+
+async def case_overflow_recovery() -> None:
+    """服务商报上下文超长：压缩后重试本轮，用户看到的是正常回答"""
+    with Sandbox() as cwd:
+        manager = file_manager(cwd)
+        session, calls = await overflow_session(cwd, limit=2500, session_manager=manager)
+        events = record(session)
+        await session.prompt("继续")
+        types = [e.type for e in events]
+        starts = [e for e in events if e.type == "compaction_start"]
+        check("超长兜底: 触发了一次压缩", len(starts) == 1 and starts[0].reason == "overflow",
+              str([(e.type, getattr(e, "reason", "")) for e in events if "compaction" in e.type]))
+        check("超长兜底: 顺序是 超长 → 摘要 → 重试成功", calls == ["overflow", "summary", "answer"], str(calls))
+        check("超长兜底: 这一轮正常结束", events[-1].type == "agent_end" and events[-1].reason == "stop",
+              str(types[-3:]))
+        check("超长兜底: 用户看到正常回答", session.messages[-1].text() == "好了")
+        check("超长兜底: 失败的回复不在上下文里",
+              all(getattr(m, "stop_reason", "") != "error" for m in session.messages))
+        disk = [e.message for e in manager.get_entries() if e.type == "message"]
+        check("超长兜底: 失败的回复不落盘", all(getattr(m, "stop_reason", "") != "error" for m in disk))
+        check("超长兜底: 新请求没被压缩掉", any(m.text() == "继续" for m in session.messages))
+
+
+async def case_overflow_unrecoverable() -> None:
+    """压缩后仍然超长：只救一次，然后照常报错（错误信息可读）"""
+    with Sandbox() as cwd:
+        session, calls = await overflow_session(cwd, limit=10)
+        events = record(session)
+        await session.prompt("继续")
+        starts = [e for e in events if e.type == "compaction_start"]
+        check("超长兜底: 只尝试一次", len(starts) == 1, str(len(starts)))
+        check("超长兜底: 救不回来时照常报错", events[-1].reason == "error", events[-1].reason)
+        check("超长兜底: 错误信息可读", "prompt is too long" in (session.agent.state.error_message or ""))
+
+
+async def case_overflow_other_errors() -> None:
+    with Sandbox() as cwd:
+        session, calls = await overflow_session(cwd, limit=10, error="HTTP 429: rate limit exceeded")
+        events = record(session)
+        await session.prompt("继续")
+        check("超长兜底: 非超长错误不压缩", not any(e.type == "compaction_start" for e in events)
+              and calls == ["overflow"], str(calls))
+
+    with Sandbox() as cwd:
+        session, calls = await overflow_session(cwd, limit=2500)
+        session.settings.set("compaction.enabled", False)
+        events = record(session)
+        await session.prompt("继续")
+        check("超长兜底: 关闭压缩后不处理", events[-1].reason == "error" and calls == ["overflow"],
+              str(calls))
+
+
 async def case_compaction_no_gain() -> None:
     """内容太少、压缩后反而更大时不替换历史。"""
     with Sandbox() as cwd:
@@ -1121,6 +1221,18 @@ def test_rehydrate_hook_failure() -> None:
     asyncio.run(case_rehydrate_hook_failure())
 
 
+def test_overflow_recovery() -> None:
+    asyncio.run(case_overflow_recovery())
+
+
+def test_overflow_unrecoverable() -> None:
+    asyncio.run(case_overflow_unrecoverable())
+
+
+def test_overflow_other_errors() -> None:
+    asyncio.run(case_overflow_other_errors())
+
+
 def test_compaction_no_gain() -> None:
     asyncio.run(case_compaction_no_gain())
 
@@ -1200,6 +1312,9 @@ async def main() -> int:
     await case_prune_disabled()
     await case_rehydrate_after_compaction()
     await case_rehydrate_hook_failure()
+    await case_overflow_recovery()
+    await case_overflow_unrecoverable()
+    await case_overflow_other_errors()
     await case_compaction_no_gain()
     await case_double_compaction_resume()
     await case_compact_before_prompt()

@@ -78,6 +78,14 @@ def _seconds(s: float) -> str:
     return f"{s:.1f}s" if s < 60 else f"{int(s // 60)}m{int(s % 60):02d}s"
 
 
+def _message_text(message: Any) -> str:
+    content = getattr(message, "content", "")
+    if isinstance(content, str):
+        return content.strip()
+    return "".join(getattr(block, "text", "") for block in content or []
+                   if getattr(block, "type", "") == "text").strip()
+
+
 def first_line(text: str, limit: int) -> str:
     for line in (text or "").split("\n"):
         if line.strip():
@@ -435,6 +443,51 @@ class SessionRenderer:
 
     def status_line(self) -> str:
         return self.status.render(self.width)
+
+    def print_lines(self, lines: list[str]) -> None:
+        """命令输出等非事件内容"""
+        self._emit(lines)
+
+    def reset(self) -> None:
+        """换会话（/clear、/resume）：清掉上一轮记录和统计，ctrl+o 不再展开旧会话的内容"""
+        self.stop()
+        self.state = RenderState()
+        self.turn = TurnRecord()
+        self.last_turn = None
+        self.tool_count = 0
+        self.tool_errors = 0
+        self.status.tokens = 0
+        self.status.cost = 0.0
+
+    def recap(self, messages: list[Any], exchanges: int = 2, answer_lines: int = 3) -> list[str]:
+        """恢复会话时回顾最后几轮：用户的话 + 回答的前几行。工具、思考、压缩摘要都不显示"""
+        t = self.theme
+        pairs: list[tuple[str, str]] = []
+        for message in messages:
+            role = getattr(message, "role", None)
+            if role == "user":
+                text = _message_text(message)
+                if text:
+                    pairs.append((text, ""))
+            elif role == "assistant" and pairs:
+                text = _message_text(message)
+                if text:
+                    pairs[-1] = (pairs[-1][0], text)
+        if not pairs:
+            return []
+        width = max(20, self.width - 4)
+        lines = [rule(self.width, "最近的对话", t)]
+        for question, answer in pairs[-exchanges:]:
+            lines.append(f"{t.muted('❯')} {t.muted(first_line(question, width))}")
+            if answer:
+                body = [line for line in answer.splitlines() if line.strip()]
+                for i, line in enumerate(body[:answer_lines]):
+                    lead = ANSWER_MARK if i == 0 else " "
+                    lines.append(t.muted(f"{lead} {truncate(line, width)}"))
+                if len(body) > answer_lines:
+                    lines.append(t.muted(f"  …（还有 {len(body) - answer_lines} 行）"))
+        lines.append(rule(self.width, "", t))
+        return lines
 
     # -- 内部 ---------------------------------------------------------- #
 

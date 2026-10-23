@@ -3,7 +3,7 @@ name = "pi-app"
 version = "0.1.0"
 description = "Top layer: wires the coding agent to the terminal UI"
 requires-python = ">=3.10"
-dependencies = ["pi-coding-agent>=0.1.0", "pi-tui>=0.1.0"]
+dependencies = ["pi-coding-agent>=0.1.0", "pi-tui>=0.1.0", "prompt_toolkit>=3.0"]
 
 [project.scripts]
 pi-tui = "pi_app.app:main"

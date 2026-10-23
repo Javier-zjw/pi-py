@@ -14,6 +14,7 @@ from .entries import (
     entry_from_dict,
     entry_to_dict,
 )
+from .listing import SessionSummary, describe_session, list_sessions
 from .manager import SessionManager, project_dir_name, sessions_root
 
 __all__ = [
@@ -29,9 +30,12 @@ __all__ = [
     "SessionHeader",
     "SessionInfoEntry",
     "SessionManager",
+    "SessionSummary",
     "ThinkingLevelChangeEntry",
+    "describe_session",
     "entry_from_dict",
     "entry_to_dict",
+    "list_sessions",
     "project_dir_name",
     "sessions_root",
 ]

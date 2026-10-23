@@ -4,8 +4,8 @@
 没有任何包依赖 pi-app。
 """
 
-from .app import main, main_async, run
+from .app import App, main, main_async, run
 from .renderer import RenderState, SessionRenderer, summarize_arguments
 
 __version__ = "0.1.0"
-__all__ = ["RenderState", "SessionRenderer", "main", "main_async", "run", "summarize_arguments"]
+__all__ = ["App", "RenderState", "SessionRenderer", "main", "main_async", "run", "summarize_arguments"]

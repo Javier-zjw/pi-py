@@ -185,15 +185,13 @@ def create_app(cwd: str | Path = ".", agent_dir: str | Path | None = None) -> Fa
     @app.post("/api/sessions/{session_id}/compact")
     async def compact(session_id: str) -> dict[str, Any]:
         live = require(session_id)
+        # 过程和结果都通过 compaction_* 事件帧推给前端，这里只回一个结论
         result = await live.session.compact()
-        if result:
-            # 关键：告诉前端"上下文已经重置"，否则页面上的占用还按旧的累计
-            live.publish({
-                "type": "compacted",
-                "tokensBefore": result.tokens_before,
-                "summary": result.summary[:200],
-            })
-        return {"ok": bool(result), "tokensBefore": result.tokens_before if result else 0}
+        return {
+            "ok": bool(result),
+            "tokensBefore": result.tokens_before if result else 0,
+            "tokensAfter": result.tokens_after if result else None,
+        }
 
     # -- 模式与命令 ------------------------------------------------ #
 

@@ -139,6 +139,9 @@ class AgentSession:
             latest.details.get("state") if latest and isinstance(latest.details, dict) else None
         )
         self._compacting = False
+        # 压缩期间进来的 prompt 要等它做完，否则压缩结果会覆盖掉这一轮的消息
+        self._compaction_idle = asyncio.Event()
+        self._compaction_idle.set()
         self._in_loop = False
         self._compaction_cancel: asyncio.Event | None = None
         self._compaction_attempts = 0
@@ -266,6 +269,7 @@ class AgentSession:
                                                delta=p.delta))
 
         self._compacting = True
+        self._compaction_idle.clear()
         self._compaction_cancel = asyncio.Event()
         self._emit(CompactionStartEvent(reason=reason, tokens_before=tokens_before,
                                         context_window=budget.context_window))
@@ -280,8 +284,11 @@ class AgentSession:
         except Exception as exc:  # 压缩是附加能力，自身的 bug 不能让这一轮跑不起来
             end.error = f"{type(exc).__name__}: {exc}"
         finally:
+            # 之后到替换消息之间没有 await，此处放行等待中的 prompt 是安全的；
+            # 放在 finally 里，任务被取消（CancelledError）时也不会让后续 prompt 永远等下去
             self._compacting = False
             self._compaction_cancel = None
+            self._compaction_idle.set()
 
         if outcome is not None and outcome.tokens_after >= outcome.tokens_before:
             # 没变小就不替换：原始历史信息更全
@@ -378,6 +385,7 @@ class AgentSession:
     ) -> list[AgentMessage]:
         if expand_prompt_templates:
             text = self.expand_prompt_template(text)
+        await self._compaction_idle.wait()
         await self._apply_mode()
         errors = await self.resources.get_extension_api().run_before_start(self)
         for note in errors:

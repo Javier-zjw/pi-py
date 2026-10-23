@@ -12,10 +12,13 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from pi_coding_agent import SessionManager
 from pi_coding_agent.session.entries import entry_from_dict
+
+from .dto import compaction_dto
 
 MAX_PREVIEW_BYTES = 512_000
 SKIP_DIRS = {
@@ -195,9 +198,10 @@ class HistoryTurn:
     text: str = ""
     tools: list[dict] = None
     usage: dict = None
+    compaction: dict | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        out = {
             "user": self.user,
             "thinking": self.thinking,
             "text": self.text,
@@ -206,6 +210,10 @@ class HistoryTurn:
             "phase": "done",
             "folded": True,
         }
+        if self.compaction is not None:
+            out["kind"] = "compaction"
+            out["compaction"] = self.compaction
+        return out
 
 
 def read_session_file(path: str | Path) -> dict[str, Any]:
@@ -238,7 +246,16 @@ def read_session_file(path: str | Path) -> dict[str, Any]:
 
     for entry in entries:
         if entry.type == "compaction":
-            turns.append(HistoryTurn(user="", text=f"（上下文已压缩）{entry.summary}"))
+            details = entry.details if isinstance(entry.details, dict) else {}
+            turns.append(HistoryTurn(
+                user="", text=entry.summary,
+                compaction=compaction_dto(SimpleNamespace(
+                    reason=details.get("reason") or "", tokens_before=entry.tokens_before,
+                    tokens_after=details.get("tokensAfter"), summary=entry.summary,
+                    state=details.get("state"), degraded=details.get("degraded", False),
+                    restored=details.get("restored") or [],
+                )),
+            ))
             current = None
             continue
         if entry.type != "message" or entry.message is None:

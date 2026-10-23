@@ -52,6 +52,15 @@ def summarize_arguments(arguments: Any) -> str:
         return ""
 
 
+COMPACTION_REASONS = {"threshold": "上下文快满了", "manual": "手动", "overflow": "超出窗口"}
+
+
+def _k(n: int | None) -> str:
+    if n is None:
+        return "?"
+    return f"{n / 1000:.1f}k" if n >= 1000 else str(n)
+
+
 def first_line(text: str, limit: int) -> str:
     """工具结果只取首行。
 
@@ -78,6 +87,7 @@ class RenderState:
     detail: str = ""
     tool_at: dict[str, float] = field(default_factory=dict)
     own_prompt: str = ""
+    compaction_tail: str = ""
 
 
 class SessionRenderer:
@@ -100,6 +110,8 @@ class SessionRenderer:
         self.state = RenderState()
         self.tool_count = 0
         self.tool_errors = 0
+        # 压缩可能发生在一轮开始之前（手动 / 先压后跑），那时转圈要自己启停
+        self.agent_running = False
 
     # -- 对外 ---------------------------------------------------------- #
 
@@ -141,6 +153,7 @@ class SessionRenderer:
     # -- 事件处理 ------------------------------------------------------ #
 
     def _on_agent_start(self, event) -> None:
+        self.agent_running = True
         own = self.state.own_prompt
         self.state = RenderState(turn_started=time.time(), own_prompt=own)
         self.spinner.reset()
@@ -250,6 +263,7 @@ class SessionRenderer:
         self._set_status("等待中...")
 
     def _on_agent_end(self, event) -> None:
+        self.agent_running = False
         self.ticker.stop()
         self._flush()
         self.live.finalize()
@@ -257,10 +271,50 @@ class SessionRenderer:
             self._emit([self.theme.warn(f"  · 结束原因：{event.reason}"), ""])
 
     def _on_error(self, event) -> None:
+        self.agent_running = False
         self.ticker.stop()
         self._flush()
         self.live.finalize()
         self._emit([self.theme.error(f"  ✗ {event.error}"), ""])
+
+    # -- 压缩：同步进行，期间不执行任务，所以必须让用户看得到 ----------- #
+
+    def _on_compaction_start(self, event) -> None:
+        self._flush()
+        self.state.compaction_tail = ""
+        self.ticker.start()
+        reason = COMPACTION_REASONS.get(event.reason, event.reason)
+        self._set_status("正在压缩上下文", f"{_k(event.tokens_before)} tokens · {reason} · Ctrl+C 取消")
+
+    def _on_compaction_progress(self, event) -> None:
+        self.state.compaction_tail = (self.state.compaction_tail + event.delta)[-400:]
+        label = "压缩校验未通过，重试中" if event.phase == "retrying" else "正在压缩上下文"
+        chunk = f"第 {event.chunk}/{event.chunks} 块 · " if event.chunks > 1 else ""
+        self._set_status(label, chunk + self._tail(self.state.compaction_tail))
+
+    def _on_compaction_end(self, event) -> None:
+        t = self.theme
+        if not self.agent_running:
+            self.ticker.stop()
+        self._flush()
+        self.live.finalize()
+        if event.error:
+            lines = [t.warn(f"  · 压缩未执行：{event.error}")]
+        elif event.cancelled:
+            lines = [t.warn("  · 已取消压缩，上下文保持原样")]
+        elif event.skipped:
+            return
+        else:
+            seq = (event.state or {}).get("seq")
+            before, after = event.tokens_before, event.tokens_after or 0
+            saved = f"，省 {round((1 - after / before) * 100)}%" if before else ""
+            lines = [t.accent(f"  ⟳ 上下文已压缩（第 {seq} 次）：{_k(before)} → {_k(after)} tokens{saved}")]
+            if event.degraded:
+                lines.append(t.warn("    摘要未能由模型生成，已降级为确定性记录（用户原话、文件、命令）"))
+            if event.restored:
+                lines.append(t.muted(f"    补回了模型遗漏的 {len(event.restored)} 条约束/决策/认知"))
+        self._emit([*lines, ""])
+        self._set_status("等待中...")
 
     # -- 汇总 ---------------------------------------------------------- #
 

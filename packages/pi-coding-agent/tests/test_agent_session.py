@@ -660,6 +660,46 @@ async def case_compaction_cancel() -> None:
         check("取消: 压缩状态复位", not session.is_compacting)
 
 
+async def case_prompt_waits_for_compaction() -> None:
+    """手动压缩还没做完时来了新请求：先等压缩完成，再执行这一轮。"""
+    with Sandbox() as cwd:
+        long_answer = "。详细说明" * 300
+        session, _ = compaction_session(
+            cwd, [[TextContent(text="回答一" + long_answer)], [TextContent(text="回答二" + long_answer)],
+                  [TextContent(text="新回答")]])
+        await session.prompt("问题一")
+        await session.prompt("问题二")
+        use_estimates(session)
+        real_stream = session.model_runtime.models.stream_simple
+
+        def slow_summary(model, context, options=None):
+            async def gen():
+                message = AssistantMessage()
+                yield StartEvent(partial=message)
+                for _ in range(10):
+                    await asyncio.sleep(0.01)
+                    yield TextDeltaEvent(content_index=0, delta="…", partial=message)
+                message.content.append(TextContent(text=SUMMARY_JSON))
+                message.stop_reason = "stop"
+                yield DoneEvent(reason="stop", message=message)
+            return gen()
+
+        session.model_runtime.models.stream_simple = slow_summary
+        order: list[str] = []
+        session.subscribe(lambda e: order.append(e.type)
+                          if e.type in ("compaction_end", "agent_start") else None)
+        compaction = asyncio.create_task(session.compact())
+        await asyncio.sleep(0.02)
+        session.model_runtime.models.stream_simple = real_stream
+        await session.prompt("问题三")
+        await compaction
+        check("并发: 压缩结束后才开始新一轮", order == ["compaction_end", "agent_start"], str(order))
+        check("并发: 新一轮的消息没被压缩覆盖",
+              session.messages[0].text().startswith("<compacted_state")
+              and session.messages[-1].text() == "新回答",
+              str([m.text()[:20] for m in session.messages]))
+
+
 async def case_compact_guard_while_streaming() -> None:
     with Sandbox() as cwd:
         session, _ = compaction_session(cwd, [[TextContent(text="回答")]])
@@ -946,6 +986,10 @@ def test_compaction_cancel() -> None:
     asyncio.run(case_compaction_cancel())
 
 
+def test_prompt_waits_for_compaction() -> None:
+    asyncio.run(case_prompt_waits_for_compaction())
+
+
 def test_compact_guard_while_streaming() -> None:
     asyncio.run(case_compact_guard_while_streaming())
 
@@ -998,6 +1042,7 @@ async def main() -> int:
     await case_compact_mid_loop()
     await case_compaction_failure_keeps_history()
     await case_compaction_cancel()
+    await case_prompt_waits_for_compaction()
     await case_compact_guard_while_streaming()
     await case_compaction_disabled()
     print("模板与队列")

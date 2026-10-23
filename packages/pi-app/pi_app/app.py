@@ -79,9 +79,11 @@ async def run(session, renderer: SessionRenderer) -> int:
                 for tool in session.agent.state.tools:
                     print(f"  {tool.name:<10} {tool.description.splitlines()[0][:70]}")
             elif cmd == "compact":
-                result = await session.compact(rest or None)
-                if result:
-                    print(renderer.theme.muted(f"  已压缩 {result.tokens_before} tokens"))
+                # 进度和结果由渲染器根据 compaction_* 事件显示
+                try:
+                    await session.compact(rest or None)
+                except KeyboardInterrupt:
+                    session.abort()
             elif cmd == "usage":
                 u = session.usage()
                 print(renderer.theme.muted(f"  ↑{u.input} ↓{u.output} ¥{u.cost.total:.4f}"))

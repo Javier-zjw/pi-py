@@ -21,6 +21,7 @@ from pi_agent import (
 from pi_ai import TextDeltaEvent, ThinkingDeltaEvent
 
 from .agent_session import AgentSession, create_agent_session, create_agent_session_services
+from .compaction import CompactionEndEvent, CompactionProgressEvent, CompactionStartEvent
 from .session.manager import SessionManager
 from .text import sanitize
 
@@ -65,6 +66,34 @@ def make_printer(show_thinking: bool = False):
         elif isinstance(event, AgentEndEvent):
             sys.stdout.write("\n")
             sys.stdout.flush()
+        elif isinstance(event, CompactionStartEvent):
+            sys.stdout.write(f"\n{YELLOW}⟳ compacting context ({event.tokens_before} tokens)…{RESET}")
+            sys.stdout.flush()
+        elif isinstance(event, CompactionProgressEvent):
+            # 每收到约 200 字摘要打一个点，让人知道没卡住
+            before = state.get("chars", 0)
+            state["chars"] = before + len(event.delta)
+            if event.phase == "retrying" and not state.get("retry_noted"):
+                state["retry_noted"] = True
+                sys.stdout.write(f"{DIM} retrying{RESET}")
+            sys.stdout.write("." * (state["chars"] // 200 - before // 200))
+            sys.stdout.flush()
+        elif isinstance(event, CompactionEndEvent):
+            state["retry_noted"] = False
+            state["chars"] = 0
+            if event.ok:
+                note = " (degraded)" if event.degraded else ""
+                sys.stdout.write(
+                    f"\r{CYAN}⟳ compacted {event.tokens_before} → {event.tokens_after} tokens"
+                    f"{note}{RESET}\n"
+                )
+            elif event.error:
+                sys.stdout.write(f"\n{RED}compaction skipped: {event.error}{RESET}\n")
+            elif event.cancelled:
+                sys.stdout.write(f"\n{YELLOW}compaction cancelled{RESET}\n")
+            else:
+                sys.stdout.write("\n")
+            sys.stdout.flush()
 
     return on_event
 
@@ -81,6 +110,14 @@ def json_printer(event: AgentEvent) -> None:
         payload = {"type": event.type, "tool": event.tool_name, "arguments": event.arguments}
     elif isinstance(event, ToolExecutionEndEvent):
         payload = {"type": event.type, "tool": event.tool_name, "isError": event.is_error}
+    elif isinstance(event, CompactionProgressEvent):
+        return
+    elif isinstance(event, CompactionStartEvent):
+        payload = {"type": event.type, "reason": event.reason, "tokensBefore": event.tokens_before}
+    elif isinstance(event, CompactionEndEvent):
+        payload = {"type": event.type, "ok": event.ok, "reason": event.reason,
+                   "tokensBefore": event.tokens_before, "tokensAfter": event.tokens_after,
+                   "degraded": event.degraded, "error": event.error, "cancelled": event.cancelled}
     print(json.dumps(payload, ensure_ascii=False), flush=True)
 
 
@@ -135,9 +172,8 @@ async def handle_command(session: AgentSession, line: str) -> bool:
         for command in api.commands.values():
             print(f"  /{command.name:<18} {command.description[:70]} (extension)")
     elif name == "compact":
-        result = await session.compact(rest or None)
-        if result:
-            print(f"{DIM}compacted {result.tokens_before} tokens → summary{RESET}")
+        # 进度与结果由事件打印（make_printer 的 compaction_* 分支）
+        await session.compact(rest or None)
     elif name == "usage":
         usage = session.usage()
         print(

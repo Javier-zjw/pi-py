@@ -6,8 +6,8 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Any, Callable, Iterable
-from pi_ai import ImageContent, Model, TextContent, ThinkingLevel, UserMessage
+from typing import Any, Awaitable, Callable, Iterable
+from pi_ai import AssistantMessage, ImageContent, Model, TextContent, ThinkingLevel, UserMessage
 
 from .loop import LoopConfig, default_convert_to_llm, run_agent_loop
 from .queue import PendingMessageQueue
@@ -44,6 +44,7 @@ class Agent:
             transform_context: TransformContext | None = None,
             convert_to_llm: ConvertToLlm = default_convert_to_llm,
             stream_options: dict[str, Any] | None = None,
+            on_stream_error: Callable[[AssistantMessage], Awaitable[bool]] | None = None,
     ) -> None:
         self.state = initial_state or AgentState()
         self.stream_fn = stream_fn
@@ -54,6 +55,7 @@ class Agent:
         self.transform_context = transform_context
         self.convert_to_llm = convert_to_llm
         self.stream_options = stream_options or {}
+        self.on_stream_error = on_stream_error
 
         self.steering_queue = PendingMessageQueue(mode=queue_mode)
         self.follower_queue = PendingMessageQueue(mode=queue_mode)
@@ -112,7 +114,8 @@ class Agent:
             convert_to_llm=self.convert_to_llm,
             on_turn_end=on_turn_end,
             on_before_stop=on_before_stop,
-            stream_options=self.stream_options
+            stream_options=self.stream_options,
+            on_stream_error=self.on_stream_error,
         )
 
     @staticmethod

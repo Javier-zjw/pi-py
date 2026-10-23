@@ -77,6 +77,9 @@ class LoopConfig:
     on_turn_end: Callable[[], Awaitable[list[AgentMessage]]] | None = None
     """返回额外消息，用于维持循环持续运行（后续消息）"""
     on_before_stop: Callable[[], Awaitable[list[AgentMessage]]] | None = None
+    """模型调用出错时询问上层。返回 True 表示上层已处理（比如上下文超长、已经压缩），
+    丢弃这条失败的回复、重试本轮；同一次运行最多重试 MAX_ERROR_RETRIES 次"""
+    on_stream_error: Callable[[AssistantMessage], Awaitable[bool]] | None = None
     stream_options: dict[str, Any] = field(default_factory=dict)
 
 
@@ -266,6 +269,9 @@ async def _stream_turn(
     state.streaming_message = None
     return final
 
+MAX_ERROR_RETRIES = 2
+
+
 async def run_agent_loop(
         state: AgentState,
         emit: Emit,
@@ -281,6 +287,7 @@ async def run_agent_loop(
     state.error_message = None
     reason: EndReason = "stop"
     turn = 0
+    error_retries = 0
 
     try:
         while True:
@@ -294,6 +301,16 @@ async def run_agent_loop(
             emit(TurnStartEvent(turn=turn))
 
             assistant = await _stream_turn(state, emit, config, cancel_event)
+            if (
+                    assistant.stop_reason == "error"
+                    and config.on_stream_error is not None
+                    and error_retries < MAX_ERROR_RETRIES
+                    and not cancel_event.is_set()
+            ):
+                error_retries += 1
+                if await config.on_stream_error(assistant):
+                    # 失败的回复不进 transcript、不发 message_end（订阅方据此落盘），直接重试本轮
+                    continue
             state.messages.append(assistant)
             new_messages.append(assistant)
             emit(MessageEndEvent(message=assistant))

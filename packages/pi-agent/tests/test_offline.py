@@ -20,6 +20,7 @@ HERE = Path(__file__).resolve()
 sys.path.insert(0, str(HERE.parents[1]))                    # packages/pi-agent
 sys.path.insert(0, str(HERE.parents[2] / "pi-ai"))          # packages/pi-ai
 
+from pi_agent.loop import MAX_ERROR_RETRIES  # noqa: E402
 from pi_agent import (  # noqa: E402
     AfterToolCallResult,
     Agent,
@@ -659,6 +660,78 @@ async def case_stream_error() -> None:
     check("流出错: 错误写进 state", agent.state.error_message == "provider 挂了")
 
 
+def flaky_stream(errors: int, text: str = "好了"):
+    """前 errors 次调用出错，之后正常回答"""
+    calls = {"n": 0}
+
+    def stream_fn(model, context, options=None):
+        calls["n"] += 1
+        failing = calls["n"] <= errors
+
+        async def gen():
+            from pi_ai import ErrorEvent
+
+            message = AssistantMessage(api=model.api, provider=model.provider, model=model.id)
+            yield StartEvent(partial=message)
+            if failing:
+                message.stop_reason = "error"
+                message.error_message = "HTTP 400: prompt is too long"
+                yield ErrorEvent(error=message.error_message, message=message)
+                return
+            message.content.append(TextContent(text=text))
+            message.stop_reason = "stop"
+            yield DoneEvent(reason="stop", message=message)
+
+        return gen(), calls
+
+    def call(model, context, options=None):
+        return stream_fn(model, context, options)[0]
+
+    return call, calls
+
+
+async def case_stream_error_hook() -> None:
+    seen: list = []
+
+    async def recover(message) -> bool:
+        seen.append(message.error_message)
+        return True
+
+    stream, calls = flaky_stream(errors=1)
+    agent = Agent(stream_fn=stream, initial_state=AgentState(model=MODEL), on_stream_error=recover)
+    events: list = []
+    agent.subscribe(events.append)
+    await agent.prompt("go")
+    check("出错钩子: 收到失败的回复", seen == ["HTTP 400: prompt is too long"], str(seen))
+    check("出错钩子: 处理后重试成功", events[-1].reason == "stop" and agent.state.messages[-1].text() == "好了")
+    check("出错钩子: 失败的回复不进 transcript",
+          [m.role for m in agent.state.messages] == ["user", "assistant"],
+          str([m.role for m in agent.state.messages]))
+    ended = [e.message for e in events if e.type == "message_end"]
+    check("出错钩子: 失败的回复不发 message_end",
+          all(getattr(m, "stop_reason", "") != "error" for m in ended))
+    check("出错钩子: 一共调了两次模型", calls["n"] == 2, str(calls["n"]))
+
+    async def decline(message) -> bool:
+        return False
+
+    stream, calls = flaky_stream(errors=1)
+    agent = Agent(stream_fn=stream, initial_state=AgentState(model=MODEL), on_stream_error=decline)
+    events = []
+    agent.subscribe(events.append)
+    await agent.prompt("go")
+    check("出错钩子: 返回 False 时照旧结束", events[-1].reason == "error" and calls["n"] == 1)
+    check("出错钩子: 返回 False 时错误照旧入 transcript", agent.state.messages[-1].stop_reason == "error")
+
+    stream, calls = flaky_stream(errors=99)
+    agent = Agent(stream_fn=stream, initial_state=AgentState(model=MODEL), on_stream_error=recover)
+    events = []
+    agent.subscribe(events.append)
+    await agent.prompt("go")
+    check("出错钩子: 有重试上限，不会死循环",
+          events[-1].reason == "error" and calls["n"] == MAX_ERROR_RETRIES + 1, str(calls["n"]))
+
+
 async def case_no_terminal_event() -> None:
     """provider 异常退出、一个终止事件都没发——必须有兜底。"""
     def truncated(model, context, options=None):
@@ -814,6 +887,10 @@ def test_stream_error() -> None:
     asyncio.run(case_stream_error())
 
 
+def test_stream_error_hook() -> None:
+    asyncio.run(case_stream_error_hook())
+
+
 def test_no_terminal_event() -> None:
     asyncio.run(case_no_terminal_event())
 
@@ -856,6 +933,7 @@ async def main() -> int:
     await case_max_turns()
     print("错误路径")
     await case_stream_error()
+    await case_stream_error_hook()
     await case_no_terminal_event()
     await case_loop_continue()
     print("订阅与输入")

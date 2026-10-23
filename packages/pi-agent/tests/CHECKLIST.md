@@ -86,6 +86,9 @@
 | 无终止事件有兜底消息 | ⚠️ `_stream_turn` 结尾 `if final is None:` 那段，删了会返回 None 一路崩 |
 | 续跑 assistant 结尾应拒绝 | `agent_loop_continue` 里 `isinstance(last, AssistantMessage)` 时 raise |
 | 续跑空 transcript 应拒绝 | 同函数开头 `if not state.messages` |
+| 出错钩子: 处理后重试成功 | `run_agent_loop` 里 `config.on_stream_error` 返回 True 时 `continue`，**在 `state.messages.append` 之前** |
+| 出错钩子: 失败的回复不发 message_end | 同上：`continue` 必须在 `emit(MessageEndEvent)` 之前，否则订阅方会把失败的回复落盘 |
+| 出错钩子: 有重试上限 | `error_retries < MAX_ERROR_RETRIES`，计数在调用钩子前自增 |
 
 ## 订阅
 

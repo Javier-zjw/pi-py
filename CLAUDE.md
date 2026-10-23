@@ -30,7 +30,7 @@ ruff check packages                       # line-length 100, py310
 ```bash
 python packages/pi-ai/tests/test_offline.py
 python packages/pi-agent/tests/test_offline.py [-v]
-python packages/pi-coding-agent/tests/test_tools.py      # 另有 test_session / test_resources / test_runtime / test_agent_session
+python packages/pi-coding-agent/tests/test_tools.py      # 另有 test_session / test_resources / test_runtime / test_compaction / test_agent_session
 ```
 
 pytest 下 `check()` 失败会抛 AssertionError（`under_pytest()` 必须在调用时判断环境变量，不能在 import 时求值，否则 pytest 会假绿）。pi-ai 和 pi-agent 的测试文件都叫 `test_offline.py` 且没有 `__init__.py`，必须**按包分别运行**，一次性收集会报 import file mismatch：
@@ -69,11 +69,18 @@ pi-web（Vue 3 + Vite，只通过 HTTP/SSE 与 pi-server 通信）
   - 事件约定：Start = 消息开始（可能流式），End = 定稿；生来完整的消息也成对发，订阅方只听 `message_end`。
   - 全程使用 `AgentMessage`，只在 provider 边界 `convert_to_llm`；`CustomMessage.include_in_context` 控制是否给模型看。
 - **pi-coding-agent**：
-  - `AgentSession`（`agent_session.py`）是组合点：`AgentSessionServices`（ModelRuntime + SettingsManager + ResourceLoader，按 cwd 解析一次）+ `SessionManager` + `Agent`。持久化靠订阅 agent 事件；自动压缩挂在 agent 的 `transform_context` 钩子上。
+  - `AgentSession`（`agent_session.py`）是组合点：`AgentSessionServices`（ModelRuntime + SettingsManager + ResourceLoader，按 cwd 解析一次）+ `SessionManager` + `Agent`。持久化靠订阅 agent 事件。会话自己的事件（如压缩）和 agent 事件走同一条 `subscribe` 通道，按 `event.type` 区分。
   - 模式：`_apply_mode()` 每轮先把系统提示和工具集**从 `_base_system_prompt` / `_base_tools` 基线重建**，再调用模式的 `apply`——不要在上一轮结果上叠加。
-  - 会话（`session/`）：JSONL **树**（`id`/`parentId`），分支=移动 leaf；存于 `~/.pi/agent/sessions/<项目目录名>/`。磁盘格式与 TS 版 pi 保持一致（camelCase 键、v3 entry 类型），改格式会破坏互操作。compaction entry 自带 `retained_tail`，是自包含检查点。模型/思考档位从完整分支读取，而非裁剪后的上下文。
+  - 会话（`session/`）：JSONL **树**（`id`/`parentId`），分支=移动 leaf；存于 `~/.pi/agent/sessions/<项目目录名>/`。磁盘格式与 TS 版 pi 保持一致（camelCase 键、v3 entry 类型），改格式会破坏互操作。compaction entry 写 `firstKeptEntryId`（旧文件里的 `retainedTail` 仍可读），`details.state` 存结构化状态。模型/思考档位从完整分支读取，而非裁剪后的上下文。
   - 工具（`tools/`）：`read write edit bash grep find ls`。参数是纯 JSON Schema dict，由 `pi_agent.validation` 校验（会把 `"3"` 纠正为 `3`）；非必填字段一律 `args.get()`；`details` 必须可 JSON 序列化（`Path` 先转 `str`）。grep/find 有 rg/fd 时用二进制，否则纯 Python 回退。所有来自 OS 的字符串先过 `text.sanitize`；bash 输出用增量解码器（中文跨块）。
   - 配置：`~/.pi/agent/` 下 `models.json`（自定义 provider/模型，`api` 字段决定协议）、`auth.json`（`{provider_id: {apiKey}}`）、`settings.json`；项目级 `<cwd>/.pi/settings.json` 深度合并覆盖全局（默认值见 `settings.py::DEFAULT_SETTINGS`）。`reasoning: true` 只是能力标记；思考档位来源：CLI `-t` > 会话记录 > settings > `off`。
+- **上下文压缩**（`pi_coding_agent/compaction/`，设计取舍见各模块 docstring）：
+  - 分工：`budget`（CJK 感知计量，以实报 usage 为锚）→ `cut`（按 token 预算保留尾部，不拆工具调用/结果）→ `engine`（只计算结果、不改会话）→ `AgentSession._apply_compaction`（落盘 + 替换消息，中间无 await）。
+  - 压缩请求复用正文的 system prompt + tools + 消息前缀、`tool_choice="none"`，指令追加在末尾（`prompt.py`），为了命中前缀缓存；改动请求构造时保持前缀一致。
+  - 状态磁盘存 JSON、给模型渲染成 Markdown（`state.py`）。用户原话、文件记录、命令由代码提取，模型只写需要理解的字段；`constraints/decisions/knowledge` 被模型漏掉时由代码补回。
+  - 触发点：`prompt()` 先压后跑（新请求不进压缩）、`transform_context` 每次调模型前检查。服务商出错、取消、没变小都保持原历史；格式两次不合格才降级。压缩期间到来的 `prompt()` 会等待它结束。
+  - 保留尾部里 assistant 的 usage 是压缩前的，状态消息 `details.tailLength` 标出这段，计量时不能当锚——否则会反复压缩。
+  - 前端契约：`compaction_start/progress/end` 帧（`pi_server/dto.py::compaction_dto`，历史回放共用）。
 - **pi-tui**：零依赖终端渲染原语（`prompt_toolkit` 为可选 extra）。**pi-app**：把 AgentSession 事件渲染到 pi-tui。
 - **pi-server**：`dto.py`（事件 → SSE 帧，**前后端唯一契约**）、`registry.py`（会话注册 + 事件扇出）、`workspace.py`（历史解析、文件浏览，`resolve_within()` 越界 403）都**不 import fastapi**，`app.py` 只是薄路由层。前端优先用 `pi_server/web/`（Vite 构建产物），不存在时回退 `pi_server/static/index.html`。新增 SSE 帧类型要同时改 `dto.py` 和 `pi-web/src/App.vue` 的 `handle()`。
 

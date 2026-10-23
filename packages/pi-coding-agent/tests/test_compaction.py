@@ -26,7 +26,13 @@ from fakes import BIG_MODEL  # noqa: E402
 from pi_agent import CustomMessage  # noqa: E402
 from pi_ai import (  # noqa: E402
     AssistantMessage,
+    DoneEvent,
+    ErrorEvent,
+    Model,
+    StartEvent,
     TextContent,
+    TextDeltaEvent,
+    Tool,
     ToolCall,
     ToolResultMessage,
     Usage,
@@ -40,6 +46,12 @@ from pi_coding_agent.compaction.budget import (  # noqa: E402
     estimate_text_tokens,
 )
 from pi_coding_agent.compaction.cut import chunk_ranges, find_cut, is_valid_boundary  # noqa: E402
+from pi_coding_agent.compaction.engine import (  # noqa: E402
+    CompactionCancelled,
+    CompactionFailed,
+    CompactionRequest,
+    run_compaction,
+)
 from pi_coding_agent.compaction.state import (  # noqa: E402
     build_state,
     degraded_llm_state,
@@ -383,6 +395,272 @@ def test_trim() -> None:
     check("裁剪: 预算内不动", steps == [] and same == state)
 
 
+# --------------------------------------------------------------------------- #
+# 4. 编排：请求构造、重试、降级、取消、分块
+# --------------------------------------------------------------------------- #
+
+
+GOOD_JSON = """好的。
+```json
+{"task": {"goal": "迁移到 JWT", "status": "修测试"},
+ "constraints": [{"id": "c1", "text": "不改表结构"}],
+ "decisions": [{"id": "d1", "decision": "用 PyJWT", "reason": "已在依赖里"}],
+ "progress": {"done": [{"id": "p1", "text": "改了 auth.py"}]},
+ "nextSteps": ["跑 pytest"]}
+```"""
+
+MID_MODEL = Model(id="fake-mid", provider="fake", api="anthropic-messages", name="Mid",
+                  context_window=40_000, max_tokens=4096)
+
+
+class FakeSummarizer:
+    """按剧本回复。剧本元素：文本 / ("error", 原因) / ("tool", 文本) / ("length", 文本)。"""
+
+    def __init__(self, replies: list, on_delta=None) -> None:
+        self.replies = list(replies)
+        self.calls: list = []
+        self.on_delta = on_delta
+
+    def __call__(self, model, context, options=None):
+        self.calls.append((context, options))
+        reply = self.replies.pop(0) if self.replies else GOOD_JSON
+
+        async def gen():
+            message = AssistantMessage(usage=Usage(input=100, output=20))
+            yield StartEvent(partial=message)
+            kind, text = ("text", reply) if isinstance(reply, str) else (reply[0], reply[1])
+            if kind == "error":
+                message.stop_reason = "error"
+                message.error_message = text
+                yield ErrorEvent(error=text, message=message)
+                return
+            if kind == "tool":
+                message.content.append(ToolCall(id="x", name="read", arguments={"path": "a"}))
+            for piece in (text[:10], text[10:]):
+                if piece:
+                    if self.on_delta:
+                        self.on_delta()
+                    yield TextDeltaEvent(content_index=0, delta=piece, partial=message)
+            message.content.append(TextContent(text=text))
+            message.stop_reason = "length" if kind == "length" else "stop"
+            yield DoneEvent(reason=message.stop_reason, message=message)
+
+        return gen()
+
+
+def long_history(turns: int = 8, size: int = 2000) -> list:
+    msgs: list = []
+    for i in range(turns):
+        msgs.append(UserMessage(content=f"需求{i}：" + "x" * size))
+        msgs += tool_turn(f"t{i}", "read", {"path": f"src/m{i}.py"}, "y" * size,
+                          {"path": f"/w/src/m{i}.py"})
+        msgs.append(assistant("完成 " + "z" * size))
+    return msgs
+
+
+def request(messages, fake, model=BIG_MODEL, **kw) -> CompactionRequest:
+    from pi_coding_agent.compaction.budget import CompactionBudget
+    budget = kw.pop("budget", CompactionBudget(context_window=model.context_window,
+                                               keep_recent_tokens=3000))
+    return CompactionRequest(messages=messages, model=model, stream_fn=fake, budget=budget,
+                             system_prompt="你是编码助手", cwd="/w", **kw)
+
+
+TOOLS = [Tool(name="read", description="读文件", parameters={"type": "object", "properties": {}})]
+
+
+async def case_engine_success() -> None:
+    msgs = long_history()
+    fake = FakeSummarizer([GOOD_JSON])
+    deltas: list[str] = []
+    out = await run_compaction(request(msgs, fake, tools=TOOLS),
+                               on_progress=lambda p: deltas.append(p.delta))
+    check("编排: 产出结果", out is not None)
+    context, options = fake.calls[0]
+    check("编排: 复用正文 system prompt", context.system_prompt == "你是编码助手")
+    check("编排: 带同一套工具定义", [t.name for t in context.tools] == ["read"])
+    check("编排: 禁止调用工具", options.tool_choice == "none", str(options.tool_choice))
+    check("编排: 前缀与原消息一致（可命中缓存）",
+          context.messages[:out.cut.cut] == msgs[:out.cut.cut])
+    check("编排: 指令追加在末尾", "<compaction_request>" in context.messages[-1].text())
+    check("编排: 只调用一次", len(fake.calls) == 1)
+    check("编排: 流式进度", "".join(deltas) == GOOD_JSON, str(deltas[:2]))
+    check("编排: 模型字段进状态", out.state["llm"]["task"]["goal"] == "迁移到 JWT")
+    check("编排: 确定性字段进状态", "src/m0.py" in out.state["fileLedger"]["read"],
+          str(out.state["fileLedger"]))
+    check("编排: 用户原话完整保留", out.state["userMessages"][0]["text"].startswith("需求0："))
+    check("编排: 保留尾部未被压缩", out.retained == msgs[out.cut.cut:] and len(out.retained) > 0)
+    check("编排: 压缩后变小", out.tokens_after < out.tokens_before,
+          f"{out.tokens_before} → {out.tokens_after}")
+    check("编排: 第一次压缩 seq=1", out.state["seq"] == 1)
+    check("编排: 状态消息带 tailLength",
+          out.state_message().details["tailLength"] == len(out.retained))
+    check("编排: usage 累计", out.usage.input == 100)
+    check("编排: 未降级", not out.degraded)
+
+
+async def case_engine_no_tools() -> None:
+    fake = FakeSummarizer([GOOD_JSON])
+    await run_compaction(request(long_history(), fake))
+    check("编排: 无工具时不传 tool_choice", fake.calls[0][1].tool_choice is None)
+
+
+async def case_engine_format_retry() -> None:
+    fake = FakeSummarizer(["我来总结一下，但忘了 JSON", GOOD_JSON])
+    out = await run_compaction(request(long_history(), fake))
+    check("重试: 格式错误后重试成功", out is not None and not out.degraded)
+    check("重试: 共调用两次", len(fake.calls) == 2)
+    retry_context = fake.calls[1][0]
+    check("重试: 带上错误原因", "没有找到可解析的 JSON" in retry_context.messages[-1].text())
+    check("重试: 保留第一次的前缀", retry_context.messages[:-2] == fake.calls[0][0].messages)
+
+    fake = FakeSummarizer([("tool", GOOD_JSON), GOOD_JSON])
+    out = await run_compaction(request(long_history(), fake))
+    check("重试: 调用工具算格式错误", len(fake.calls) == 2 and not out.degraded)
+    check("重试: 提示不要调工具", "不要调用工具" in fake.calls[1][0].messages[-1].text())
+
+    fake = FakeSummarizer([("length", '```json\n{"task": '), GOOD_JSON])
+    out = await run_compaction(request(long_history(), fake))
+    check("重试: 输出被截断要求精简", "截断" in fake.calls[1][0].messages[-1].text())
+
+
+async def case_engine_degrade() -> None:
+    msgs = long_history()
+    fake = FakeSummarizer(["不是 JSON", '```json\n{"task": {}}\n```'])
+    out = await run_compaction(request(msgs, fake))
+    check("降级: 两次不合格后降级", out is not None and out.degraded)
+    check("降级: 只调用两次", len(fake.calls) == 2)
+    check("降级: 用户原话仍然完整", len(out.state["userMessages"]) >= 1)
+    check("降级: 文件记录仍然完整", len(out.state["fileLedger"]["read"]) >= 1)
+    check("降级: 摘要里有提示", "⚠" in out.summary)
+    check("降级: 记录错误原因", any("goal" in e for e in out.errors), str(out.errors))
+
+
+async def case_engine_provider_failure() -> None:
+    fake = FakeSummarizer([("error", "429 rate limited"), GOOD_JSON])
+    out = await run_compaction(request(long_history(), fake))
+    check("失败: 服务商出错重试一次成功", out is not None and not out.degraded and len(fake.calls) == 2)
+
+    fake = FakeSummarizer([("error", "429"), ("error", "503 overloaded")])
+    try:
+        await run_compaction(request(long_history(), fake))
+        check("失败: 连续出错抛 CompactionFailed", False, "没有抛")
+    except CompactionFailed as exc:
+        check("失败: 连续出错抛 CompactionFailed", "503" in str(exc), str(exc))
+
+
+async def case_engine_cancel() -> None:
+    cancel = asyncio.Event()
+    fake = FakeSummarizer([GOOD_JSON], on_delta=cancel.set)
+    try:
+        await run_compaction(request(long_history(), fake), cancel_event=cancel)
+        check("取消: 抛 CompactionCancelled", False, "没有抛")
+    except CompactionCancelled:
+        check("取消: 抛 CompactionCancelled", True)
+
+
+async def case_engine_nothing() -> None:
+    fake = FakeSummarizer([])
+    out = await run_compaction(request([UserMessage(content="hi")], fake))
+    check("编排: 没有可压缩内容返回 None", out is None and fake.calls == [])
+
+
+async def case_engine_incremental() -> None:
+    first = await run_compaction(request(long_history(), FakeSummarizer([GOOD_JSON])))
+    msgs = [first.state_message(), *first.retained]
+    for i in range(6):
+        msgs.append(UserMessage(content=f"新需求{i}：" + "n" * 2000))
+        msgs.append(assistant("好 " + "m" * 2000))
+    dropped = """```json
+{"task": {"goal": "迁移到 JWT", "status": "联调"},
+ "decisions": [{"id": "d1", "decision": "用 PyJWT"}],
+ "progress": {"done": [{"id": "p1", "text": "改了 auth.py"}]}}
+```"""
+    fake = FakeSummarizer([dropped])
+    second = await run_compaction(request(msgs, fake, previous_state=first.state))
+    check("增量: seq 递增", second.state["seq"] == 2)
+    check("增量: 指令要求合并上一份状态", "<compacted_state> 是上一次压缩" in
+          fake.calls[0][0].messages[-1].text())
+    check("增量: 上一份状态在前缀里",
+          fake.calls[0][0].messages[0].text().startswith('<compacted_state seq="1">'))
+    check("增量: 悄悄丢掉的约束被补回", second.restored == ["c1"], str(second.restored))
+    check("增量: 用户原话累积",
+          len(second.state["userMessages"]) > len(first.state["userMessages"]))
+    check("增量: 摘要里仍有约束", "不改表结构" in second.summary)
+
+
+async def case_engine_chunked() -> None:
+    from pi_coding_agent.compaction.budget import CompactionBudget
+    msgs = long_history(turns=20, size=3000)
+    budget = CompactionBudget(context_window=MID_MODEL.context_window, reserve_tokens=4096,
+                              keep_recent_tokens=2000)
+    fake = FakeSummarizer([])
+    progress: list = []
+    out = await run_compaction(request(msgs, fake, model=MID_MODEL, budget=budget),
+                               on_progress=progress.append)
+    check("分块: 放不下时分块调用", out is not None and out.chunks > 1 and len(fake.calls) == out.chunks,
+          f"chunks={out.chunks if out else None} calls={len(fake.calls)}")
+    check("分块: 后续块带上滚动状态",
+          "<compacted_state" in fake.calls[1][0].messages[0].text())
+    check("分块: 每块不超窗口", all(
+        sum(len(m.text()) if hasattr(m, "text") else 0 for m in c.messages) // 4
+        < MID_MODEL.context_window for c, _ in fake.calls))
+    check("分块: 进度带块序号", {p.chunk for p in progress} == set(range(1, out.chunks + 1)))
+    check("分块: 结果覆盖全部用户原话",
+          len(out.state["userMessages"]) == sum(isinstance(m, UserMessage)
+                                                for m in msgs[:out.cut.cut]))
+
+
+async def case_engine_shrinks_tail() -> None:
+    from pi_coding_agent.compaction.budget import CompactionBudget
+    msgs = long_history(turns=6, size=4000)
+    budget = CompactionBudget(context_window=20_000, reserve_tokens=2000,
+                              keep_recent_tokens=50_000)
+    out = await run_compaction(request(msgs, FakeSummarizer([]), budget=budget))
+    check("预算: 保留尾部过大时自动缩小", out.tokens_after <= budget.usable,
+          f"after={out.tokens_after} usable={budget.usable}")
+
+
+def test_engine_success() -> None:
+    asyncio.run(case_engine_success())
+
+
+def test_engine_no_tools() -> None:
+    asyncio.run(case_engine_no_tools())
+
+
+def test_engine_format_retry() -> None:
+    asyncio.run(case_engine_format_retry())
+
+
+def test_engine_degrade() -> None:
+    asyncio.run(case_engine_degrade())
+
+
+def test_engine_provider_failure() -> None:
+    asyncio.run(case_engine_provider_failure())
+
+
+def test_engine_cancel() -> None:
+    asyncio.run(case_engine_cancel())
+
+
+def test_engine_nothing() -> None:
+    asyncio.run(case_engine_nothing())
+
+
+def test_engine_incremental() -> None:
+    asyncio.run(case_engine_incremental())
+
+
+def test_engine_chunked() -> None:
+    asyncio.run(case_engine_chunked())
+
+
+def test_engine_shrinks_tail() -> None:
+    asyncio.run(case_engine_shrinks_tail())
+
+
 async def main() -> int:
     print("计量与预算")
     test_estimate()
@@ -404,6 +682,17 @@ async def main() -> int:
     test_render()
     test_degraded()
     test_trim()
+    print("编排")
+    await case_engine_success()
+    await case_engine_no_tools()
+    await case_engine_format_retry()
+    await case_engine_degrade()
+    await case_engine_provider_failure()
+    await case_engine_cancel()
+    await case_engine_nothing()
+    await case_engine_incremental()
+    await case_engine_chunked()
+    await case_engine_shrinks_tail()
 
     print()
     if FAILURES:

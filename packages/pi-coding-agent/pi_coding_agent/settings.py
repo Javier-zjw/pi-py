@@ -23,7 +23,9 @@ DEFAULT_SETTINGS : dict[str, Any] = {
     "compaction": {"enabled": True, "threshold": 0.85, "reserveTokens": 16384,
                    "keepRecentTokens": 20000, "maxSummaryTokens": 8000, "thinking": "off",
                    "prune": {"enabled": True, "triggerRatio": 0.6, "targetRatio": 0.4,
-                             "protectTokens": 40000, "minTokens": 200}},
+                             "protectTokens": 40000, "minTokens": 200},
+                   # rehydrate：压缩后补回最近修改的文件（上限另受可用窗口 8% 约束）
+                   "rehydrate": {"enabled": True, "maxFiles": 5, "maxTokens": 10000}},
     "retry": {"enabled": True, "maxRetries": 3},
     "extensions": [],
     "disabledExtensions": [],

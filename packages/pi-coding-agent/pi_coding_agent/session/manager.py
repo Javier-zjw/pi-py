@@ -49,6 +49,12 @@ def project_dir_name(cwd: str | Path) -> str:
     return "--" + resolved.replace("/", "-").replace("\\", "-").replace(":", "") + "--"
 
 
+def _with_rehydration(summary: str, details: dict[str, Any]) -> str:
+    """压缩时补回的上下文（最近修改的文件、计划）和状态放在同一条消息里"""
+    extra = details.get("rehydration")
+    return f"{summary}\n\n{extra}" if extra else summary
+
+
 class SessionManager:
     def __init__(
             self,
@@ -365,7 +371,7 @@ class SessionManager:
                 CustomMessage(
                     custom_type="compaction_summary",
                     content=(
-                        compaction.summary if structured else
+                        _with_rehydration(compaction.summary, compaction.details) if structured else
                         "Summary of the earlier conversation, which has been compacted:\n\n"
                         + compaction.summary
                     ),

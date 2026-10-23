@@ -43,6 +43,7 @@ from .budget import (
 )
 from .cut import CutPoint, chunk_ranges, find_cut
 from .prompt import build_instruction, build_retry_message
+from .rehydrate import Rehydration, build_rehydration, recent_modified_files
 from .state import (
     build_state,
     degraded_llm_state,
@@ -88,6 +89,10 @@ class CompactionRequest:
     reason: str = "threshold"          # threshold | manual | overflow
     custom_instructions: str | None = None
     reasoning: ThinkingLevel = "off"
+    # L3：摘要之后补回最近修改的文件（0 表示不附内容，只列路径）和扩展提供的上下文
+    rehydrate_max_files: int = 0
+    rehydrate_max_tokens: int = 0
+    extra_context: Sequence[str] = ()
 
 
 @dataclass
@@ -104,9 +109,19 @@ class CompactionOutcome:
     errors: list[str] = field(default_factory=list)
     chunks: int = 1
     retained: list[AgentMessage] = field(default_factory=list)
+    rehydration: Rehydration = field(default_factory=Rehydration)
+
+    @property
+    def content(self) -> str:
+        """状态消息的完整内容：结构化状态 + 补回的上下文"""
+        return join_state_content(self.summary, self.rehydration.text)
 
     def state_message(self) -> CustomMessage:
-        return make_state_message(self.summary, self.state, tail_length=len(self.retained))
+        return make_state_message(self.content, self.state, tail_length=len(self.retained))
+
+
+def join_state_content(summary: str, rehydration: str | None) -> str:
+    return f"{summary}\n\n{rehydration}" if rehydration else summary
 
 
 def make_state_message(summary: str, state: dict[str, Any] | None, tail_length: int) -> CustomMessage:
@@ -326,8 +341,22 @@ async def run_compaction(
     state, trimmed = trim_to_budget(state, budget_tokens)
     summary = render_markdown(state)
     retained = messages[cut.cut:]
-    tokens_after = fixed + estimate_text_tokens(summary) + estimate_tokens(retained)
+    tail_tokens = fixed + estimate_tokens(retained)
+
+    rehydration = Rehydration()
+    if req.rehydrate_max_files > 0 or req.extra_context:
+        rehydration = build_rehydration(
+            recent_modified_files(summarized, retained), req.cwd,
+            req.rehydrate_max_files, req.rehydrate_max_tokens, req.extra_context,
+        )
+    tokens_after = tail_tokens + estimate_text_tokens(join_state_content(summary, rehydration.text))
+    if rehydration.text and tokens_after >= tokens_before:
+        # 补回的内容让压缩失去意义时宁可不补，摘要本身仍然有效
+        rehydration = Rehydration()
+        tokens_after = tail_tokens + estimate_text_tokens(summary)
     state["meta"]["tokensAfter"] = tokens_after
+    if rehydration.files:
+        state["meta"]["rehydratedFiles"] = list(rehydration.files)
 
     total = Usage()
     for u in usage:
@@ -345,4 +374,5 @@ async def run_compaction(
         errors=errors,
         chunks=chunks,
         retained=retained,
+        rehydration=rehydration,
     )

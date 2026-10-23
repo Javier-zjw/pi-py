@@ -155,9 +155,38 @@ def activate(pi) -> None:
             return "当前没有计划"
         return json.dumps(plan, ensure_ascii=False, indent=2)
 
+    async def plan_context(session) -> str | None:
+        """上下文压缩后把当前计划补回给模型，否则 /build 执行到一半压缩就忘了计划"""
+        plan = pi.state.get("plan") or latest_plan(session)
+        if not plan:
+            return None
+        note = "当前仍在计划模式：只读调研，等用户确认后用 /build 执行。" if session.mode == "plan" \
+            else "这是最近一次提交的计划，执行时以它为准。"
+        return render_plan_context(plan, note)
+
+    pi.compaction_context(plan_context)
+
     pi.register_command("plan", "进入计划模式（可直接带上需求）", cmd_plan, usage="/plan [需求]")
     pi.register_command("build", "执行已确认的计划", cmd_build, usage="/build [补充说明]")
     pi.register_command("show_plan", "查看当前计划", cmd_show_plan)
+
+def latest_plan(session) -> dict | None:
+    """pi.state 里没有（比如重启后恢复会话）就从会话记录里找最近一份"""
+    for entry in reversed(session.session.get_branch()):
+        if getattr(entry, "type", "") == "custom" and getattr(entry, "custom_type", "") == "plan":
+            return entry.data if isinstance(entry.data, dict) else None
+    return None
+
+
+def render_plan_context(plan: dict, note: str) -> str:
+    lines = ["## 当前计划", note, "", f"目标：{plan.get('summary', '')}", "", "步骤："]
+    lines += [f"{i}. {s}" for i, s in enumerate(plan.get("steps") or [], 1)]
+    if plan.get("files"):
+        lines += ["", "涉及文件：" + "、".join(plan["files"])]
+    if plan.get("questions"):
+        lines += ["", "待确认：", *[f"- {q}" for q in plan["questions"]]]
+    return "\n".join(lines)
+
 
 def render_plan_as_task(plan: dict, extra: str = "") -> str:
     """把结构化计划渲染成给模型的任务描述。"""

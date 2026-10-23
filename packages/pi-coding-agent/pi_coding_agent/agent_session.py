@@ -312,6 +312,12 @@ class AgentSession:
             return None
 
         thinking = self.settings.get("compaction.thinking", "off")
+        extra_context, hook_errors = await self.resources.get_extension_api().run_compaction_context(
+            self
+        )
+        for note in hook_errors:
+            self.services.diagnostics.append(f"compaction_context 失败：{note}")
+        rehydrate = bool(self.settings.get("compaction.rehydrate.enabled", True))
         request = CompactionRequest(
             messages=list(self.agent.state.messages),
             model=model,
@@ -324,6 +330,11 @@ class AgentSession:
             reason=reason,
             custom_instructions=custom_instructions,
             reasoning=self.agent.state.thinking_level if thinking == "inherit" else thinking,
+            rehydrate_max_files=int(self.settings.get("compaction.rehydrate.maxFiles", 5))
+            if rehydrate else 0,
+            rehydrate_max_tokens=min(int(self.settings.get("compaction.rehydrate.maxTokens", 10_000)),
+                                     int(budget.usable * 0.08)),
+            extra_context=extra_context,
         )
 
         def on_progress(p: CompactionProgress) -> None:
@@ -389,6 +400,9 @@ class AgentSession:
             "restored": outcome.restored,
             "trimmed": outcome.trimmed,
             "chunks": outcome.chunks,
+            # 补回的上下文和状态一起放进状态消息；恢复会话时原样拼回
+            "rehydration": outcome.rehydration.text or None,
+            "rehydratedFiles": outcome.rehydration.files,
         }
         self.session.append_compaction(
             summary=outcome.summary,

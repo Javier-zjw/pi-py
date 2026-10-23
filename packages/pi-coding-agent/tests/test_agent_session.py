@@ -579,6 +579,64 @@ async def case_prune_disabled() -> None:
         check("清理: 关闭后不触发", "context_pruned" not in [e.type for e in events])
 
 
+async def case_rehydrate_after_compaction() -> None:
+    """压缩后补回最近改过的文件和当前计划；恢复会话后一样。"""
+    with Sandbox() as cwd:
+        (cwd / "cfg.py").write_text("TIMEOUT = 30\n", "utf-8")
+        manager = file_manager(cwd)
+        long_answer = "。详细说明" * 300
+        script = [
+            [ToolCall(id="e1", name="edit", arguments={
+                "path": "cfg.py", "old_text": "TIMEOUT = 30", "new_text": "TIMEOUT = 60"})],
+            [TextContent(text="改好了" + long_answer)],
+            [TextContent(text="回答二" + long_answer)],
+            [TextContent(text="回答三")],
+            [TextContent(text=SUMMARY_JSON)],
+        ]
+        session, _ = compaction_session(cwd, script, tools=["edit"], session_manager=manager)
+        await session.prompt("把超时改成 60")
+        await session.prompt("问题二")
+        await session.prompt("问题三")
+        use_estimates(session)
+        session.resources.get_extension_api().state["plan"] = {
+            "summary": "把配置迁到环境变量", "steps": ["读 cfg.py", "改成 os.environ"]}
+        events = record(session)
+
+        result = await session.compact()
+        check("补回: 压缩成功", result is not None, str(events[-1:]))
+        content = session.messages[0].text()
+        check("补回: 状态消息带文件当前内容", "TIMEOUT = 60" in content, content[-300:])
+        check("补回: 计划模式补回当前计划", "## 当前计划" in content and "迁到环境变量" in content)
+        check("补回: 结束事件里的摘要不含补回内容", "TIMEOUT" not in events[-1].summary)
+        entry = [e for e in manager.get_entries() if e.type == "compaction"][-1]
+        check("补回: 落盘", entry.details.get("rehydratedFiles") == ["cfg.py"],
+              str(entry.details.get("rehydratedFiles")))
+
+        reopened = AgentSession(session.services, SessionManager.open(cwd / "s.jsonl"),
+                                model=MID_MODEL, tools=[])
+        check("补回: 恢复后状态消息一致", reopened.messages[0].text() == content)
+
+
+async def case_rehydrate_hook_failure() -> None:
+    with Sandbox() as cwd:
+        long_answer = "。详细说明" * 300
+        session, _ = compaction_session(
+            cwd, [[TextContent(text="回答一" + long_answer)], [TextContent(text="回答二" + long_answer)],
+                  [TextContent(text="回答三")], [TextContent(text=SUMMARY_JSON)]])
+        for q in ("一", "二", "三"):
+            await session.prompt(f"问题{q}")
+        use_estimates(session)
+
+        async def broken(_session):
+            raise RuntimeError("扩展炸了")
+
+        session.resources.get_extension_api().compaction_context(broken)
+        result = await session.compact()
+        check("补回: 扩展钩子出错不影响压缩", result is not None)
+        check("补回: 钩子错误进诊断",
+              any("扩展炸了" in d for d in session.services.diagnostics), str(session.services.diagnostics))
+
+
 async def case_compaction_no_gain() -> None:
     """内容太少、压缩后反而更大时不替换历史。"""
     with Sandbox() as cwd:
@@ -1055,6 +1113,14 @@ def test_prune_disabled() -> None:
     asyncio.run(case_prune_disabled())
 
 
+def test_rehydrate_after_compaction() -> None:
+    asyncio.run(case_rehydrate_after_compaction())
+
+
+def test_rehydrate_hook_failure() -> None:
+    asyncio.run(case_rehydrate_hook_failure())
+
+
 def test_compaction_no_gain() -> None:
     asyncio.run(case_compaction_no_gain())
 
@@ -1132,6 +1198,8 @@ async def main() -> int:
     await case_prune_in_tool_loop()
     await case_prune_ignores_stale_usage()
     await case_prune_disabled()
+    await case_rehydrate_after_compaction()
+    await case_rehydrate_hook_failure()
     await case_compaction_no_gain()
     await case_double_compaction_resume()
     await case_compact_before_prompt()

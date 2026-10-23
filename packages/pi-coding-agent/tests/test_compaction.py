@@ -21,7 +21,7 @@ sys.path.insert(0, str(HERE.parents[1]))
 sys.path.insert(0, str(HERE.parents[2] / "pi-agent"))
 sys.path.insert(0, str(HERE.parents[2] / "pi-ai"))
 
-from fakes import BIG_MODEL  # noqa: E402
+from fakes import BIG_MODEL, Sandbox  # noqa: E402
 
 from pi_agent import CustomMessage  # noqa: E402
 from pi_ai import (  # noqa: E402
@@ -46,6 +46,10 @@ from pi_coding_agent.compaction.budget import (  # noqa: E402
     estimate_text_tokens,
 )
 from pi_coding_agent.compaction.cut import chunk_ranges, find_cut, is_valid_boundary  # noqa: E402
+from pi_coding_agent.compaction.rehydrate import (  # noqa: E402
+    build_rehydration,
+    recent_modified_files,
+)
 from pi_coding_agent.compaction.prune import (  # noqa: E402
     STUB_PREFIX,
     apply_prune,
@@ -753,6 +757,80 @@ def test_apply_prune() -> None:
     check("替换: 切点仍不落在工具结果上", cut is not None and is_valid_boundary(out, cut.cut))
 
 
+# --------------------------------------------------------------------------- #
+# 6. L3 压缩后补回
+# --------------------------------------------------------------------------- #
+
+
+def edit_turn(call_id: str, path: str, tool: str = "edit") -> list:
+    return tool_turn(call_id, tool, {"path": path}, "ok", {"path": path})
+
+
+def test_recent_modified_files() -> None:
+    summarized = [*edit_turn("1", "/w/a.py"), *edit_turn("2", "/w/b.py"),
+                  *edit_turn("3", "/w/a.py"), *edit_turn("4", "/w/c.py", "write"),
+                  *tool_turn("5", "read", {"path": "d.py"}, "x", {"path": "/w/d.py"})]
+    retained = [UserMessage(content="继续"), *tool_turn("6", "read", {"path": "c.py"}, "x",
+                                                     {"path": "/w/c.py"})]
+    paths = recent_modified_files(summarized, retained)
+    check("补回: 最近修改的在前、去重", paths == ["/w/a.py", "/w/b.py"], str(paths))
+    check("补回: 只读过的不算修改", "/w/d.py" not in paths)
+
+
+def test_build_rehydration() -> None:
+    with Sandbox() as cwd:
+        (cwd / "a.py").write_text("def a():\n    return 1\n", "utf-8")
+        (cwd / "big.py").write_text("\n".join(f"line_{i} = {i}" for i in range(3000)), "utf-8")
+        (cwd / "bin.dat").write_bytes(b"\x00\x01\x02" * 100)
+        paths = [str(cwd / "a.py"), str(cwd / "big.py"), str(cwd / "bin.dat"), str(cwd / "gone.py")]
+        r = build_rehydration(paths, str(cwd), max_files=5, max_tokens=3000,
+                              extra_sections=["## 当前计划\n目标：迁移"])
+        check("补回: 附上文件当前内容", "### a.py\n```py\ndef a():" in r.text, r.text[:120])
+        check("补回: 长文件截断并说明", "### big.py" in r.text and "只附了开头部分" in r.text)
+        check("补回: 二进制和不存在的只列路径", r.listed == ["bin.dat", "gone.py"], str(r.listed))
+        check("补回: 记录附了哪些", r.files == ["a.py", "big.py"], str(r.files))
+        check("补回: 扩展片段在后", r.text.index("## 当前计划") > r.text.index("### big.py"))
+        check("补回: 不超预算", estimate_text_tokens(r.text) <= 3300, str(estimate_text_tokens(r.text)))
+        check("补回: 包在 recent_context 里",
+              r.text.startswith("<recent_context>") and r.text.endswith("</recent_context>"))
+
+        r = build_rehydration(paths, str(cwd), max_files=1, max_tokens=3000)
+        check("补回: 文件数上限", r.files == ["a.py"] and "big.py" in r.listed, str(r.listed))
+        check("补回: 什么都没有时为空", build_rehydration([], str(cwd), 5, 3000).text == "")
+
+
+async def case_engine_rehydrate() -> None:
+    with Sandbox() as cwd:
+        (cwd / "auth.py").write_text("TOKEN_TTL = 3600\n", "utf-8")
+        msgs = long_history()
+        msgs[3:3] = edit_turn("e1", str(cwd / "auth.py"))
+        req = request(msgs, FakeSummarizer([GOOD_JSON]), rehydrate_max_files=5,
+                      rehydrate_max_tokens=4000, extra_context=["## 当前计划\n目标：迁移"])
+        req.cwd = str(cwd)
+        out = await run_compaction(req)
+        check("编排补回: 附上改过的文件", out.rehydration.files == ["auth.py"], str(out.rehydration))
+        check("编排补回: 状态消息里有文件内容", "TOKEN_TTL = 3600" in out.state_message().text())
+        check("编排补回: 摘要本身不含补回内容", "TOKEN_TTL" not in out.summary)
+        check("编排补回: 扩展片段进来了", "## 当前计划" in out.content)
+        check("编排补回: 压缩后大小算上补回内容",
+              out.tokens_after >= estimate_text_tokens(out.content), str(out.tokens_after))
+        check("编排补回: meta 记录补回的文件", out.state["meta"].get("rehydratedFiles") == ["auth.py"])
+
+        # 补回内容让结果没变小时宁可不补
+        tiny = [UserMessage(content="改一下"), *edit_turn("e2", str(cwd / "auth.py")),
+                UserMessage(content="好"), assistant("嗯")]
+        (cwd / "auth.py").write_text("X = 1\n" * 2000, "utf-8")
+        req = request(tiny, FakeSummarizer([GOOD_JSON]), rehydrate_max_files=5,
+                      rehydrate_max_tokens=4000)
+        req.cwd = str(cwd)
+        out = await run_compaction(req)
+        check("编排补回: 没收益时不补", out.rehydration.text == "", str(out.rehydration.files))
+
+
+def test_engine_rehydrate() -> None:
+    asyncio.run(case_engine_rehydrate())
+
+
 async def main() -> int:
     print("计量与预算")
     test_estimate()
@@ -789,6 +867,10 @@ async def main() -> int:
     test_stub_text()
     test_plan_prune()
     test_apply_prune()
+    print("L3 补回")
+    test_recent_modified_files()
+    test_build_rehydration()
+    await case_engine_rehydrate()
 
     print()
     if FAILURES:

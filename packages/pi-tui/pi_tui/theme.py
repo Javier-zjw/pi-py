@@ -65,6 +65,9 @@ WARN = Color((215, 135, 95), 173, 33)       # 陶土橙
 ERROR = Color((215, 95, 95), 167, 31)       # 砖红
 THINKING = Color((135, 135, 175), 103, 35)  # 灰紫
 MUTED = Color((128, 128, 128), 244, 90)     # 中灰
+# 统计数字用的亮色：用时、token 要一眼能扫到，低饱和的灰调在这里反而看不见
+INFO = Color((86, 200, 214), 80, 96)         # 亮青
+HIGHLIGHT = Color((236, 196, 106), 221, 93)  # 亮金
 
 RESET = "\033[0m"
 BOLD = "\033[1m"
@@ -111,6 +114,12 @@ class Theme:
 
     def thinking(self, t: str, **kw) -> str:
         return self.paint(t, THINKING, **kw)
+
+    def info(self, t: str, **kw) -> str:
+        return self.paint(t, INFO, **kw)
+
+    def highlight(self, t: str, **kw) -> str:
+        return self.paint(t, HIGHLIGHT, **kw)
 
     def muted(self, t: str, **kw) -> str:
         return self.paint(t, MUTED, dim=True, **kw)

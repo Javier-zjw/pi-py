@@ -14,11 +14,13 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 try:  # 可选依赖，缺了也能跑
     from prompt_toolkit import PromptSession
+    from prompt_toolkit.application import run_in_terminal
     from prompt_toolkit.formatted_text import ANSI
     from prompt_toolkit.history import FileHistory
     from prompt_toolkit.key_binding import KeyBindings
@@ -30,9 +32,22 @@ except ImportError:  # pragma: no cover
 
 
 class LineReader:
-    """一行输入。Enter 提交，Shift/Alt+Enter 换行，↑↓ 翻历史。"""
+    """一行输入。Enter 提交，Shift/Alt+Enter 换行，↑↓ 翻历史。
 
-    def __init__(self, history_file: str | Path | None = None) -> None:
+    - ``key_handlers``：额外快捷键（prompt_toolkit 的键名，如 ``"c-o"``）→ 回调。回调在输入行
+      上方打印内容，打完输入行原样恢复，正在输入的字不丢。
+    - ``erase_when_done``：提交后擦掉输入框，由上层用自己的样式回显这句话。
+
+    不用 prompt_toolkit 的 bottom_toolbar：它固定在屏幕最底行，输入行和它之间会空出一大块，
+    提交后这块空白还留在 scrollback 里。提示信息放进输入框上方的分隔线即可。
+    """
+
+    def __init__(
+            self,
+            history_file: str | Path | None = None,
+            key_handlers: dict[str, Callable[[], None]] | None = None,
+            erase_when_done: bool = False,
+    ) -> None:
         self.session: Any = None
         if not HAS_PROMPT_TOOLKIT:
             return
@@ -42,6 +57,9 @@ class LineReader:
         @bindings.add("escape", "enter")     # Alt+Enter 换行
         def _(event) -> None:
             event.current_buffer.insert_text("\n")
+
+        for key, handler in (key_handlers or {}).items():
+            bindings.add(key)(_print_above(handler))
 
         history = None
         if history_file:
@@ -55,6 +73,9 @@ class LineReader:
             multiline=False,
             enable_history_search=True,
             complete_while_typing=False,
+            erase_when_done=erase_when_done,
+            # 默认给补全菜单预留 8 行，输入行和提示栏之间会空出一大块
+            reserve_space_for_menu=0,
         )
 
     @property
@@ -69,6 +90,12 @@ class LineReader:
                 return await self.session.prompt_async(ANSI(prompt))
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, lambda: input(prompt))
+
+
+def _print_above(handler: Callable[[], None]) -> Callable[[Any], None]:
+    def run(event) -> None:
+        run_in_terminal(handler)
+    return run
 
 
 def missing_dependency_hint(theme=None) -> str | None:

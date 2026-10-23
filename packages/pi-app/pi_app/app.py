@@ -18,7 +18,8 @@ from pi_tui import LineReader, Theme, missing_dependency_hint, terminal_width
 from .renderer import SessionRenderer
 
 BUILTIN_COMMANDS = {
-    "help", "model", "think", "tools", "compact", "continue", "usage", "session", "exit", "quit",
+    "help", "model", "think", "tools", "compact", "continue", "expand", "usage", "session",
+    "exit", "quit",
 }
 
 HELP = """
@@ -29,6 +30,7 @@ HELP = """
   /tools             列出当前启用的工具
   /compact [说明]    立即压缩上下文，可附加压缩重点
   /continue          接着执行上次中断的那一轮
+  /expand            展开上一轮的思考和工具调用（等同 ctrl+o）
   /usage             本次会话的 token 与费用
   /session           当前会话文件路径
   /exit              退出
@@ -46,18 +48,25 @@ async def run(session, renderer: SessionRenderer) -> int:
                 if session.interrupted_tool_calls else "")
         print(renderer.theme.warn(f"  上次的任务在一轮中途中断了{note}，输入 /continue 接着执行"))
 
-    reader = LineReader(history_file=Path.home() / ".pi" / "agent" / "history")
+    reader = LineReader(
+        history_file=Path.home() / ".pi" / "agent" / "history",
+        key_handlers={"c-o": renderer.expand_last_turn},
+        erase_when_done=True,
+    )
     hint = missing_dependency_hint(renderer.theme)
     if hint:
         print(hint)
     turns = 0
     while True:
         try:
-            raw = await reader.read("\033[1m> \033[0m")
+            raw = await reader.read(renderer.input_prompt() if reader.rich else "\033[1m❯ \033[0m")
         except (EOFError, KeyboardInterrupt):
             print()
             break
         line = sanitize(raw).strip()
+        if line and reader.rich:
+            # 输入框提交后被擦掉了，用紧凑的样式把这句话留在 scrollback 里
+            renderer.user_echo(line)
         if not line:
             continue
 
@@ -67,6 +76,8 @@ async def run(session, renderer: SessionRenderer) -> int:
                 break
             if cmd == "help":
                 print(renderer.theme.muted(HELP))
+            elif cmd == "expand":
+                renderer.expand_last_turn()
             elif cmd == "model":
                 if rest:
                     model = session.model_runtime.resolve(rest.strip())

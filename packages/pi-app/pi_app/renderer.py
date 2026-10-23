@@ -1,12 +1,22 @@
 """事件 → 界面。
 
-三条设计原则，都是踩过坑之后定下来的：
+一轮的样子（过程收起，结论突出）：
 
-1. **四类内容各有引导符号**：▌用户、╭╰思考、→✓工具、●回答。滚多远都能一眼
-   分辨。只靠颜色不行——滚上去之后颜色相近的内容会连成一片。
-2. **正文和思考都真流式**，但经过 TextStreamer 匀速吐字。provider 的 SSE 是
-   成批到的，收到就整块写会显得"蹦"。
-3. **一切耗时都显式标出**。思考几秒、每个工具几秒、整轮几秒，用户才有掌控感。
+    ❯ 查看一下当前代码
+      思考了 1.2s
+    ▸ 4 个工具调用 · bash ×2, read ×2 · 1 失败   ctrl+o 展开
+    ● 当前目录是一个很小的示例项目：
+      - README.md：说明文档
+
+    ✻ 用时 7.9s · 上下文 ↑4.1k · 输出 ↓86
+
+设计原则：
+
+1. **过程收起、结论突出**。思考和工具只留一行摘要；运行时底部只有一行状态，
+   显示正在执行的那个工具（名字闪烁），不打印参数。细节按 ctrl+o（或 /expand）
+   展开上一轮再看。
+2. **正文真流式**，经 TextStreamer 匀速吐字；以 ● 开头，续行缩进两格。
+3. **每轮一行统计**，亮色：用时、上下文大小、输出 token。不再每次调用模型都打一行。
 """
 
 from __future__ import annotations
@@ -14,6 +24,7 @@ from __future__ import annotations
 import json
 import sys
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, TextIO
 
@@ -29,14 +40,16 @@ from pi_tui import (
     markdown_lite,
     rule,
     terminal_width,
-    thinking_block,
-    tool_call,
     truncate,
-    usage_line,
     user_message,
+    wrap,
 )
 
 TOOL_SUMMARY_KEYS = ("path", "command", "pattern", "url", "query", "old_text")
+EXPAND_HINT = "ctrl+o 展开"
+EXPAND_RESULT_LINES = 20
+ANSWER_MARK = "●"
+INDENT = "  "
 
 
 def summarize_arguments(arguments: Any) -> str:
@@ -61,12 +74,11 @@ def _k(n: int | None) -> str:
     return f"{n / 1000:.1f}k" if n >= 1000 else str(n)
 
 
-def first_line(text: str, limit: int) -> str:
-    """工具结果只取首行。
+def _seconds(s: float) -> str:
+    return f"{s:.1f}s" if s < 60 else f"{int(s // 60)}m{int(s % 60):02d}s"
 
-    多行内容压平成一行完全没法读（行号和正文糊在一起），而用户在这里只需要
-    知道"成功了、大概是什么"。要看细节是另一个命令的事。
-    """
+
+def first_line(text: str, limit: int) -> str:
     for line in (text or "").split("\n"):
         if line.strip():
             return truncate(line.strip(), limit)
@@ -74,20 +86,47 @@ def first_line(text: str, limit: int) -> str:
 
 
 @dataclass
+class ToolRecord:
+    """一次工具调用，展开时用。"""
+
+    call_id: str
+    name: str
+    arguments: Any
+    started: float
+    took: float | None = None
+    is_error: bool = False
+    output: str = ""
+    patch: str | None = None
+
+
+@dataclass
+class TurnRecord:
+    """一轮的过程记录：思考全文、全部工具调用。ctrl+o 展开的就是它。"""
+
+    thinking: list[tuple[str, float]] = field(default_factory=list)
+    tools: list[ToolRecord] = field(default_factory=list)
+
+
+@dataclass
 class RenderState:
     """一轮之内的临时状态。渲染器不持有会话状态，只持有画到哪儿了。"""
 
     thinking: str = ""
-    thinking_started: bool = False
-    thinking_committed: bool = False
-    thinking_at: float = 0.0
+    # 这次调用模型的开始时间：思考时长从这里算（等第一个 token 也是思考的一部分）
+    call_started: float = 0.0
     text_started: bool = False
     turn_started: float = 0.0
-    label: str = "等待中..."
+    label: str = "思考中"
     detail: str = ""
-    tool_at: dict[str, float] = field(default_factory=dict)
     own_prompt: str = ""
     compaction_tail: str = ""
+    # 已执行完、还没打印摘要的工具（遇到正文或一轮结束时收成一行）
+    pending_tools: list[ToolRecord] = field(default_factory=list)
+    running: dict[str, ToolRecord] = field(default_factory=dict)
+    context_tokens: int = 0
+    output_tokens: int = 0
+    cost: float = 0.0
+    tool_total: int = 0
 
 
 class SessionRenderer:
@@ -108,6 +147,8 @@ class SessionRenderer:
         self.ticker = Ticker(self._repaint, interval=0.1)
         self.streamer = TextStreamer(self.live.stream_text)
         self.state = RenderState()
+        self.turn = TurnRecord()
+        self.last_turn: TurnRecord | None = None
         self.tool_count = 0
         self.tool_errors = 0
         # 压缩可能发生在一轮开始之前（手动 / 先压后跑），那时转圈要自己启停
@@ -123,22 +164,43 @@ class SessionRenderer:
         t = self.theme
         from pathlib import Path
 
+        think = f" · think {thinking}" if thinking != "off" else ""
         self._emit([
-            t.bold("pi coding agent"),
-            f"  {t.muted('工作目录')}  {Path(cwd).name}  {t.muted(cwd)}",
-            f"  {t.muted('模型')}      {model}",
-            f"  {t.muted('思考')}      {thinking}",
-            f"  {t.muted('输入任务开始，/help 查看命令，/exit 退出')}",
-            rule(self.width, theme=t),
+            (f"{t.accent('✻', bold=True)} {t.bold('pi coding agent')}  "
+             f"{t.muted(f'{model}{think}')}"),
+            f"  {t.muted(f'{Path(cwd).name}  {cwd}')}",
+            f"  {t.muted('/help 查看命令 · ctrl+o 展开上一轮的思考和工具 · /exit 退出')}",
             "",
         ])
 
     def prompt_echo(self, text: str) -> None:
-        """只在输入层没有回显时才调用（管道输入、print 模式）。
-
-        交互模式下输入行已经显示过一遍，再调这个就是同一句话打两遍。
-        """
+        """只在输入层没有回显时才调用（管道输入、print 模式）。"""
         self._emit(["", *user_message(text, self.width, self.theme), ""])
+
+    def user_echo(self, text: str) -> None:
+        """输入框提交后被擦掉（erase_when_done），用这一行把用户的话留在 scrollback 里"""
+        t = self.theme
+        lines = text.split("\n") or [""]
+        out = [f"{t.accent('❯', bold=True)} {t.bold(lines[0])}"]
+        out += [f"{INDENT}{t.bold(line)}" for line in lines[1:]]
+        self._emit(out)
+
+    def input_prompt(self) -> str:
+        """输入框：一条带提示的细线 + ❯。配合 LineReader 的 erase_when_done，提交后整块擦掉
+
+            ── glm-5.2 · 16.9k tok · ctrl+o 展开 · /help ──────────────
+            ❯ _
+        """
+        bits = [self.status.model]
+        if self.status.thinking and self.status.thinking != "off":
+            bits.append(f"think {self.status.thinking}")
+        if self.status.tokens:
+            bits.append(f"{_k(self.status.tokens)} tok")
+        if self.last_turn and (self.last_turn.tools or self.last_turn.thinking):
+            bits.append(EXPAND_HINT)
+        bits.append("/help")
+        label = " · ".join(b for b in bits if b)
+        return f"{rule(self.width, label, self.theme)}\n{self.theme.accent('❯', bold=True)} "
 
     def on_event(self, event: Any) -> None:
         handler = getattr(self, f"_on_{event.type}", None)
@@ -150,19 +212,49 @@ class SessionRenderer:
         self.streamer.stop()
         self.live.finalize()
 
+    def expand_last_turn(self) -> None:
+        """ctrl+o / /expand：打印上一轮的思考全文和每个工具的参数、结果"""
+        t = self.theme
+        turn = self.last_turn
+        if turn is None or not (turn.tools or turn.thinking):
+            self._emit([t.muted("  上一轮没有可展开的思考或工具调用"), ""])
+            return
+        width = self.width
+        lines = [rule(width, "上一轮详情", t)]
+        for text, seconds in turn.thinking:
+            lines.append(t.thinking(f"✻ 思考 · {_seconds(seconds)}"))
+            lines += [f"{t.thinking('│')} {t.muted(line)}" for line in wrap(text.strip(), width - 2)]
+        for record in turn.tools:
+            mark = t.error("✗") if record.is_error else t.success("✓")
+            took = f"  {t.muted(_seconds(record.took))}" if record.took is not None else ""
+            args = summarize_arguments(record.arguments)
+            lines.append(f"{mark} {t.accent(record.name, bold=True)} {t.muted(truncate(args, width - 20))}{took}")
+            if record.patch and self.show_diff:
+                lines += diff_block(record.patch, width, t, max_lines=EXPAND_RESULT_LINES)
+                continue
+            output = record.output.rstrip("\n").split("\n") if record.output.strip() else []
+            for line in output[:EXPAND_RESULT_LINES]:
+                lines.append(f"  {t.muted('│')} {truncate(line, width - 4)}")
+            if len(output) > EXPAND_RESULT_LINES:
+                lines.append(f"  {t.muted(f'… 还有 {len(output) - EXPAND_RESULT_LINES} 行')}")
+        # 不画收尾线：下面紧跟着输入框的上边线
+        self._emit([*lines, ""])
+
     # -- 事件处理 ------------------------------------------------------ #
 
     def _on_agent_start(self, event) -> None:
         self.agent_running = True
         own = self.state.own_prompt
         self.state = RenderState(turn_started=time.time(), own_prompt=own)
+        self.turn = TurnRecord()
         self.spinner.reset()
-        self.tool_count = self.tool_errors = 0
         self.ticker.start()
-        self._repaint()
+        self._set_status("思考中")
 
     def _on_turn_start(self, event) -> None:
-        self._set_status("等待中...")
+        self.state.call_started = time.time()
+        if not self.state.running:
+            self._set_status("思考中")
 
     def _on_message_update(self, event) -> None:
         inner = event.assistant_message_event
@@ -170,21 +262,13 @@ class SessionRenderer:
 
         if kind == "thinking_delta":
             self.state.thinking += inner.delta
-            if not self.show_thinking:
-                self._set_status("思考中...", self._tail(self.state.thinking))
-                return
-            if not self.state.thinking_started:
-                self.state.thinking_started = True
-                self.state.thinking_at = time.time()
-                self.live.finalize(["", self.theme.muted("╭─ 思考")])
-            self.streamer.feed(self.theme.thinking(inner.delta))
+            self._set_status("思考中")
 
         elif kind == "text_delta":
             if not self.state.text_started:
-                self.state.text_started = True
-                self._commit_thinking()
-                self.live.finalize([""])
-            self.streamer.feed(inner.delta)
+                self._begin_answer()
+            # 续行缩进，和 ● 后面的第一行对齐
+            self.streamer.feed(inner.delta.replace("\n", "\n" + INDENT))
 
     def _on_message_end(self, event) -> None:
         message = event.message
@@ -195,8 +279,9 @@ class SessionRenderer:
             if text.strip() == self.state.own_prompt.strip():
                 self.state.own_prompt = ""
                 return
-            self._flush()
-            self._emit(["", *user_message(message.text(), self.width, self.theme), ""])
+            # 途中插进来的消息（steering / follow-up）
+            self._flush_tools()
+            self.user_echo(text)
             return
         if role != "assistant":
             return
@@ -204,78 +289,81 @@ class SessionRenderer:
         self._commit_thinking()
         streamed = self.state.text_started
         self._flush()
-        self.live.finalize([""] if streamed else None)
-
-        if not streamed:
+        if streamed:
+            self.live.finalize()
+        else:
             text = message.text()
             if text.strip():          # 兜底：provider 没发 delta 的实现
-                self._emit(["", self.theme.accent("● 回答"), ""])
-                self._emit(markdown_lite(text, self.theme).split("\n") + [""])
+                self._begin_answer()
+                self._flush()
+                self.live.stream_text(markdown_lite(text, self.theme).replace("\n", "\n" + INDENT))
+                self.live.finalize()
 
         if getattr(message, "stop_reason", "") == "error":
-            self._emit([self.theme.error(f"  ✗ {message.error_message}"), ""])
+            self._flush_tools()
+            self._emit([self.theme.error(f"{INDENT}✗ {message.error_message}")])
 
         usage = getattr(message, "usage", None)
-        if usage and usage.input:
-            self.status.tokens += usage.total_tokens
+        if usage and (usage.input or usage.output):
+            self.status.tokens += usage.total_tokens or (usage.input + usage.output)
             self.status.cost += usage.cost.total
-            self._emit([
-                usage_line(
-                    usage.input, usage.output, usage.cost.total,
-                    time.time() - (self.state.turn_started or time.time()), self.theme,
-                ),
-                "",
-            ])
+            self.state.context_tokens = usage.input + usage.cache_read + usage.cache_write
+            self.state.output_tokens += usage.output
+            self.state.cost += usage.cost.total
         self.state.text_started = False
+        if not self.state.running:
+            self._set_status("思考中")
 
     def _on_tool_execution_start(self, event) -> None:
+        self._commit_thinking()
+        self._end_answer()
+        record = ToolRecord(event.tool_call_id, event.tool_name, event.arguments, time.time())
+        self.state.running[event.tool_call_id] = record
+        self.turn.tools.append(record)
         self.tool_count += 1
-        self._commit_thinking()          # 先给思考收尾，再显示工具
-        summary = summarize_arguments(event.arguments)
-        self.state.tool_at[event.tool_call_id] = time.time()
-        self._emit([tool_call(event.tool_name, summary, self.width, self.theme)])
-        self._set_status(f"执行 {event.tool_name}", summary)
+        self.state.tool_total += 1
+        self._repaint()
 
     def _on_tool_execution_update(self, event) -> None:
-        preview = event.partial.content[0].text if event.partial.content else ""
-        self._set_status(f"执行 {event.tool_name}", self._tail(preview))
+        self._repaint()
 
     def _on_tool_execution_end(self, event) -> None:
-        started = self.state.tool_at.pop(event.tool_call_id, None)
-        took = f"{time.time() - started:.1f}s" if started else ""
-        if event.is_error:
-            self.tool_errors += 1
-
-        t = self.theme
-        mark = t.error("✗") if event.is_error else t.success("✓")
+        record = self.state.running.pop(event.tool_call_id, None)
+        if record is None:
+            return
+        record.took = time.time() - record.started
+        record.is_error = bool(event.is_error)
         result = event.result
-        raw = result.content[0].text if result.content else ""
-        preview = first_line(raw, max(self.width - 20, 20))
-        line = f"  {mark} {t.muted(preview)}"
-        if took:
-            line += f"  {t.muted(took)}"
-        lines = [line]
-
+        record.output = "".join(getattr(c, "text", "") or "" for c in (result.content or []))
         details = result.details if isinstance(result.details, dict) else {}
-        if self.show_diff and details.get("patch"):
-            lines += diff_block(details["patch"], self.width, self.theme, max_lines=14)
-        self._emit(lines)
-        self._set_status("等待中...")
+        record.patch = details.get("patch")
+        if record.is_error:
+            self.tool_errors += 1
+        self.state.pending_tools.append(record)
+        self._repaint()
 
     def _on_agent_end(self, event) -> None:
         self.agent_running = False
         self.ticker.stop()
+        self._commit_thinking()
         self._flush()
         self.live.finalize()
+        self._flush_tools()
+        lines = []
         if event.reason not in ("stop", "terminated"):
-            self._emit([self.theme.warn(f"  · 结束原因：{event.reason}"), ""])
+            lines.append(self.theme.warn(f"{INDENT}· 结束原因：{event.reason}"))
+        lines += ["", self._turn_footer(), ""]
+        self._emit(lines)
+        self.last_turn = self.turn
 
     def _on_error(self, event) -> None:
         self.agent_running = False
         self.ticker.stop()
         self._flush()
         self.live.finalize()
-        self._emit([self.theme.error(f"  ✗ {event.error}"), ""])
+        self._flush_tools()
+        self._emit([self.theme.error(f"{INDENT}✗ {event.error}"), ""])
+        self.last_turn = self.turn
 
     # -- 压缩：同步进行，期间不执行任务，所以必须让用户看得到 ----------- #
 
@@ -299,26 +387,27 @@ class SessionRenderer:
         self._flush()
         self.live.finalize()
         if event.error:
-            lines = [t.warn(f"  · 压缩未执行：{event.error}")]
+            lines = [t.warn(f"{INDENT}· 压缩未执行：{event.error}")]
         elif event.cancelled:
-            lines = [t.warn("  · 已取消压缩，上下文保持原样")]
+            lines = [t.warn(f"{INDENT}· 已取消压缩，上下文保持原样")]
         elif event.skipped:
             return
         else:
             seq = (event.state or {}).get("seq")
             before, after = event.tokens_before, event.tokens_after or 0
             saved = f"，省 {round((1 - after / before) * 100)}%" if before else ""
-            lines = [t.accent(f"  ⟳ 上下文已压缩（第 {seq} 次）：{_k(before)} → {_k(after)} tokens{saved}")]
+            lines = [(f"{t.accent('⟳')} {t.muted(f'上下文已压缩（第 {seq} 次）：')}"
+                      f"{t.info(f'{_k(before)} → {_k(after)}')}{t.muted(f' tokens{saved}')}")]
             if event.degraded:
-                lines.append(t.warn("    摘要未能由模型生成，已降级为确定性记录（用户原话、文件、命令）"))
+                lines.append(t.warn(f"{INDENT}摘要未能由模型生成，已降级为确定性记录（用户原话、文件、命令）"))
             if event.restored:
-                lines.append(t.muted(f"    补回了模型遗漏的 {len(event.restored)} 条约束/决策/认知"))
-        self._emit([*lines, ""])
-        self._set_status("等待中...")
+                lines.append(t.muted(f"{INDENT}补回了模型遗漏的 {len(event.restored)} 条约束/决策/认知"))
+        self._emit(lines)
+        self._set_status("思考中")
 
     def _on_context_pruned(self, event) -> None:
         self._emit([self.theme.muted(
-            f"  · 已清理 {event.count} 个旧工具输出（可重新读取）："
+            f"{INDENT}已清理 {event.count} 个旧工具输出（可重新读取）："
             f"{_k(event.tokens_before)} → {_k(event.tokens_after)} tokens"
         )])
 
@@ -349,41 +438,98 @@ class SessionRenderer:
 
     # -- 内部 ---------------------------------------------------------- #
 
+    def _turn_footer(self) -> str:
+        t = self.theme
+        state = self.state
+        elapsed = time.time() - (state.turn_started or time.time())
+        parts = [f"{t.highlight('✻', bold=True)} {t.muted('用时')} {t.highlight(_seconds(elapsed), bold=True)}"]
+        if state.context_tokens:
+            parts.append(f"{t.muted('上下文')} {t.info('↑' + _k(state.context_tokens), bold=True)}")
+        if state.output_tokens:
+            parts.append(f"{t.muted('输出')} {t.success('↓' + _k(state.output_tokens), bold=True)}")
+        if state.tool_total:
+            parts.append(t.muted(f"{state.tool_total} 次工具"))
+        if state.cost:
+            parts.append(t.warn(f"¥{state.cost:.4f}"))
+        return f" {t.muted('·')} ".join(parts)
+
+    def _begin_answer(self) -> None:
+        """正文开始：先把思考和工具摘要收好，再以 ● 起头"""
+        self._commit_thinking()
+        self._flush_tools()
+        self._flush()
+        self.live.finalize()
+        self.state.text_started = True
+        self.live.stream_text(f"{self.theme.accent(ANSWER_MARK)} ")
+
+    def _end_answer(self) -> None:
+        if self.state.text_started:
+            self._flush()
+            self.live.finalize()
+            self.state.text_started = False
+
+    def _flush_tools(self) -> None:
+        """把攒着的工具收成一行：▸ 4 个工具调用 · bash ×2, read ×2 · 1 失败   ctrl+o 展开"""
+        tools = self.state.pending_tools
+        if not tools:
+            return
+        self.state.pending_tools = []
+        t = self.theme
+        counts = Counter(r.name for r in tools)
+        names = ", ".join(f"{n} ×{c}" if c > 1 else n for n, c in counts.most_common())
+        failed = sum(r.is_error for r in tools)
+        line = (f"{t.muted('▸')} {t.muted(f'{len(tools)} 个工具调用')} {t.muted('·')} "
+                f"{t.accent(truncate(names, max(self.width - 40, 20)))}")
+        if failed:
+            line += f" {t.muted('·')} {t.error(f'{failed} 失败')}"
+        line += f"   {t.muted(EXPAND_HINT)}"
+        self._flush()
+        self.live.finalize()
+        self.live.append([line])
+
     def _flush(self) -> None:
         """吐完缓冲里剩余的字。插入任何其它内容之前都要先调，否则顺序会乱。"""
         self.streamer.flush()
 
     def _commit_thinking(self) -> None:
-        """给思考收尾。
-
-        三个触发点：正文开始、工具开始、消息结束。只有第一个的话，"思考完
-        直接调工具"那一轮的思考会没有结尾，和工具日志连成一片。
-        """
-        if self.state.thinking_committed or not self.state.thinking.strip():
+        """思考收成一行：  思考了 1.2s（全文按 ctrl+o 展开）"""
+        text = self.state.thinking
+        if not text.strip():
             return
-        self.state.thinking_committed = True
-        if self.state.thinking_started:
-            self._flush()
-            elapsed = time.time() - self.state.thinking_at
-            self.live.stream_text("\n")
-            self._emit([self.theme.muted(f"╰─ 思考结束 · {elapsed:.1f}s"), ""])
-            return
+        self.state.thinking = ""
+        seconds = time.time() - (self.state.call_started or self.state.turn_started or time.time())
         if self.show_thinking:
-            self._emit(thinking_block(self.state.thinking, self.width, self.theme) + [""])
+            self.turn.thinking.append((text, seconds))
+        self._flush()
+        self.live.finalize()
+        self.live.append([self.theme.muted(f"{INDENT}思考了 {_seconds(seconds)}")])
 
     def _set_status(self, label: str, detail: str = "") -> None:
         self.state.label = label
         self.state.detail = detail
         self._repaint()
 
+    def _status_text(self) -> str:
+        t = self.theme
+        frame = t.accent(self.spinner.frame())
+        elapsed = t.muted(_seconds(time.time() - (self.state.turn_started or time.time())))
+        running = list(self.state.running.values())
+        if running:
+            # 只显示正在执行的那个工具，名字闪烁；不打印参数
+            current = running[-1]
+            on = int(time.time() * 2) % 2 == 0
+            name = t.accent(current.name, bold=True) if on else t.accent(current.name, dim=True)
+            more = t.muted(f" 等 {len(running)} 个") if len(running) > 1 else ""
+            took = t.muted(_seconds(time.time() - current.started))
+            return f"{frame} {name}{more}  {took}"
+        detail = f"  {t.muted(self.state.detail)}" if self.state.detail else ""
+        return f"{frame} {t.muted(self.state.label + '…')}  {elapsed}{detail}"
+
     def _repaint(self) -> None:
-        # 流式写入期间不画状态行，否则转圈会插进句子中间
-        if self.state.text_started or self.state.thinking_started:
-            if not self.state.thinking_committed and self.state.thinking_started:
-                return
-            if self.state.text_started:
-                return
-        self.live.update([self.spinner.render(self.state.label, self.state.detail)])
+        # 正文流式写入期间不画状态行，否则转圈会插进句子中间
+        if self.state.text_started:
+            return
+        self.live.update([self._status_text()])
 
     def _tail(self, text: str, limit: int = 60) -> str:
         flat = " ".join(text.split())

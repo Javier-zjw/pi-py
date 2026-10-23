@@ -67,6 +67,7 @@ pi-web（Vue 3 + Vite，只通过 HTTP/SSE 与 pi-server 通信）
 ### 各层职责
 
 - **pi-ai**：单次 LLM 调用。`Context` 可序列化；`Models` 注册表提供 `stream`/`complete`（provider 原生）与 `stream_simple`/`complete_simple`（统一 `reasoning`）。provider 只有 `anthropic-messages` 和 `openai-completions`（兼容端点）。凭证优先级：运行时 override > `auth.json` > 环境变量。
+  - 用量约定（同 Anthropic）：`usage.input` **不含**命中缓存的部分，上下文大小 = input + cache_read + cache_write。OpenAI 兼容端点的 `prompt_tokens` 包含缓存，必须减掉（`providers/openai.py::apply_openai_usage`，也认 DeepSeek 的 `prompt_cache_hit_tokens`）——曾因此把上下文算成两倍，导致清理/压缩反复误触发。
   - `errors.py`：HTTP 错误经 `describe_llm_error` 把响应体里的原因写进 `error_message`；`is_context_overflow` 识别各家"上下文超长"（不含限流）。
   - Anthropic 前缀缓存：`Model.prompt_cache`（models.json `"promptCache"`）为 None 时只对官方 Anthropic 开启；第三方 anthropic-messages 端点可能不认 `cache_control`，需显式开启。断点：system、最后一个工具、最后两条 user 角色消息。
 - **pi-agent**：`loop.py::run_agent_loop` 回合状态机 + `execute_tool_calls`（校验 → `before_tool_call` → 并行/串行执行 → `after_tool_call`）；`Agent` 管状态、事件、steering/follow-up 队列、abort。
@@ -87,7 +88,7 @@ pi-web（Vue 3 + Vite，只通过 HTTP/SSE 与 pi-server 通信）
   - 分工：`budget`（CJK 感知计量，以实报 usage 为锚）→ `cut`（按 token 预算保留尾部，不拆工具调用/结果）→ `engine`（只计算结果、不改会话）→ `AgentSession._apply_compaction`（落盘 + 替换消息，中间无 await）。
   - 压缩请求复用正文的 system prompt + tools + 消息前缀、`tool_choice="none"`，指令追加在末尾（`prompt.py`），为了命中前缀缓存；改动请求构造时保持前缀一致。
   - 状态磁盘存 JSON、给模型渲染成 Markdown（`state.py`）。用户原话、文件记录、命令由代码提取，模型只写需要理解的字段；`constraints/decisions/knowledge` 被模型漏掉时由代码补回。
-  - 分层：L1 `prune`（到 60% 时把受保护区间外的旧工具输出换成占位，清到 40%，不调模型）→ 仍超 85% 才 L2 摘要 → L3 `rehydrate`（摘要后把最近改过的文件当前内容和扩展片段附进状态消息）→ L4 超长兜底（服务商报超长时经 `on_stream_error`：L1 全清 + 保留尾部减半的 L2，重试本轮；每次 prompt 只救一次）。
+  - 分层：L1 `prune`（到 60% 时把受保护区间外的旧工具输出换成占位，清到 40%，不调模型；一次省不到可用窗口的 `minBatchRatio`（10%）就不清——清理会让前缀缓存整段失效，小批量清理得不偿失，超长兜底不受此限）→ 仍超 85% 才 L2 摘要 → L3 `rehydrate`（摘要后把最近改过的文件当前内容和扩展片段附进状态消息）→ L4 超长兜底（服务商报超长时经 `on_stream_error`：L1 全清 + 保留尾部减半的 L2，重试本轮；每次 prompt 只救一次）。
   - 触发点：`prompt()` 先压后跑（新请求不进压缩）、`transform_context` 每次调模型前检查。服务商出错、取消、没变小都保持原历史；格式两次不合格才降级。压缩期间到来的 `prompt()` 会等待它结束。
   - L1 只把内存里的消息换成**副本**（会话条目里的原对象不动，文件保留原文），清理集合存为 `context_prune` 条目、恢复时重放；清理前报的 usage 不能当锚（`AgentSession._anchor_floor` / `context_tokens(min_anchor=)`）。
   - 保留尾部里 assistant 的 usage 是压缩前的，状态消息 `details.tailLength` 标出这段，计量时不能当锚——否则会反复压缩。
@@ -96,7 +97,7 @@ pi-web（Vue 3 + Vite，只通过 HTTP/SSE 与 pi-server 通信）
   - 命令补全（`input.py`）：`LineReader(commands=...)` 行首输 `/` 弹菜单（`match_commands`：完全相同 > 名字前缀 > 别名前缀 > 包含）。`footer` 参数在输入行正下方插一行（插进 PromptSession 布局，并让输入窗口 `dont_extend_height`，否则会被挤到屏幕最底行）；菜单浮在输入窗口内，窗口高度由 `_input_height` 按**原始输入**的候选数撑开（↑↓ 浏览时输入框文字会变成选中项，按它算菜单会缩成一行）。菜单出来就高亮第一条但**只改下标不改文字**（`go_to_completion` 会把候选写进输入框，接着打字变成 `/helpm`）。回车 / Tab 不依赖异步补全结果，当场匹配（`_accept_command`），否则打字快时 `/mo` 回车会原样提交。ctrl+c 有字清空、空行退出。
   - Markdown（`markdown.py`）：`MarkdownStream` 按整行提交（`feed` 返回收齐的行，`preview` 给半行和没收齐的表格，`finish` 收尾），流式与一次性渲染结果必须一致；`wrap_ansi` 按显示宽度折行、样式跨行补回、句末标点不放行首（会越过连续标点往回带字）；`render_inline` 嵌套样式靠内层 RESET 后补回外层（`Theme.codes`）。不认识的写法原样输出。
   - 选择器（`picker.py`）：`PickerState` 纯状态可离线测，↑↓ 选行、←→ 切次要选项（思考档位）；`pick()` 是非全屏 prompt_toolkit 应用，选完擦掉，由调用方打一行结论。
-- **pi-app**：把 AgentSession 事件渲染到 pi-tui（`renderer.py`）。同 Codex——过程只占一块位置，结论留下来：运行中问题下面只有活动区（`_live_lines`：第一行转圈 + 本轮用时 + 状态；下面是思考 / 过渡话 / 工具，三者共用一块，后来的顶掉先来的，思考只显示最新 `SLOT_LINES` 行，工具只显示名字（闪烁）不带参数）。正文开始时还不知道是不是最终回答：先放活动区，这次调用以工具调用收尾就是过渡话（丢掉，记进 `TurnRecord.steps`），否则是回答；超过活动区行数的长文字直接当回答写出。回答经 `MarkdownStream` 排版：定稿的行用 `live.append(lines, live=预览)` 写进 scrollback（必须同时换掉预览，否则旧半行会在下面重复一帧），半行预览留在活动区。scrollback 里每轮只留「✻ 用时 · 工具 · ctrl+o 展开」（回答开始前写，`_commit_summary`）、空一行、以 ● 开头的回答、一行 token 统计；每次提问前空一行（`_blank_tail`）。`ctrl+o` / `/expand` 按发生顺序展开上一轮（`TurnRecord.steps`）。输入框上下各一条不带文字的细线夹住 `❯`（上沿 `input_prompt`、下沿 `input_footer`），提交后擦掉、由 `user_echo` 回显。
+- **pi-app**：把 AgentSession 事件渲染到 pi-tui（`renderer.py`）。同 Codex——过程只占一块位置，结论留下来：运行中问题下面只有活动区（`_live_lines`：第一行转圈 + 本轮用时 + 状态；下面是思考 / 过渡话 / 工具，三者共用一块，后来的顶掉先来的，思考只显示最新 `SLOT_LINES` 行，工具只显示名字（闪烁）不带参数）。正文开始时还不知道是不是最终回答：先放活动区，这次调用以工具调用收尾就是过渡话（丢掉，记进 `TurnRecord.steps`），否则是回答；超过活动区行数的长文字直接当回答写出。回答经 `MarkdownStream` 排版：定稿的行用 `live.append(lines, live=预览)` 写进 scrollback（必须同时换掉预览，否则旧半行会在下面重复一帧），半行预览留在活动区。L1 清理不单独打行，计数显示在活动区第一行、并进用时行。scrollback 里每轮只留「✻ 用时 · 工具 · ctrl+o 展开」（回答开始前写，`_commit_summary`）、空一行、以 ● 开头的回答、一行 token 统计；每次提问前空一行（`_blank_tail`）。`ctrl+o` / `/expand` 按发生顺序展开上一轮（`TurnRecord.steps`）。输入框上下各一条不带文字的细线夹住 `❯`（上沿 `input_prompt`、下沿 `input_footer`），提交后擦掉、由 `user_echo` 回显。
   - 斜杠命令（`commands.py` 命令表 → 补全菜单和 `/help` 共用；`app.py::App` 分派）：对齐 Claude Code——`/model`（选择器，↑↓ 模型 ←→ 思考档位；`/model <spec>` 直接切）、`/clear`（`/new` `/reset`，沿用模型和档位）、`/resume`（`pi_coding_agent.session.list_sessions`，跳过空会话，切换后回顾最近对话）、`/compact`、`/context`、`/cost`（`/usage`）、`/status`（`/session`）；另有 `/think` `/continue` `/tools` `/expand`。扩展命令经 `session.run_command`，提示模板交给 `prompt()` 展开；像命令名的未知 `/xxx` 报错，`/usr/bin` 这类照常发给模型。换会话用 `App._replace_session`：复用 services、改订阅、`renderer.reset()`。
   - 测试里用 `ScriptedApp` 覆盖 `App.pick` 返回预设结果；真终端效果用 pexpect + pyte 驱动（要回应 CPR `\x1b[6n`）。
 - **pi-server**：`dto.py`（事件 → SSE 帧，**前后端唯一契约**）、`registry.py`（会话注册 + 事件扇出）、`workspace.py`（历史解析、文件浏览，`resolve_within()` 越界 403）都**不 import fastapi**，`app.py` 只是薄路由层。前端优先用 `pi_server/web/`（Vite 构建产物），不存在时回退 `pi_server/static/index.html`。新增 SSE 帧类型要同时改 `dto.py` 和 `pi-web/src/App.vue` 的 `handle()`。
@@ -110,6 +111,6 @@ pi-web（Vue 3 + Vite，只通过 HTTP/SSE 与 pi-server 通信）
 
 `pi`（`extensions.py::ExtensionAPI`）提供 `register_tool` / `register_command` / `register_mode` / `before_agent_start` / `transform_context` / `compaction_context`（压缩后补回给模型的片段）/ `on(event_type)` / `events`（扩展间总线）/ `state` / `session` / `send_message`。加载或钩子异常都会被捕获并记入 `LoadedExtension.error` → `services.diagnostics`，不会让 CLI 起不来。注册项按 `api.owner` 归属到扩展。`settings.disabledExtensions` 中的扩展仍会列出但不执行 `activate`。
 
-当前唯一的内置扩展是 `builtin_extensions/plan_mode.py`（`chat`/`plan` 模式 + `/plan` `/build` `/show_plan` 命令，并通过 `compaction_context` 在压缩后补回当前计划），可作为模板。SUMMARY.md 提到的 `subagents.py`、`mcp.py` 尚未在仓库中。
+内置扩展：`builtin_extensions/plan_mode.py`（`chat`/`plan` 模式 + `/plan` `/build` `/show_plan` 命令，并通过 `compaction_context` 在压缩后补回当前计划），可作为模板；`tool_budget.py`（一次请求工具调用到 `toolBudget.softLimit` 次时用 steering 插一条 `CustomMessage` 提醒模型收尾，之后每 `every` 次再提醒，不打断；`details.notice` 供界面显示一行说明）。SUMMARY.md 提到的 `subagents.py`、`mcp.py` 尚未在仓库中。
 
 注意 `pi.register_tool` 注册的工具会进入**每个** AgentSession 的工具基线（也会出现在网页的工具选择里）。只属于某个模式的工具（如 `submit_plan`）应直接构造 `AgentTool`，在该模式的 `apply` 里挂上。内置扩展总会被加载，断言扩展列表的测试要把它们算进去。

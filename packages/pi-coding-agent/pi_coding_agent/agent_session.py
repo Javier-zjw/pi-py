@@ -345,7 +345,9 @@ class AgentSession:
             budget.protect if protect_tokens is None else protect_tokens,
             budget.prune_min_tokens,
         )
-        if not plan.tool_call_ids:
+        # 平时一次至少要省下 prune_min_batch（见 CompactionBudget）；超长兜底（显式给了目标）不设下限
+        min_saving = budget.prune_min_batch if target_tokens is None else 0
+        if not plan.tool_call_ids or plan.tokens_saved < min_saving:
             return False
         messages, count = apply_prune(self.agent.state.messages, plan.tool_call_ids)
         self._swap_messages(messages)

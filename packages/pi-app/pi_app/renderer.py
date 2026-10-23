@@ -183,6 +183,9 @@ class SessionRenderer:
         self.ticker = Ticker(self._repaint, interval=0.1)
         # 最后写出的一行是不是空行：提问前补空行时用，避免连着两个空行
         self._blank_tail = True
+        # 本轮清理旧工具输出的次数和省下的 tokens（写进「✻ 用时」那一行后清零）
+        self._prune_times = 0
+        self._pruned_tokens = 0
         self.state = RenderState()
         self.turn = TurnRecord()
         self.last_turn: TurnRecord | None = None
@@ -327,6 +330,11 @@ class SessionRenderer:
         role = getattr(message, "role", "")
 
         if role in ("user", "custom"):
+            details = getattr(message, "details", None) if role == "custom" else None
+            if isinstance(details, dict) and details.get("notice"):
+                # 扩展插进来的提醒（如 tool_budget）：一行说明，不当成用户说的话回显
+                self._emit([f"{INDENT}{self.theme.warn('⚑')} {self.theme.muted(details['notice'])}"])
+                return
             text = message.text()
             if text.strip() == self.state.own_prompt.strip():
                 self.state.own_prompt = ""
@@ -465,10 +473,11 @@ class SessionRenderer:
         self._set_status("思考中")
 
     def _on_context_pruned(self, event) -> None:
-        self._emit([self.theme.muted(
-            f"{INDENT}已清理 {event.count} 个旧工具输出（可重新读取）："
-            f"{_k(event.tokens_before)} → {_k(event.tokens_after)} tokens"
-        )])
+        """L1 清理不单独占一行（一轮里可能有好几次，会刷屏）：计数，运行中显示在活动区第一行，
+        结束后并进本轮的「✻ 用时」那一行。清理可能发生在一轮开始之前，所以计数不放在 RenderState"""
+        self._prune_times += 1
+        self._pruned_tokens += max(event.tokens_before - event.tokens_after, 0)
+        self._repaint()
 
     # -- 汇总 ---------------------------------------------------------- #
 
@@ -507,6 +516,7 @@ class SessionRenderer:
         self.last_turn = None
         self.tool_count = 0
         self.tool_errors = 0
+        self._prune_times = self._pruned_tokens = 0
         self.status.tokens = 0
         self.status.cost = 0.0
 
@@ -556,6 +566,8 @@ class SessionRenderer:
             failed = sum(r.is_error for r in tools)
             if failed:
                 parts.append(t.error(f"{failed} 失败"))
+        if self._prune_times:
+            parts.append(t.muted(f"清理旧输出 {self._prune_times} 次 −{_k(self._pruned_tokens)}"))
         line = f" {t.muted('·')} ".join(parts)
         if self.turn.steps:
             line += f"   {t.muted(EXPAND_HINT)}"
@@ -580,6 +592,7 @@ class SessionRenderer:
         self.state.summary_done = True
         self.live.finalize()
         self._emit([self._turn_summary()])
+        self._prune_times = self._pruned_tokens = 0
 
     def _begin_answer(self, text: str) -> None:
         """确定是最终回答：活动区收起，先写本轮用时，空一行，再以 ● 起头按 Markdown 排版写正文"""
@@ -656,6 +669,8 @@ class SessionRenderer:
         head = f"{frame} {elapsed} {t.muted('· ' + self.state.label)}"
         if self.state.tool_total:
             head += t.muted(f" · {self.state.tool_total} 次工具")
+        if self._prune_times:
+            head += t.muted(f" · 清理 {self._prune_times} 次")
         lines = [head + detail]
         slot = self.state.slot
         if slot == "tools" and self.state.batch:

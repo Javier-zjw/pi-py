@@ -153,6 +153,24 @@ def build_payload(model: Model, context: Context, options: StreamOptions) -> dic
     return payload
 
 
+
+def apply_openai_usage(target, usage: dict) -> None:
+    """OpenAI 兼容端点的用量 → pi 的 Usage。
+
+    OpenAI 的 prompt_tokens **包含**命中缓存的部分（cached_tokens 是它的子集），而 pi 的约定
+    （同 Anthropic）是 input 只算没命中缓存的。直接把 prompt_tokens 记成 input、再把 cached_tokens
+    记成 cache_read，缓存部分就算了两遍：上下文计量翻倍（压缩、清理误触发）、费用也多算。
+    DeepSeek 另给 prompt_cache_hit_tokens，含义相同。"""
+    details = usage.get("prompt_tokens_details") or {}
+    cached = details.get("cached_tokens") or usage.get("prompt_cache_hit_tokens") or 0
+    prompt = usage.get("prompt_tokens") or 0
+    if prompt:
+        target.input = max(prompt - cached, 0)
+    if cached:
+        target.cache_read = min(cached, prompt) if prompt else cached
+    if usage.get("completion_tokens"):
+        target.output = usage["completion_tokens"]
+
 class OpenAIProvider:
     api = "openai-completions"
 
@@ -208,13 +226,7 @@ class OpenAIProvider:
                 usage = data.get("usage")
 
                 if usage:
-                    if usage.get("prompt_tokens"):
-                        message.usage.input = usage["prompt_tokens"]
-                    if usage.get("completion_tokens"):
-                        message.usage.output = usage["completion_tokens"]
-                    details = usage.get("prompt_tokens_details") or {}
-                    if details.get("cached_tokens"):
-                        message.usage.cache_read = details["cached_tokens"]
+                    apply_openai_usage(message.usage, usage)
 
                 choices = data.get("choices") or []
                 if not choices:

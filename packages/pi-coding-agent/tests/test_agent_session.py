@@ -24,7 +24,7 @@ sys.path.insert(0, str(HERE.parents[1]))
 sys.path.insert(0, str(HERE.parents[2] / "pi-agent"))
 sys.path.insert(0, str(HERE.parents[2] / "pi-ai"))
 
-from fakes import BIG_MODEL, FAKE_MODEL, Sandbox, fake_models  # noqa: E402
+from fakes import BIG_MODEL, FAKE_MODEL, Sandbox, fake_models, scripted_stream  # noqa: E402
 
 from pi_agent import AgentToolResult, CustomMessage, ToolContext  # noqa: E402
 from pi_ai import (  # noqa: E402
@@ -568,6 +568,60 @@ async def case_prune_ignores_stale_usage() -> None:
         session.messages.pop()
         check("清理: 清理之前的 usage 不当锚", session.context_tokens() < 14_000,
               str(session.context_tokens()))
+
+
+async def case_prune_skips_small_batches() -> None:
+    """一次清理省不到 minBatchRatio 就不清：清理会让前缀缓存整段失效，省一点不值得"""
+    with Sandbox() as cwd:
+        write_files(cwd, 6)
+        session, provider = compaction_session(cwd, read_script(6), tools=["read"], usage=Usage())
+        session.settings.set("compaction.prune.protectTokens", 3000)
+        session.settings.set("compaction.prune.minBatchRatio", 0.95)
+        events = record(session)
+        await session.prompt("把 f0 到 f5 都读一遍")
+        check("清理: 省得太少时不清理", "context_pruned" not in [e.type for e in events],
+              str([e.type for e in events]))
+        # 不清理就一直涨到 L2 摘要线；在那之前每次请求的前缀都原样不动，缓存可以一直命中
+        contexts = [[m.text() for m in call["context"].messages] for call in provider.calls[1:]
+                    if call["context"].messages]
+        before = [c for c in contexts if not c[0].startswith("<compacted_state")]
+        check("清理: 不清理时前面的消息原样不动（前缀缓存可以一直命中）",
+              len(before) >= 3 and all(c[:len(before[0])] == before[0] for c in before),
+              str(len(before)))
+        check("清理: 涨到摘要线后照常走 L2", "compaction_end" in [e.type for e in events])
+        budget = session.compaction_budget()
+        check("清理: 门槛按可用窗口算", budget.prune_min_batch == int(budget.usable * 0.95),
+              str(budget.prune_min_batch))
+        check("清理: 超长兜底（显式目标）不受门槛限制",
+              session.prune(budget, target_tokens=0, protect_tokens=1) is True)
+
+
+async def case_tool_budget() -> None:
+    """一次请求工具调用太多：到 softLimit 次插一条提醒让模型收尾，之后每 every 次再提醒"""
+    with Sandbox() as cwd:
+        write_files(cwd, 6)
+        session, provider = compaction_session(cwd, read_script(6), tools=["read"], usage=Usage())
+        session.settings.set("compaction.enabled", False)
+        session.settings.set("toolBudget.softLimit", 3)
+        session.settings.set("toolBudget.every", 2)
+        await session.prompt("把 f0 到 f5 都读一遍")
+        reminders = [m for m in session.messages
+                     if getattr(m, "role", "") == "custom" and m.custom_type == "tool_budget"]
+        check("预算: 第 3、5 次工具之后各提醒一次", [m.details["count"] for m in reminders] == [3, 5],
+              str([m.details for m in reminders]))
+        index = next(i for i, call in enumerate(provider.calls)
+                     if any("已经调用了 3 次工具" in m.text() for m in call["context"].messages))
+        check("预算: 提醒在第 3 次工具之后、下一次调模型时送到", index == 3, str(index))
+        sent = [m for m in provider.calls[index]["context"].messages if "已经调用了 3 次工具" in m.text()]
+        check("预算: 模型看到的是一条用户消息", sent and sent[0].role == "user")
+        check("预算: 不打断，这一轮照常跑完", session.messages[-1].text() == "都读完了")
+
+        session.settings.set("toolBudget.enabled", False)
+        provider.fn = scripted_stream(read_script(6))
+        before = len(session.messages)
+        await session.prompt("再读一遍")
+        check("预算: 关掉后不提醒", not any(getattr(m, "role", "") == "custom"
+                                          for m in session.messages[before:]))
 
 
 async def case_prune_disabled() -> None:
@@ -1325,6 +1379,14 @@ def test_prune_ignores_stale_usage() -> None:
     asyncio.run(case_prune_ignores_stale_usage())
 
 
+def test_prune_skips_small_batches() -> None:
+    asyncio.run(case_prune_skips_small_batches())
+
+
+def test_tool_budget() -> None:
+    asyncio.run(case_tool_budget())
+
+
 def test_prune_disabled() -> None:
     asyncio.run(case_prune_disabled())
 
@@ -1441,6 +1503,8 @@ async def main() -> int:
     await case_manual_compact()
     await case_prune_in_tool_loop()
     await case_prune_ignores_stale_usage()
+    await case_prune_skips_small_batches()
+    await case_tool_budget()
     await case_prune_disabled()
     await case_rehydrate_after_compaction()
     await case_rehydrate_hook_failure()

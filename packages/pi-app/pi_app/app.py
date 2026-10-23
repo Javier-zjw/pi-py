@@ -249,6 +249,7 @@ class App:
             key_handlers={"c-o": self.renderer.expand_last_turn},
             erase_when_done=True,
             commands=self.slash_commands,
+            footer=self.renderer.input_footer,
         )
         hint = missing_dependency_hint(self.theme)
         if hint:

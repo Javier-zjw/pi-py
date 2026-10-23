@@ -61,7 +61,8 @@ SCRIPT = [
 ]
 
 
-async def run_turn(cwd: Path, script: list[list]) -> tuple[SessionRenderer, io.StringIO, AgentSession]:
+async def run_turn(cwd: Path, script: list[list], show_thinking: bool = True
+                   ) -> tuple[SessionRenderer, io.StringIO, AgentSession]:
     (cwd / "README.md").write_text("# demo\n说明文档\n", "utf-8")
     (cwd / "app.py").write_text("def main():\n    print('hi')\n", "utf-8")
     models, _ = fake_models(script, usage=Usage(input=4130, output=86))
@@ -70,7 +71,7 @@ async def run_turn(cwd: Path, script: list[list]) -> tuple[SessionRenderer, io.S
     session = AgentSession(services, SessionManager.in_memory(cwd), model=FAKE_MODEL,
                            tools=["bash", "read"])
     out = io.StringIO()
-    renderer = SessionRenderer(theme=Theme(ColorMode.NONE), stream=out)
+    renderer = SessionRenderer(theme=Theme(ColorMode.NONE), stream=out, show_thinking=show_thinking)
     session.subscribe(renderer.on_event)
     renderer.state.own_prompt = "查看一下当前代码"
     await session.prompt("查看一下当前代码")
@@ -92,19 +93,52 @@ async def case_collapsed_turn() -> None:
         check("收起: 摘要带名字和次数", "bash ×2" in summary[0] and "read ×2" in summary[0], summary[0])
         check("收起: 失败数醒目标出", "1 失败" in summary[0], summary[0])
         check("收起: 提示怎么展开", "ctrl+o 展开" in summary[0])
-        check("思考: 只留一行时长", any(line.strip().startswith("思考了") for line in lines)
-              and "先列目录" not in text, text)
+        check("思考: 实时显示思考原文", "✻ 思考" in text and "  用户想看代码，我先列目录，再读关键文件。" in lines,
+              text)
+        check("思考: 显示原文时不再打「思考了」", "思考了" not in text, text)
         answer = next((i for i, line in enumerate(lines) if line.startswith("● ")), None)
         check("回答: 以 ● 开头", answer is not None, text)
         check("回答: 续行缩进两格", answer is not None and lines[answer + 1].startswith("  - README.md"),
               str(lines[answer:answer + 3]))
         check("回答: 工具摘要在回答之前", text.index("个工具调用") < text.index("● "))
-        footers = [line for line in lines if "用时" in line]
+        footers = [line for line in lines if "↑" in line and "↓" in line]
         check("统计: 每轮只有一行", len(footers) == 1, str(footers))
         check("统计: 上下文取最后一次、输出累加",
-              "上下文 ↑4.1k" in footers[0] and "输出 ↓344" in footers[0] and "4 次工具" in footers[0],
+              "↑4.1k" in footers[0] and "↓344" in footers[0] and "4 次工具" in footers[0],
               footers[0])
+        check("统计: 不带文字标签，以用时开头",
+              footers[0].split(" · ")[0].endswith("s") and not any(
+                  word in footers[0] for word in ("用时", "上下文", "输出", "✻")), footers[0])
         check("统计: 不再每次调模型都打一行", "↑4130" not in text)
+
+
+async def case_thinking_order() -> None:
+    """多次调模型：思考 → 工具摘要 → 思考 → 回答，按真实顺序；思考的多余空行被压掉"""
+    script = [
+        [ThinkingContent(thinking="\n\n先看目录。\n\n\n\n再决定读哪个文件。\n\n"),
+         ToolCall(id="t1", name="bash", arguments={"command": "ls"})],
+        [ThinkingContent(thinking="README 最关键。"),
+         ToolCall(id="t2", name="read", arguments={"path": "README.md"})],
+        [ThinkingContent(thinking="可以回答了。"), TextContent(text="这是一个示例项目。")],
+    ]
+    with Sandbox() as cwd:
+        _renderer, out, _ = await run_turn(cwd, script)
+        text = out.getvalue()
+        lines = text.splitlines()
+        marks = [text.index(m) for m in ("先看目录", "1 个工具调用 · bash", "README 最关键",
+                                         "1 个工具调用 · read", "可以回答了", "● 这是一个示例项目")]
+        check("顺序: 思考 → 工具 → 思考 → 工具 → 思考 → 回答", marks == sorted(marks), text)
+        check("思考: 每次调用一个标题", text.count("✻ 思考") == 3, text)
+        check("思考: 开头的空行去掉", lines[lines.index("✻ 思考") + 1] == "  先看目录。", text)
+        check("思考: 连续空行压成一行，续行缩进",
+              "  先看目录。\n  \n  再决定读哪个文件。\n" in text, repr(text))
+        check("思考: 段尾空行不写出", "再决定读哪个文件。\n▸" in text, repr(text))
+
+    with Sandbox() as cwd:
+        _renderer, out, _ = await run_turn(cwd, list(SCRIPT), show_thinking=False)
+        text = out.getvalue()
+        check("--no-thinking: 收成一行时长", "思考了" in text and "先列目录" not in text
+              and "✻ 思考" not in text, text)
 
 
 async def case_expand() -> None:
@@ -119,13 +153,15 @@ async def case_expand() -> None:
               and "cat missing.txt" in expanded, expanded)
         check("展开: 工具结果", "# demo" in expanded and "def main" in expanded)
         check("展开: 失败的工具标 ✗", "✗ bash" in expanded, expanded)
-        check("展开: 提示行里出现 ctrl+o", "ctrl+o 展开" in renderer.input_prompt())
+        prompt = renderer.input_prompt()
+        check("输入框: 上沿是不带文字的细线", prompt.split("\n")[0].strip("─ ") == ""
+              and "ctrl+o" not in prompt and "tok" not in prompt, prompt)
+        check("输入框: 下沿也是细线", renderer.input_footer().strip("─ ") == "")
 
     out = io.StringIO()
     fresh = SessionRenderer(theme=Theme(ColorMode.NONE), stream=out)
     fresh.expand_last_turn()
     check("展开: 还没有轮次时给提示", "没有可展开" in out.getvalue())
-    check("展开: 没有可展开内容时提示行不出现 ctrl+o", "ctrl+o" not in fresh.input_prompt())
 
 
 def test_running_status() -> None:
@@ -171,6 +207,10 @@ def test_expand() -> None:
     asyncio.run(case_expand())
 
 
+def test_thinking_order() -> None:
+    asyncio.run(case_thinking_order())
+
+
 def test_steering_echo() -> None:
     asyncio.run(case_steering_echo())
 
@@ -178,6 +218,8 @@ def test_steering_echo() -> None:
 async def main() -> int:
     print("收起与统计")
     await case_collapsed_turn()
+    print("思考")
+    await case_thinking_order()
     print("展开")
     await case_expand()
     print("状态行与回显")

@@ -3,25 +3,31 @@
 一轮的样子（过程收起，结论突出）：
 
     ❯ 查看一下当前代码
-      思考了 1.2s
+    ✻ 思考
+      用户想看代码，我先列目录，再读关键文件。
     ▸ 4 个工具调用 · bash ×2, read ×2 · 1 失败   ctrl+o 展开
     ● 当前目录是一个很小的示例项目：
       - README.md：说明文档
 
-    ✻ 用时 7.9s · 上下文 ↑4.1k · 输出 ↓86
+    7.9s · ↑4.1k · ↓86
 
 设计原则：
 
-1. **过程收起、结论突出**。思考和工具只留一行摘要；运行时底部只有一行状态，
+1. **思考实时可见**（同 Codex / Claude Code）：每次调模型的思考以「✻ 思考」开头，
+   斜体、思考色，和正文一样匀速流式写进 scrollback；思考 → 工具 → 思考 → 回答按真实顺序排列。
+   ``--no-thinking`` 时退回成一行「思考了 1.2s」。
+   **工具收起**：只留一行摘要；运行时底部只有一行状态，
    显示正在执行的那个工具（名字闪烁），不打印参数。细节按 ctrl+o（或 /expand）
    展开上一轮再看。
 2. **正文真流式**，经 TextStreamer 匀速吐字；以 ● 开头，续行缩进两格。
-3. **每轮一行统计**，亮色：用时、上下文大小、输出 token。不再每次调用模型都打一行。
+3. **每轮一行统计**，亮色、不带文字标签：用时 · ↑上下文 · ↓输出。不再每次调用模型都打一行。
+4. **输入框**上下各一条细线，线上不放模型、token 之类的文字。
 """
 
 from __future__ import annotations
 
 import json
+import re
 import sys
 import time
 from collections import Counter
@@ -123,6 +129,8 @@ class RenderState:
     # 这次调用模型的开始时间：思考时长从这里算（等第一个 token 也是思考的一部分）
     call_started: float = 0.0
     text_started: bool = False
+    thinking_open: bool = False     # 正在流式写一段思考
+    thinking_hold: str = ""         # 思考末尾的空白先扣着，后面有字才写，免得段尾留空行
     turn_started: float = 0.0
     label: str = "思考中"
     detail: str = ""
@@ -154,6 +162,7 @@ class SessionRenderer:
         self.spinner = Spinner(self.theme)
         self.ticker = Ticker(self._repaint, interval=0.1)
         self.streamer = TextStreamer(self.live.stream_text)
+        self.thinking_streamer = TextStreamer(self._write_thinking)
         self.state = RenderState()
         self.turn = TurnRecord()
         self.last_turn: TurnRecord | None = None
@@ -194,21 +203,18 @@ class SessionRenderer:
         self._emit(out)
 
     def input_prompt(self) -> str:
-        """输入框：一条带提示的细线 + ❯。配合 LineReader 的 erase_when_done，提交后整块擦掉
+        """输入框上沿 + ❯。和 Claude Code 一样上下各一条细线把输入夹住，线上不带任何文字；
+        下沿由 LineReader 的 footer 画（input_footer）。配合 erase_when_done，提交后整块擦掉
 
-            ── glm-5.2 · 16.9k tok · ctrl+o 展开 · /help ──────────────
+            ────────────────────────────
             ❯ _
+            ────────────────────────────
         """
-        bits = [self.status.model]
-        if self.status.thinking and self.status.thinking != "off":
-            bits.append(f"think {self.status.thinking}")
-        if self.status.tokens:
-            bits.append(f"{_k(self.status.tokens)} tok")
-        if self.last_turn and (self.last_turn.tools or self.last_turn.thinking):
-            bits.append(EXPAND_HINT)
-        bits.append("/help")
-        label = " · ".join(b for b in bits if b)
-        return f"{rule(self.width, label, self.theme)}\n{self.theme.accent('❯', bold=True)} "
+        return f"{rule(self.width, '', self.theme)}\n{self.theme.accent('❯', bold=True)} "
+
+    def input_footer(self) -> str:
+        """输入框下沿"""
+        return rule(self.width, "", self.theme)
 
     def on_event(self, event: Any) -> None:
         handler = getattr(self, f"_on_{event.type}", None)
@@ -218,6 +224,7 @@ class SessionRenderer:
     def stop(self) -> None:
         self.ticker.stop()
         self.streamer.stop()
+        self.thinking_streamer.stop()
         self.live.finalize()
 
     def expand_last_turn(self) -> None:
@@ -261,7 +268,7 @@ class SessionRenderer:
 
     def _on_turn_start(self, event) -> None:
         self.state.call_started = time.time()
-        if not self.state.running:
+        if not self.state.running and not self.state.thinking_open:
             self._set_status("思考中")
 
     def _on_message_update(self, event) -> None:
@@ -270,7 +277,13 @@ class SessionRenderer:
 
         if kind == "thinking_delta":
             self.state.thinking += inner.delta
-            self._set_status("思考中")
+            if self.show_thinking:
+                self._stream_thinking(inner.delta)
+            else:
+                self._set_status("思考中")
+
+        elif kind == "thinking_end":
+            self._commit_thinking()
 
         elif kind == "text_delta":
             if not self.state.text_started:
@@ -367,6 +380,7 @@ class SessionRenderer:
     def _on_error(self, event) -> None:
         self.agent_running = False
         self.ticker.stop()
+        self._commit_thinking()
         self._flush()
         self.live.finalize()
         self._flush_tools()
@@ -495,11 +509,12 @@ class SessionRenderer:
         t = self.theme
         state = self.state
         elapsed = time.time() - (state.turn_started or time.time())
-        parts = [f"{t.highlight('✻', bold=True)} {t.muted('用时')} {t.highlight(_seconds(elapsed), bold=True)}"]
+        # 只留数字和箭头：3.5s · ↑911 · ↓99（↑ 上下文，↓ 输出）
+        parts = [t.highlight(_seconds(elapsed), bold=True)]
         if state.context_tokens:
-            parts.append(f"{t.muted('上下文')} {t.info('↑' + _k(state.context_tokens), bold=True)}")
+            parts.append(t.info("↑" + _k(state.context_tokens), bold=True))
         if state.output_tokens:
-            parts.append(f"{t.muted('输出')} {t.success('↓' + _k(state.output_tokens), bold=True)}")
+            parts.append(t.success("↓" + _k(state.output_tokens), bold=True))
         if state.tool_total:
             parts.append(t.muted(f"{state.tool_total} 次工具"))
         if state.cost:
@@ -542,17 +557,54 @@ class SessionRenderer:
 
     def _flush(self) -> None:
         """吐完缓冲里剩余的字。插入任何其它内容之前都要先调，否则顺序会乱。"""
+        self.thinking_streamer.flush()
         self.streamer.flush()
 
+    def _write_thinking(self, text: str) -> None:
+        # 每块单独上色：中间可能插进别的输出，样式不能跨块延续
+        self.live.stream_text(self.theme.thinking(text, italic=True))
+
+    def _begin_thinking(self) -> None:
+        """一段思考开始：先把上一次调用的工具摘要落盘（保持真实顺序），再写标题"""
+        self._end_answer()
+        self._flush_tools()
+        self._flush()
+        self.live.finalize()
+        self.live.append([f"{self.theme.thinking('✻', bold=True)} {self.theme.thinking('思考', bold=True)}"])
+        self.state.thinking_open = True
+        self.state.thinking_hold = ""
+        self.live.stream_text(INDENT)
+
+    def _stream_thinking(self, delta: str) -> None:
+        if not self.state.thinking_open:
+            delta = delta.lstrip()
+            if not delta:
+                return
+            self._begin_thinking()
+        text = self.state.thinking_hold + delta.replace("\r", "")
+        body = text.rstrip()
+        self.state.thinking_hold = text[len(body):]
+        if body:
+            # 连续空行压成一行；续行缩进两格，和标题下第一行对齐
+            body = re.sub(r"\n\s*\n\s*\n+", "\n\n", body)
+            self.thinking_streamer.feed(body.replace("\n", "\n" + INDENT))
+
     def _commit_thinking(self) -> None:
-        """思考收成一行：  思考了 1.2s（全文按 ctrl+o 展开）"""
+        """一段思考结束。流式模式下正文已经写出去了，这里收尾；
+        --no-thinking 时收成一行：  思考了 1.2s（全文按 ctrl+o 展开）"""
         text = self.state.thinking
         if not text.strip():
+            self.state.thinking = ""
             return
         self.state.thinking = ""
         seconds = time.time() - (self.state.call_started or self.state.turn_started or time.time())
-        if self.show_thinking:
-            self.turn.thinking.append((text, seconds))
+        self.turn.thinking.append((text, seconds))
+        if self.state.thinking_open:
+            self.thinking_streamer.flush()
+            self.state.thinking_open = False
+            self.state.thinking_hold = ""
+            self.live.finalize()
+            return
         self._flush()
         self.live.finalize()
         self.live.append([self.theme.muted(f"{INDENT}思考了 {_seconds(seconds)}")])
@@ -579,8 +631,8 @@ class SessionRenderer:
         return f"{frame} {t.muted(self.state.label + '…')}  {elapsed}{detail}"
 
     def _repaint(self) -> None:
-        # 正文流式写入期间不画状态行，否则转圈会插进句子中间
-        if self.state.text_started:
+        # 正文、思考流式写入期间不画状态行，否则转圈会插进句子中间
+        if self.state.text_started or self.state.thinking_open:
             return
         self.live.update([self._status_text()])
 

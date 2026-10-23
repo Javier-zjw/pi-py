@@ -68,6 +68,10 @@ def test_match_commands() -> None:
     check("补全: 敲了空格（在输参数）不再补", match_commands("/model ", COMMANDS) == [])
     check("补全: 不是 / 开头不补", match_commands("model", COMMANDS) == [])
     check("补全: 无匹配为空", match_commands("/usr/bin", COMMANDS) == [])
+    extra = [SlashCommand("planner"), SlashCommand("plan")]
+    check("补全: 名字完全相同的排最前", names(match_commands("/plan", extra)) == ["plan", "planner"])
+    check("补全: 别名完全相同的也排最前",
+          names(match_commands("/session", [SlashCommand("sessions"), *COMMANDS]))[0] == "status")
 
 
 def test_completer() -> None:

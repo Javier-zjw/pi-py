@@ -23,7 +23,9 @@ try:  # 可选依赖，缺了也能跑
     from prompt_toolkit import PromptSession
     from prompt_toolkit.application import run_in_terminal
     from prompt_toolkit.completion import Completer, Completion
-    from prompt_toolkit.filters import has_completions
+    from prompt_toolkit.document import Document
+    from prompt_toolkit.enums import DEFAULT_BUFFER
+    from prompt_toolkit.filters import Condition, has_focus
     from prompt_toolkit.formatted_text import ANSI
     from prompt_toolkit.history import FileHistory
     from prompt_toolkit.key_binding import KeyBindings
@@ -52,23 +54,26 @@ Commands = Iterable[SlashCommand] | Callable[[], Iterable[SlashCommand]]
 def match_commands(text: str, commands: Iterable[SlashCommand]) -> list[SlashCommand]:
     """输入框内容 → 候选命令。只在行首是 / 且还没敲空格（还在输命令名）时给候选。
 
-    排序：名字前缀匹配 > 别名前缀匹配 > 名字里包含，各组内保持传入顺序。
+    排序：名字或别名完全相同 > 名字前缀 > 别名前缀 > 名字里包含，各组内保持传入顺序。
     """
     if not text.startswith("/") or any(ch.isspace() for ch in text):
         return []
     query = text[1:].lower()
+    exact: list[SlashCommand] = []
     prefix: list[SlashCommand] = []
     alias: list[SlashCommand] = []
     contains: list[SlashCommand] = []
     for command in commands:
         name = command.name.lower()
-        if name.startswith(query):
+        if query and (name == query or query in (a.lower() for a in command.aliases)):
+            exact.append(command)
+        elif name.startswith(query):
             prefix.append(command)
         elif any(a.lower().startswith(query) for a in command.aliases):
             alias.append(command)
         elif query in name:
             contains.append(command)
-    return prefix + alias + contains
+    return exact + prefix + alias + contains
 
 
 def _resolve(commands: Commands) -> list[SlashCommand]:
@@ -92,7 +97,7 @@ class SlashCompleter(Completer):
                              display=f"/{command.name}", display_meta=command.description)
 
 
-# 菜单不用 prompt_toolkit 默认的灰底白块：透明底，高亮行用主题的青色
+# 菜单不用 prompt_toolkit 默认的灰底白块：透明底；高亮行沿用默认的 reverse，配上主题青色成一条青色底条
 MENU_STYLE = {
     "completion-menu": "bg:default",
     "completion-menu.completion": "bg:default fg:ansidefault",
@@ -135,13 +140,29 @@ class LineReader:
         def _(event) -> None:
             event.current_buffer.insert_text("\n")
 
-        @bindings.add("enter", filter=has_completions)
+        # 回车 / Tab 都不依赖菜单是否已经算出来（补全是异步的，打字快时按键会先到）：
+        # 菜单里有选中项用选中项，否则当场匹配取第一条
+        # 只管输入框；ctrl+r 搜索历史时的回车等仍走 prompt_toolkit 自己的绑定
+        in_input = has_focus(DEFAULT_BUFFER)
+
+        @bindings.add("enter", filter=in_input & Condition(lambda: self.completer is not None))
         def _(event) -> None:
-            buffer = event.current_buffer
-            state = buffer.complete_state
-            completion = state.current_completion or state.completions[0]
-            buffer.apply_completion(completion)
-            buffer.validate_and_handle()
+            self._accept_command(event.current_buffer)
+            event.current_buffer.validate_and_handle()
+
+        @bindings.add("tab", filter=in_input & Condition(self._typing_command))
+        def _(event) -> None:
+            """补全命令名并留一个空格，接着输参数"""
+            self._accept_command(event.current_buffer)
+            event.current_buffer.insert_text(" ")
+
+        @bindings.add("c-c", filter=in_input)
+        def _(event) -> None:
+            """有字时清空这一行，空行时才退出（同 Claude Code）"""
+            if event.current_buffer.text:
+                event.current_buffer.reset()
+            else:
+                event.app.exit(exception=KeyboardInterrupt, style="class:aborting")
 
         for key, handler in (key_handlers or {}).items():
             bindings.add(key)(_print_above(handler))
@@ -170,6 +191,24 @@ class LineReader:
         )
         if self.completer is not None:
             self.session.default_buffer.on_text_changed += self._fit_menu
+            self.session.default_buffer.on_completions_changed += _highlight_first
+
+    def _typing_command(self) -> bool:
+        text = self.session.default_buffer.document.text_before_cursor
+        return bool(self.completer and self.completer.matches(text))
+
+    def _accept_command(self, buffer: Any) -> None:
+        """把正在输的命令名换成选中的候选（没选就是第一条）"""
+        state = buffer.complete_state
+        if state is not None and state.completions:
+            buffer.apply_completion(state.current_completion or state.completions[0])
+            return
+        if buffer.document.text_after_cursor or self.completer is None:
+            return
+        matches = self.completer.matches(buffer.text)
+        if matches:
+            text = f"/{matches[0].name}"
+            buffer.document = Document(text, len(text))
 
     def _fit_menu(self, buffer: Any) -> None:
         count = len(self.completer.matches(buffer.text)) if self.completer else 0
@@ -188,6 +227,18 @@ class LineReader:
                 return await self.session.prompt_async(ANSI(prompt))
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, lambda: input(prompt))
+
+
+def _highlight_first(buffer: Any) -> None:
+    """菜单一出来就高亮第一条（回车执行的就是它）。只改下标、不改输入框的字——
+    go_to_completion 会把候选写进输入框，接着打字就成了 /helpm。
+    已经输完整的唯一候选 prompt_toolkit 随后会丢掉，这时不能选，否则下标指向空列表"""
+    state = buffer.complete_state
+    if state is None or state.complete_index is not None or not state.completions:
+        return
+    if len(state.completions) == 1 and state.completions[0].text == buffer.document.text_before_cursor:
+        return
+    state.complete_index = 0
 
 
 def _print_above(handler: Callable[[], None]) -> Callable[[Any], None]:

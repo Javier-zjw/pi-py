@@ -38,8 +38,9 @@ COMMAND_NAME = re.compile(r"[A-Za-z][\w-]*")
 SHORTCUTS = [
     ("ctrl+o", "展开上一轮的思考和工具调用"),
     ("Alt+Enter", "换行"),
-    ("↑ ↓", "翻历史；补全菜单打开时选择命令"),
-    ("ctrl+c", "中断当前任务；空闲时退出"),
+    ("↑ ↓", "翻历史；菜单打开时选择命令"),
+    ("Tab", "补全命令名，接着输参数"),
+    ("ctrl+c", "清空输入；空行时退出；运行中中断"),
 ]
 
 
@@ -188,7 +189,7 @@ class App:
             self.error(f"打不开会话：{type(exc).__name__}: {exc}")
             return
         self._replace_session(manager)
-        self.out(["", *self.renderer.recap(self.session.messages)])
+        self.out(self.renderer.recap(self.session.messages))
         self.note(f"已恢复会话 {Path(path).name} · {len(self.session.messages)} 条消息 · "
                   f"{self.renderer.status.model}")
         self.continue_hint()

@@ -291,7 +291,7 @@ async def cmd_exit(app: App, rest: str) -> bool:
 BUILTIN_COMMANDS: list[AppCommand] = [
     AppCommand("help", "显示命令和快捷键", cmd_help),
     AppCommand("model", "选择模型和思考档位（↑↓ 模型，←→ 思考）", cmd_model, usage="[provider/model]"),
-    AppCommand("think", "设置思考档位", cmd_think, usage="[off|minimal|low|medium|high|xhigh|max]"),
+    AppCommand("think", "设置思考档位", cmd_think, usage="[档位]"),
     AppCommand("clear", "开始新会话（清空上下文）", cmd_clear, aliases=("new", "reset")),
     AppCommand("resume", "恢复历史会话", cmd_resume, usage="[会话文件]"),
     AppCommand("continue", "接着执行上次中断的那一轮", cmd_continue),

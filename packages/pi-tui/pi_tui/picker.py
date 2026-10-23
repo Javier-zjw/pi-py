@@ -94,7 +94,7 @@ class PickerState:
                     side = t.muted(f"{self.choice_label} {value}")
             else:
                 side = t.muted(item.note)
-            line = f"{mark} {label}{current}  {side}"
+            line = f"{mark} {label}{current}" + (f"  {side}" if side else "")
             if item.description:
                 room = width - display_width(line) - 4
                 if room > 8:

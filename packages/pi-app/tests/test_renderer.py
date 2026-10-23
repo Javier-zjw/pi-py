@@ -99,8 +99,9 @@ async def case_collapsed_turn() -> None:
         check("用时: 不带文字标签", "用时" not in text and "上下文" not in text, text)
         answer = next((i for i, line in enumerate(lines) if line.startswith("● ")), None)
         check("回答: 以 ● 开头，紧跟在用时下面", answer == 1, str(lines))
-        check("回答: 续行缩进两格", answer is not None and lines[answer + 1].startswith("  - README.md"),
-              str(lines[answer:answer + 3]))
+        check("回答: 按 Markdown 排版，列表缩进两格", answer is not None
+              and lines[answer + 1].startswith("  • README.md"), str(lines[answer:answer + 3]))
+        check("留白: 用时行和回答之间空一行", "ctrl+o 展开\n\n● " in text, repr(text))
         check("统计: 最后一行只有 token", lines[-1] == "↑4.1k · ↓344", lines[-1])
         check("统计: 不再每次调模型都打一行", "↑4130" not in text)
 
@@ -120,7 +121,7 @@ async def case_interim_text() -> None:
         check("过渡话: 不写进 scrollback", "让我先查看" not in text, text)
         check("过渡话: 只有一个 ●", text.count("●") == 1, text)
         check("回答: 开头空行去掉", "● 这是一个示例项目。" in text, repr(text))
-        check("回答: 连续空行压成一行", "这是一个示例项目。\n  \n  第二段。\n" in text, repr(text))
+        check("回答: 连续空行压成一行", "这是一个示例项目。\n\n  第二段。\n" in text, repr(text))
         check("回答: 段尾空行不写出，和统计之间只空一行", "第二段。\n\n↑" in text, repr(text))
         steps = [kind for kind, _ in renderer.last_turn.steps]
         check("展开: 按顺序记下思考、过渡话、工具、思考",
@@ -181,7 +182,6 @@ def test_live_slot() -> None:
           and len(text.split("\n")) == 1 + SLOT_LINES, text)
 
     renderer.on_event(delta("text_delta", "\n".join(f"回答第 {i} 行" for i in range(10))))
-    renderer._flush()        # 在事件循环里时回答是匀速吐字的
     check("长文字: 超过活动区就当回答写出", renderer.state.answering
           and "● 回答第 0 行" in renderer.stream.getvalue(), renderer.stream.getvalue())
     check("长文字: 用时写在回答上面", renderer.stream.getvalue().index("✻ ")
@@ -252,6 +252,10 @@ def test_user_echo_multiline() -> None:
     renderer = SessionRenderer(theme=Theme(ColorMode.NONE), stream=out)
     renderer.user_echo("第一行\n第二行")
     check("回显: 多行对齐", out.getvalue() == "❯ 第一行\n  第二行\n", repr(out.getvalue()))
+    renderer.print_lines(["  ✓ 模型 x"])
+    renderer.user_echo("下一句")
+    check("留白: 新的提问和上面的输出之间空一行", out.getvalue().endswith("✓ 模型 x\n\n❯ 下一句\n"),
+          repr(out.getvalue()))
 
 
 def test_collapsed_turn() -> None:

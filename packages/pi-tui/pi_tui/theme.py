@@ -73,6 +73,8 @@ RESET = "\033[0m"
 BOLD = "\033[1m"
 DIM = "\033[2m"
 ITALIC = "\033[3m"
+UNDERLINE = "\033[4m"
+STRIKE = "\033[9m"
 
 
 class Theme:
@@ -85,19 +87,23 @@ class Theme:
     def enabled(self) -> bool:
         return self.mode is not ColorMode.NONE
 
-    def paint(self, text: str, color: Color | None = None, *, bold=False, dim=False, italic=False) -> str:
+    def paint(self, text: str, color: Color | None = None, *, bold=False, dim=False, italic=False,
+              underline=False, strike=False) -> str:
         if not self.enabled or not text:
             return text
-        prefix = ""
-        if color is not None:
-            prefix += color.fg(self.mode)
-        if bold:
-            prefix += BOLD
-        if dim:
-            prefix += DIM
-        if italic:
-            prefix += ITALIC
+        prefix = self.codes(color, bold=bold, dim=dim, italic=italic, underline=underline, strike=strike)
         return f"{prefix}{text}{RESET}" if prefix else text
+
+    def codes(self, color: Color | None = None, *, bold=False, dim=False, italic=False,
+              underline=False, strike=False) -> str:
+        """只要开头的转义序列（嵌套样式时，内层 RESET 之后要把外层样式补回来）"""
+        if not self.enabled:
+            return ""
+        prefix = color.fg(self.mode) if color is not None else ""
+        for on, code in ((bold, BOLD), (dim, DIM), (italic, ITALIC), (underline, UNDERLINE), (strike, STRIKE)):
+            if on:
+                prefix += code
+        return prefix
 
     # 语义化快捷方式：调用处不该出现具体颜色
     def accent(self, t: str, **kw) -> str:

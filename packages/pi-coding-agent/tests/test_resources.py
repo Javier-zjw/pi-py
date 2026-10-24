@@ -157,6 +157,17 @@ def test_build_system_prompt() -> None:
         prompt = build_system_prompt(cwd, context_files=files, skills_block="<skills>x</skills>")
 
         check("系统提示: 含基础提示", BASE_SYSTEM_PROMPT[:30] in prompt)
+        # 防跑偏的几条要求（长工具链里最容易丢的就是这些），改提示时别删掉
+        for needle, why in [
+            ("Size the task", "先判断任务大小"),
+            ("defines the scope", "范围以用户的请求为准"),
+            ("Do I already have enough to", "隔几步自查、够了就回答"),
+            ("`update_plan`", "多步任务用计划工具"),
+            ("not for `cat`, `sed -n` or `grep`", "读文件用 read 而不是 bash"),
+            ("language the user writes in", "回答跟随用户语言"),
+        ]:
+            check(f"系统提示: {why}", needle in BASE_SYSTEM_PROMPT)
+        check("系统提示: 续行已拼接（没有残留反斜杠）", "\\\n" not in BASE_SYSTEM_PROMPT)
         check("系统提示: 含环境块", "<environment>" in prompt)
         check("系统提示: 含 AGENTS.md 内容", "必须写测试" in prompt)
         check("系统提示: 含技能块", "<skills>" in prompt)
@@ -470,10 +481,10 @@ def test_resource_loader() -> None:
         check("资源: 发现上下文文件",
               any("项目约定" in f.content for f in loader.get_context_files()))
         check("资源: 加载扩展",
-              [e.name for e in loader.get_extensions()] == ["plan_mode", "tool_budget", "demo-ext"],
+              [e.name for e in loader.get_extensions()] == ["plan_mode", "todo", "tool_budget", "demo-ext"],
               str([(e.name, e.error) for e in loader.get_extensions()]))
         check("资源: 扩展注册的工具可取",
-              [t.name for t in loader.get_extension_api().tools] == ["hello"])
+              [t.name for t in loader.get_extension_api().tools] == ["update_plan", "hello"])
 
         prompt = loader.get_system_prompt()
         check("资源: 系统提示含技能块", "<skills>" in prompt and "commit-message" in prompt)
@@ -485,12 +496,12 @@ def test_resource_loader() -> None:
         # reload 必须重建扩展状态：删掉扩展文件后，它注册的东西也该消失
         loader.reload()
         check("资源: reload 后工具不重复",
-              len(loader.get_extension_api().tools) == 1,
+              len(loader.get_extension_api().tools) == 2,
               str([t.name for t in loader.get_extension_api().tools]))
         (cwd / ".pi" / "extensions" / "demo.py").unlink()
         loader.reload()
         check("资源: reload 丢弃已删除扩展的工具",
-              loader.get_extension_api().tools == [],
+              [t.name for t in loader.get_extension_api().tools] == ["update_plan"],
               str([t.name for t in loader.get_extension_api().tools]))
         check("资源: reload 丢弃已删除扩展的命令",
               "greet" not in loader.get_extension_api().commands,

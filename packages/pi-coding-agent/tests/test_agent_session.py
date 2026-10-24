@@ -118,7 +118,9 @@ async def case_simple_turn() -> None:
         ctx = provider.calls[0]["context"]
         check("单轮: 系统提示已装配", "<environment>" in (ctx.system_prompt or ""),
               (ctx.system_prompt or "")[:40])
-        check("单轮: 没配工具时不下发 tools", ctx.tools == [], str(ctx.tools))
+        # 内置扩展 todo 注册的 update_plan 总会加入工具基线
+        check("单轮: 没配工具时只有扩展注册的 update_plan",
+              [t.name for t in ctx.tools] == ["update_plan"], str(ctx.tools))
 
 
 async def case_tool_turn_with_real_tools() -> None:
@@ -140,7 +142,7 @@ async def case_tool_turn_with_real_tools() -> None:
         check("工具轮: 真的读了磁盘",
               "藏在文件里的内容" in session.messages[2].text(), session.messages[2].text()[:40])
         check("工具轮: 工具 schema 下发给模型",
-              [t.name for t in provider.calls[0]["context"].tools] == ["read"],
+              [t.name for t in provider.calls[0]["context"].tools] == ["read", "update_plan"],
               str(provider.calls[0]["context"].tools))
         check("工具轮: 第二次请求带上了工具结果",
               any(getattr(m, "role", "") == "toolResult"
@@ -301,18 +303,19 @@ def test_tool_selection() -> None:
 
         default = AgentSession(services, SessionManager.in_memory(cwd), model=FAKE_MODEL)
         names = {t.name for t in default.agent.state.tools}
-        check("工具: 默认集合", names == {"read", "bash", "edit", "write"}, str(names))
+        check("工具: 默认集合（含扩展注册的 update_plan）",
+              names == {"read", "bash", "edit", "write", "update_plan"}, str(names))
 
         limited = AgentSession(services, SessionManager.in_memory(cwd), model=FAKE_MODEL,
                                tools=["read", "grep"])
         check("工具: 显式指定",
-              {t.name for t in limited.agent.state.tools} == {"read", "grep"},
+              {t.name for t in limited.agent.state.tools} == {"read", "grep", "update_plan"},
               str([t.name for t in limited.agent.state.tools]))
 
         excluded = AgentSession(services, SessionManager.in_memory(cwd), model=FAKE_MODEL,
                                 exclude_tools=["bash", "write"])
         check("工具: 排除生效",
-              {t.name for t in excluded.agent.state.tools} == {"read", "edit"},
+              {t.name for t in excluded.agent.state.tools} == {"read", "edit", "update_plan"},
               str([t.name for t in excluded.agent.state.tools]))
 
         custom = define_tool("mine", "自定义", {"type": "object", "properties": {}},
@@ -320,7 +323,7 @@ def test_tool_selection() -> None:
         with_custom = AgentSession(services, SessionManager.in_memory(cwd), model=FAKE_MODEL,
                                    tools=["read"], custom_tools=[custom])
         check("工具: 自定义工具加入",
-              {t.name for t in with_custom.agent.state.tools} == {"read", "mine"},
+              {t.name for t in with_custom.agent.state.tools} == {"read", "update_plan", "mine"},
               str([t.name for t in with_custom.agent.state.tools]))
 
 
@@ -378,7 +381,7 @@ async def case_plan_mode_tools() -> None:
         await session.set_mode("chat")
         await session._apply_mode()
         check("计划模式: 切回聊天后恢复基线",
-              names() == {"read", "bash", "edit", "write"}, str(names()))
+              names() == {"read", "bash", "edit", "write", "update_plan"}, str(names()))
 
 
 def test_diagnostics_surface() -> None:
@@ -622,6 +625,105 @@ async def case_tool_budget() -> None:
         await session.prompt("再读一遍")
         check("预算: 关掉后不提醒", not any(getattr(m, "role", "") == "custom"
                                           for m in session.messages[before:]))
+
+
+def plan_call(call_id: str, *steps: tuple[str, str], explanation: str = "") -> ToolCall:
+    args: dict = {"plan": [{"step": step, "status": status} for step, status in steps]}
+    if explanation:
+        args["explanation"] = explanation
+    return ToolCall(id=call_id, name="update_plan", arguments=args)
+
+
+async def case_todo_plan() -> None:
+    """update_plan：存进会话记录、拒绝两个 in_progress、压缩后补回没做完的计划、恢复会话后还在"""
+    from pi_coding_agent.builtin_extensions.todo import latest_todo
+
+    with Sandbox() as cwd:
+        write_files(cwd, 1)
+        script = [
+            [plan_call("p1", ("读文件", "in_progress"), ("总结", "pending"))],
+            [ToolCall(id="r0", name="read", arguments={"path": "f0.txt"})],
+            [plan_call("p2", ("读文件", "in_progress"), ("总结", "in_progress"))],
+            [plan_call("p3", ("读文件", "completed"), ("总结", "in_progress"))],
+            [TextContent(text="总结完了")],
+        ]
+        manager = file_manager(cwd)
+        session, _ = make_session(cwd, script, tools=["read"], session_manager=manager)
+        await session.prompt("读一下 f0 再总结")
+        results = {m.tool_call_id: m for m in session.messages if getattr(m, "role", "") == "toolResult"}
+        check("计划: 正常更新返回进度", "1/2" not in results["p1"].text()
+              and "0/2" in results["p1"].text() and "读文件" in results["p1"].text(), results["p1"].text())
+        check("计划: 两个 in_progress 被拒绝", results["p2"].is_error, results["p2"].text())
+        check("计划: 拒绝后模型改正，记下最新状态", "1/2" in results["p3"].text(), results["p3"].text())
+        entries = [e for e in manager.get_entries() if e.type == "custom" and e.custom_type == "todo"]
+        check("计划: 只有合法的更新写进会话记录", len(entries) == 2, str([e.data for e in entries]))
+
+        api = session.resources.get_extension_api()
+        sections, errors = await api.run_compaction_context(session)
+        todo = [s for s in sections if "当前任务计划" in s]
+        check("计划: 压缩后补回没做完的计划", len(todo) == 1 and "- [x] 读文件" in todo[0]
+              and "- [>] 总结" in todo[0] and not errors, str(sections))
+
+        reopened = AgentSession(session.services, SessionManager.open(cwd / "s.jsonl"),
+                                model=FAKE_MODEL, tools=["read"])
+        record = latest_todo(reopened)
+        check("计划: 恢复会话后还在", record is not None
+              and [s["status"] for s in record["plan"]] == ["completed", "in_progress"], str(record))
+
+        session.session.append_custom_entry("todo", {"plan": [{"step": "读文件", "status": "completed"},
+                                                               {"step": "总结", "status": "completed"}]})
+        sections, _ = await api.run_compaction_context(session)
+        check("计划: 全部完成后不再补回", not any("当前任务计划" in s for s in sections), str(sections))
+
+
+class ScriptedSSE:
+    """真 OpenAIProvider 用的假 HTTP：每次请求回放一段 SSE，并记下请求体"""
+
+    def __init__(self, replies: list[list[dict]]) -> None:
+        self.replies = list(replies)
+        self.payloads: list[dict] = []
+
+    async def stream_sse(self, url, headers, payload, timeout=600.0):
+        from pi_ai import SSEEvent
+        self.payloads.append(payload)
+        for data in self.replies.pop(0):
+            yield SSEEvent(None, data)
+
+
+async def case_reasoning_passback_end_to_end() -> None:
+    """DeepSeek 思考模式：第一步流出来的思考，要原样出现在第二步请求里（三层串起来验证）"""
+    from pi_ai import InMemoryCredentialStore, Models, OpenAIProvider
+
+    def chunk(delta, finish=None):
+        return {"choices": [{"delta": delta, "finish_reason": finish}]}
+
+    transport = ScriptedSSE([
+        [chunk({"reasoning_content": "先读入口文件 main.py，"}), chunk({"reasoning_content": "再决定看哪里"}),
+         chunk({"tool_calls": [{"index": 0, "id": "c1", "function": {
+             "name": "read", "arguments": '{"path": "main.py"}'}}]}),
+         chunk({}, "tool_calls")],
+        [chunk({"reasoning_content": "够了"}), chunk({"content": "入口只打印 hi"}), chunk({}, "stop")],
+    ])
+    model = Model(id="deepseek-flash", provider="deepseek-api", api="openai-completions",
+                  reasoning=True, base_url="https://api.deepseek.com")
+    store = InMemoryCredentialStore()
+    store.set("deepseek-api", "k")
+    models = Models(models=[model], credentials=store)
+    models.set_provider(OpenAIProvider(provider_id="deepseek-api", base_url=model.base_url,
+                                       transport=transport))
+    with Sandbox() as cwd:
+        (cwd / "main.py").write_text("print('hi')\n", "utf-8")
+        services = create_agent_session_services(cwd=cwd, agent_dir=cwd / "agent",
+                                                 model_runtime=ModelRuntime(models, cwd / "agent"))
+        session = AgentSession(services, SessionManager.in_memory(cwd), model=model,
+                               thinking_level="low", tools=["read"])
+        await session.prompt("入口文件做了什么")
+        check("回传: 跑完两步", session.messages[-1].text() == "入口只打印 hi", session.messages[-1].text())
+        second = transport.payloads[1]["messages"]
+        calls = [m for m in second if m.get("role") == "assistant" and m.get("tool_calls")]
+        check("回传: 第二步请求里带着第一步的思考",
+              calls and calls[0].get("reasoning_content") == "先读入口文件 main.py，再决定看哪里",
+              json.dumps(calls, ensure_ascii=False)[:300])
 
 
 async def case_prune_disabled() -> None:
@@ -1387,6 +1489,14 @@ def test_tool_budget() -> None:
     asyncio.run(case_tool_budget())
 
 
+def test_todo_plan() -> None:
+    asyncio.run(case_todo_plan())
+
+
+def test_reasoning_passback_end_to_end() -> None:
+    asyncio.run(case_reasoning_passback_end_to_end())
+
+
 def test_prune_disabled() -> None:
     asyncio.run(case_prune_disabled())
 
@@ -1505,6 +1615,8 @@ async def main() -> int:
     await case_prune_ignores_stale_usage()
     await case_prune_skips_small_batches()
     await case_tool_budget()
+    await case_todo_plan()
+    await case_reasoning_passback_end_to_end()
     await case_prune_disabled()
     await case_rehydrate_after_compaction()
     await case_rehydrate_hook_failure()

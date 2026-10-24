@@ -72,11 +72,25 @@ def _user_content(content: Any) -> Any:
     return parts
 
 
+# 思考模式要求回传 reasoning_content 的服务商（按 provider / 模型 id / base_url 识别）
+_PASSBACK_HINTS = ("deepseek", "moonshot", "kimi")
+
+
+def passes_back_reasoning(model: Model) -> bool:
+    if model.reasoning_passback is not None:
+        return model.reasoning_passback
+    if not model.reasoning:
+        return False
+    haystack = f"{model.provider} {model.id} {model.base_url or ''}".lower()
+    return any(hint in haystack for hint in _PASSBACK_HINTS)
+
+
 def build_payload(model: Model, context: Context, options: StreamOptions) -> dict[str, Any]:
     messages: list[dict[str, Any]] = []
     if context.system_prompt:
         messages.append({"role": "system", "content": context.system_prompt})
 
+    passback = passes_back_reasoning(model)
     for m in context.messages:
         if isinstance(m, UserMessage):
             messages.append({"role": "user", "content": _user_content(m.content)})
@@ -97,6 +111,11 @@ def build_payload(model: Model, context: Context, options: StreamOptions) -> dic
             entry: dict[str, Any] = {"role": "assistant", "content": text or None}
             if tool_calls:
                 entry["tool_calls"] = tool_calls
+                # 工具调用链里的思考要发回去：模型据此接着上一步的思路往下走，而不是每一步从头想。
+                # 别家模型的思考不发（格式、语义都不保证一致）
+                thinking = "".join(c.thinking for c in m.content if isinstance(c, ThinkingContent))
+                if passback and thinking and m.provider == model.provider:
+                    entry["reasoning_content"] = thinking
             if text or tool_calls:
                 messages.append(entry)
 

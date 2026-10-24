@@ -190,6 +190,10 @@ class Model:
     # Anthropic 前缀缓存断点（cache_control）。None = 自动：官方 Anthropic 才开；
     # 兼容 anthropic-messages 的第三方端点不一定认这个字段，需要在 models.json 里显式 "promptCache": true
     prompt_cache: bool | None = None
+    # OpenAI 兼容端点：调了工具的那些回复，把思考（reasoning_content）随历史发回去。
+    # None = 自动：DeepSeek / Moonshot(Kimi) 的推理模型开（它们的思考模式要求回传，不传模型每一步都
+    # 从头想、长任务容易跑偏）；其余默认关（严格的端点可能拒绝未知字段），models.json 用 "reasoningPassback" 指定
+    reasoning_passback: bool | None = None
 
     @property
     def key(self) -> str:

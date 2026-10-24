@@ -256,6 +256,52 @@ def test_openai_payload_shapes() -> None:
     check("openai: 无工具时不传 tool_choice", "tool_choice" not in payload)
 
 
+def test_openai_reasoning_passback() -> None:
+    """DeepSeek 等思考模式：调了工具的回复要把 reasoning_content 发回去，模型才能接着上一步的思路走"""
+    import dataclasses
+
+    from pi_ai.providers.openai import build_payload, passes_back_reasoning
+
+    deepseek = dataclasses.replace(OPENAI_MODEL, id="deepseek-flash", provider="deepseek-api",
+                                   reasoning=True, base_url="https://api.deepseek.com")
+
+    def assistant(provider: str, blocks: list) -> dict:
+        return {"role": "assistant", "provider": provider, "content": blocks}
+
+    thinking = {"type": "thinking", "thinking": "先列目录，再读入口文件"}
+    call = {"type": "toolCall", "id": "t1", "name": "read", "arguments": {"path": "a"}}
+    context = Context(messages=[
+        UserMessage(content="分析代码"),
+        message_from_dict(assistant("deepseek-api", [thinking, call])),
+        ToolResultMessage(tool_call_id="t1", tool_name="read", content=[TextContent(text="内容")]),
+        message_from_dict(assistant("deepseek-api", [{"type": "thinking", "thinking": "可以回答了"},
+                                                     {"type": "text", "text": "结论"}])),
+        UserMessage(content="继续"),
+    ])
+
+    msgs = build_payload(deepseek, context, SimpleStreamOptions())["messages"]
+    check("回传: DeepSeek 推理模型自动开启", passes_back_reasoning(deepseek))
+    check("回传: 调了工具的回复带上 reasoning_content",
+          msgs[1].get("reasoning_content") == "先列目录，再读入口文件", str(msgs[1]))
+    check("回传: 没调工具的回复不带（服务商会忽略，省 token）", "reasoning_content" not in msgs[3], str(msgs[3]))
+
+    other = Context(messages=[UserMessage(content="q"),
+                              message_from_dict(assistant("anthropic", [thinking, call])),
+                              ToolResultMessage(tool_call_id="t1", tool_name="read",
+                                                content=[TextContent(text="x")])])
+    msgs = build_payload(deepseek, other, SimpleStreamOptions())["messages"]
+    check("回传: 别家模型的思考不发", "reasoning_content" not in msgs[1], str(msgs[1]))
+
+    msgs = build_payload(dataclasses.replace(OPENAI_MODEL, reasoning=True), context,
+                         SimpleStreamOptions())["messages"]
+    check("回传: 其他端点默认不发（严格端点可能拒绝未知字段）", "reasoning_content" not in msgs[1])
+    forced = dataclasses.replace(OPENAI_MODEL, provider="deepseek-api", reasoning_passback=True)
+    check("回传: models.json 可以显式打开", passes_back_reasoning(forced)
+          and "reasoning_content" in build_payload(forced, context, SimpleStreamOptions())["messages"][1])
+    check("回传: 也可以显式关闭",
+          not passes_back_reasoning(dataclasses.replace(deepseek, reasoning_passback=False)))
+
+
 def test_openai_usage_variants() -> None:
     """各家 OpenAI 兼容端点的缓存用量写法：input 永远不含缓存命中部分"""
     from pi_ai.providers.openai import apply_openai_usage
@@ -473,6 +519,7 @@ async def main() -> int:
     await case_anthropic_tools_and_thinking()
     test_anthropic_payload_shapes()
     test_openai_usage_variants()
+    test_openai_reasoning_passback()
     test_prompt_cache_breakpoints()
     print("openai-completions")
     await case_openai_text_tools_reasoning()

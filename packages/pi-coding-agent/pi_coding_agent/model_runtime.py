@@ -44,6 +44,7 @@ def _model_from_json(d: dict[str, Any]) -> Model:
         reasoning=d.get("reasoning", False),
         base_url=d.get("baseUrl"),
         prompt_cache=d.get("promptCache"),
+        reasoning_passback=d.get("reasoningPassback"),
     )
 
 class ModelRuntime:

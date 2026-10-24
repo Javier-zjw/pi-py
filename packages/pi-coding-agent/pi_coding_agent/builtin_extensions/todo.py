@@ -11,6 +11,10 @@
 
 和计划模式（plan_mode）不是一回事：计划模式是"只读调研、出方案、等确认"，
 这里是执行过程中的进度单，任何模式下都能用。
+
+清单来自用户批准的计划（source="plan"）时多一层校验——那是用户点头同意的任务表，模型不能
+悄悄改：已批准的任务不能删掉或改写，不能在前面还没开始时去做后面的。确需调整就写 explanation，
+校验放行，界面显示调整原因。每项的完成标准（done_when）按标题从上一份清单带过来。
 """
 
 from __future__ import annotations
@@ -64,10 +68,18 @@ def activate(pi) -> None:
             return AgentToolResult.text(
                 "only one step can be in_progress at a time; mark finished steps completed",
                 is_error=True)
+        explanation = (args.get("explanation") or "").strip()
         record = {"plan": steps}
-        if (args.get("explanation") or "").strip():
-            record["explanation"] = args["explanation"].strip()
+        if explanation:
+            record["explanation"] = explanation
         session = pi.session
+        previous = latest_todo(session) if session is not None else None
+        if previous and previous.get("source") == "plan":
+            problem = check_approved(previous["plan"], steps, explanation)
+            if problem:
+                return AgentToolResult.text(problem, is_error=True)
+            carry_over(previous["plan"], steps)
+            record["source"] = "plan"
         if session is not None:
             save_todo(session, record)
         done = sum(s["status"] == "completed" for s in steps)
@@ -99,6 +111,36 @@ def save_todo(session, record: dict) -> None:
     session.notify(TodoUpdatedEvent(plan=record["plan"], explanation=record.get("explanation", "")))
 
 
+def check_approved(approved: list[dict], steps: list[dict], explanation: str) -> str | None:
+    """批准的清单不许悄悄改：返回给模型的错误说明，没问题返回 None。写了 explanation 就放行"""
+    if explanation:
+        return None
+    titles = {s["step"] for s in steps}
+    missing = [s["step"] for s in approved if s["step"] not in titles]
+    if missing:
+        return ("This checklist comes from the plan the user approved. Keep every approved step "
+                "with its exact text; missing: " + "; ".join(missing) + ". If the plan really has "
+                "to change (split, skip or add steps), send it again with an explanation.")
+    for i, step in enumerate(steps):
+        if step["status"] == "pending":
+            continue
+        skipped = [s["step"] for s in steps[:i] if s["status"] == "pending"]
+        if skipped:
+            return (f"Work through the approved steps in order: \"{step['step']}\" is "
+                    f"{step['status']} while earlier steps are still pending: "
+                    + "; ".join(skipped) + ". Finish them first, or send the plan again with an "
+                    "explanation of why the order changes.")
+    return None
+
+
+def carry_over(previous: list[dict], steps: list[dict]) -> None:
+    """update_plan 只传标题和状态：完成标准按标题从上一份清单带过来"""
+    done_when = {s["step"]: s["done_when"] for s in previous if s.get("done_when")}
+    for step in steps:
+        if step["step"] in done_when:
+            step["done_when"] = done_when[step["step"]]
+
+
 def latest_todo(session) -> dict | None:
     """当前分支上最近一次 update_plan 的结果"""
     for entry in reversed(session.session.get_branch()):
@@ -111,5 +153,8 @@ def latest_todo(session) -> dict | None:
 def render_todo_context(record: dict) -> str:
     lines = ["## 当前任务计划",
              "压缩之前你在按这份计划工作。继续推进 [>] 那一步；做完一步就用 update_plan 更新状态。", ""]
-    lines += [f"- {MARKS.get(s['status'], '[ ]')} {s['step']}" for s in record["plan"]]
+    for step in record["plan"]:
+        lines.append(f"- {MARKS.get(step['status'], '[ ]')} {step['step']}")
+        if step.get("done_when") and step["status"] != "completed":
+            lines.append(f"  完成标准：{step['done_when']}")
     return "\n".join(lines)

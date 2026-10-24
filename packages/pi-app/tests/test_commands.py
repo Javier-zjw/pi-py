@@ -328,7 +328,8 @@ async def case_resume() -> None:
 def submit(call_id: str = "s1") -> ToolCall:
     return ToolCall(id=call_id, name="submit_plan", arguments={
         "title": "加超时配置", "summary": "把超时做成可配置。",
-        "steps": ["读 cfg.py", "改成读环境变量", "跑测试"], "files": ["cfg.py"]})
+        "steps": [{"title": step, "files": ["cfg.py"], "done_when": f"{step}完成"}
+                  for step in ["读 cfg.py", "改成读环境变量", "跑测试"]], "files": ["cfg.py"]})
 
 
 def tick(call_id: str, done: int) -> ToolCall:
@@ -358,13 +359,15 @@ async def case_plan_mode() -> None:
         title, items = app.pick_calls[-1]
         check("计划: 提交后问要不要执行", title == "执行这个计划？"
               and [i.label for i in items] == ["执行计划", "继续完善", "先不执行"], str(items))
-        check("计划: 计划单独成块显示", "╭ 计划 加超时配置" in text and "│ 2. 改成读环境变量" in text, text)
+        check("计划: 计划单独成块显示，任务是一张表", "╭ 计划 加超时配置" in text
+              and "│ 2 │ 改成读环境变量" in text and "改成读环境变量完成" in text, text)
         check("执行: 选「执行计划」后切到执行模式", app.session.mode == "chat")
         check("执行: 只回显一行标题，不回显整段任务说明", "✓ 执行计划 加超时配置" in text
               and "执行要求" not in text, text)
         check("执行: 跑完", "● 都改好了，测试通过。" in text, text)
         last = text[text.rindex("✻ "):]
-        check("执行: 用时行下面是打完勾的清单", "✓ 读 cfg.py" in last and "✓ 跑测试" in last, last)
+        check("执行: 用时行下面是打完勾的清单", "✓ 任务 3/3" in last and "✓ 1. 读 cfg.py" in last
+              and "✓ 3. 跑测试" in last, last)
 
     with Sandbox() as cwd:
         app, out = make_app(cwd, [[submit()]])

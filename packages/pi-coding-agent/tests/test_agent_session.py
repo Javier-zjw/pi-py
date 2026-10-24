@@ -766,7 +766,8 @@ async def case_goal_reanchor() -> None:
 
 def submit_call(call_id: str, *steps: str, title: str = "加超时配置") -> ToolCall:
     return ToolCall(id=call_id, name="submit_plan", arguments={
-        "title": title, "summary": "## 思路\n把超时做成可配置项。", "steps": list(steps),
+        "title": title, "summary": "## 思路\n把超时做成可配置项。",
+        "steps": [{"title": step, "files": ["cfg.py"], "done_when": f"{step}：验证通过"} for step in steps],
         "files": ["cfg.py"], "questions": []})
 
 
@@ -900,6 +901,107 @@ async def case_plan_ask_user() -> None:
         check("提问: 用户跳过时让模型按推荐继续", "skipped" in result.content[0].text
               and result.details == {"questions": result.details["questions"], "answers": []},
               result.content[0].text)
+
+
+async def case_plan_guardrails() -> None:
+    """执行批准的计划时守住清单：任务带完成标准；不许悄悄删改、跳着做；没做完就想收尾时提醒继续"""
+    from pi_coding_agent.builtin_extensions.plan_mode import (
+        MAX_NUDGES,
+        approve_plan,
+        latest_plan,
+        plan_markdown,
+    )
+    from pi_coding_agent.builtin_extensions.todo import latest_todo
+    from pi_coding_agent.builtin_extensions.tool_budget import current_plan
+
+    steps = ("修 report 月份", "改 id 生成", "补测试")
+    with Sandbox() as cwd:
+        session, provider = make_session(cwd, [[submit_call("s1", *steps)]])
+        session.switch_mode("plan")
+        await session.prompt("规划一下")
+        plan = latest_plan(session)
+        check("任务表: 计划存下每项的完成标准和文件", plan["tasks"][1] == {
+            "title": "改 id 生成", "files": ["cfg.py"], "done_when": "改 id 生成：验证通过"}
+              and plan["steps"] == list(steps), str(plan))
+        table = plan_markdown(plan)
+        check("任务表: 画成 Markdown 表格", "| # | 任务 | 完成标准 | 涉及文件 |" in table
+              and "| 2 | 改 id 生成 | 改 id 生成：验证通过 | cfg.py |" in table, table)
+
+        events = record(session)
+        task = approve_plan(session)
+        todo = latest_todo(session)
+        check("批准: 清单带完成标准、标明来自计划", todo["source"] == "plan"
+              and todo["plan"][0]["done_when"] == "修 report 月份：验证通过", str(todo))
+        check("批准: 任务说明带完成标准和执行要求", "完成标准：补测试：验证通过" in task
+              and "先按它的「完成标准」实际验证" in task and "不要删除、改写或跳过任务" in task, task)
+        check("重锚: 提醒里带当前这项的完成标准", "当前这一项的完成标准：修 report 月份：验证通过"
+              in current_plan(session), current_plan(session))
+
+        provider.fn = scripted_stream([
+            # 删掉一项、不写原因 → 拒绝
+            [plan_call("u1", ("修 report 月份", "completed"), ("补测试", "in_progress"))],
+            # 跳过第 2 项去做第 3 项 → 拒绝
+            [plan_call("u2", ("修 report 月份", "completed"), ("改 id 生成", "pending"),
+                       ("补测试", "in_progress"))],
+            # 按顺序推进 → 通过
+            [plan_call("u3", ("修 report 月份", "completed"), ("改 id 生成", "in_progress"),
+                       ("补测试", "pending"))],
+            # 还没做完就想收尾 → 提醒继续
+            [TextContent(text="先做到这里。")],
+            # 写明原因调整清单 → 通过
+            [plan_call("u4", ("修 report 月份", "completed"), ("改 id 生成", "completed"),
+                       explanation="补测试已在改 id 时一并完成")],
+            [TextContent(text="都做完了。")],
+        ])
+        events.clear()
+        await session.prompt(task)
+        results = [m for m in session.messages if getattr(m, "role", "") == "toolResult"]
+        by_id = {m.tool_call_id: m for m in results}
+        check("守住清单: 悄悄删掉批准的任务被拒绝", by_id["u1"].is_error
+              and "missing: 改 id 生成." in by_id["u1"].content[0].text, by_id["u1"].content[0].text)
+        check("守住清单: 跳过前面的任务被拒绝", by_id["u2"].is_error
+              and "earlier steps are still pending: 改 id 生成" in by_id["u2"].content[0].text,
+              by_id["u2"].content[0].text)
+        check("守住清单: 按顺序推进通过", not by_id["u3"].is_error)
+        guards = [m for m in session.messages if getattr(m, "custom_type", "") == "plan_guard"]
+        check("收尾检查: 清单没做完就想结束时提醒一次", len(guards) == 1
+              and "还有 2 项没完成" in guards[0].content and "完成标准：改 id 生成：验证通过" in guards[0].content
+              and guards[0].details["notice"].startswith("计划还有 2 项没完成"), str([g.content for g in guards]))
+        check("守住清单: 写明原因可以调整", not by_id["u4"].is_error
+              and [e.explanation for e in events if e.type == "todo_updated"][-1] == "补测试已在改 id 时一并完成")
+        todo = latest_todo(session)
+        check("守住清单: 调整后仍标明来自计划、完成标准带过来", todo["source"] == "plan"
+              and todo["plan"][1]["done_when"] == "改 id 生成：验证通过", str(todo))
+        check("收尾检查: 做完后正常结束", session.messages[-1].text() == "都做完了。"
+              and events[-1].type == "agent_end" and events[-1].reason == "stop")
+
+    with Sandbox() as cwd:
+        session, provider = make_session(cwd, [[submit_call("s1", *steps)]])
+        session.switch_mode("plan")
+        await session.prompt("规划一下")
+        task = approve_plan(session)
+        provider.fn = scripted_stream([[TextContent(text="做不下去：缺数据库密码。")]] * 5)
+        await session.prompt(task)
+        guards = [m for m in session.messages if getattr(m, "custom_type", "") == "plan_guard"]
+        check("收尾检查: 每次运行最多提醒 MAX_NUDGES 次，之后让模型停下", len(guards) == MAX_NUDGES
+              and len(provider.calls) == 2 + MAX_NUDGES, f"{len(guards)} 次提醒，{len(provider.calls)} 次调用")
+        before = len(guards)
+        provider.fn = scripted_stream([[TextContent(text="还是缺密码。")]] * 5)
+        await session.prompt("继续")
+        guards = [m for m in session.messages if getattr(m, "custom_type", "") == "plan_guard"]
+        check("收尾检查: 下一次运行重新计数", len(guards) == before + MAX_NUDGES, str(len(guards)))
+
+    with Sandbox() as cwd:
+        session, _ = make_session(cwd, [
+            [plan_call("p1", ("读代码", "in_progress"), ("总结", "pending"))],
+            [plan_call("p2", ("总结", "in_progress"))],
+            [TextContent(text="先这样。")],
+        ])
+        await session.prompt("分析一下")
+        results = [m for m in session.messages if getattr(m, "role", "") == "toolResult"]
+        check("自由清单: 模型自己列的计划可以随意改，不做校验", not any(r.is_error for r in results))
+        check("自由清单: 不是批准的计划，没做完结束也不提醒",
+              not any(getattr(m, "custom_type", "") == "plan_guard" for m in session.messages))
 
 
 async def case_prune_disabled() -> None:
@@ -1677,6 +1779,10 @@ def test_plan_ask_user() -> None:
     asyncio.run(case_plan_ask_user())
 
 
+def test_plan_guardrails() -> None:
+    asyncio.run(case_plan_guardrails())
+
+
 def test_goal_reanchor() -> None:
     asyncio.run(case_goal_reanchor())
 
@@ -1806,6 +1912,7 @@ async def main() -> int:
     await case_todo_plan()
     await case_plan_execute_flow()
     await case_plan_ask_user()
+    await case_plan_guardrails()
     await case_goal_reanchor()
     await case_reasoning_passback_end_to_end()
     await case_prune_disabled()

@@ -160,6 +160,7 @@ class RenderState:
     shown: str = ""                 # slot 为 thinking / text 时显示的文字
     batch: list[ToolRecord] = field(default_factory=list)   # slot 为 tools 时的这一批
     summary_done: bool = False      # 本轮的「✻ 用时 · 工具」已经写出
+    segment_start: int = 0          # 这一段从第几个工具算起（回答之后被提醒 / 插话续跑算新的一段）
     # 本轮动过（或带着没做完的）任务清单：运行中常驻活动区，回答开始前写在用时行下面
     plan_touched: bool = False
     turn_started: float = 0.0
@@ -362,6 +363,7 @@ class SessionRenderer:
                     self.turn.steps.append(("text", f"↺ {details['notice']}"))
                     return
                 self._emit([f"{INDENT}{self.theme.warn('⚑')} {self.theme.muted(details['notice'])}"])
+                self._new_segment()
                 return
             text = message.text()
             if text.strip() == self.state.own_prompt.strip():
@@ -369,6 +371,7 @@ class SessionRenderer:
                 return
             # 途中插进来的消息（steering / follow-up）
             self.user_echo(text)
+            self._new_segment()
             return
         if role != "assistant":
             return
@@ -510,10 +513,16 @@ class SessionRenderer:
         self._set_status("思考中")
 
     def _on_todo_updated(self, event) -> None:
-        """任务清单变了（update_plan、批准计划生成清单）：活动区实时刷新"""
+        """任务清单变了（update_plan、批准计划生成清单）：活动区实时刷新。
+        模型调整了清单（带 explanation）就留一行原因——用户批准的计划变了，得让人看到为什么"""
         self.plan = list(event.plan or [])
         self.state.plan_touched = True
         self.turn.steps.append(("plan", self.plan))
+        explanation = " ".join(str(getattr(event, "explanation", "") or "").split())
+        if explanation:
+            self.turn.steps.append(("text", f"调整计划：{explanation}"))
+            self._emit([f"{INDENT}{self.theme.warn('↻')} {self.theme.muted('调整计划：' + explanation)}"])
+            return
         self._repaint()
 
     def _on_mode_changed(self, event) -> None:
@@ -660,7 +669,7 @@ class SessionRenderer:
         t = self.theme
         elapsed = time.time() - (self.state.turn_started or time.time())
         parts = [f"{t.highlight('✻', bold=True)} {t.highlight(_seconds(elapsed), bold=True)}"]
-        tools = self.turn.tools
+        tools = self.turn.tools[self.state.segment_start:]
         if tools:
             counts = Counter(r.name for r in tools)
             names = ", ".join(f"{n} ×{c}" if c > 1 else n for n, c in counts.most_common())
@@ -688,6 +697,15 @@ class SessionRenderer:
         if parts and state.cost:
             parts.append(t.warn(f"¥{state.cost:.4f}"))
         return f" {t.muted('·')} ".join(parts)
+
+    def _new_segment(self) -> None:
+        """回答写出之后运行还在继续（计划没做完被提醒、用户插话）：后面算新的一段，
+        下次回答前重新写「✻ 用时 · 工具」和任务清单——否则屏幕上停在旧进度，接着就是最终回答"""
+        if not self.state.summary_done:
+            return
+        self.state.summary_done = False
+        self.state.turn_started = time.time()
+        self.state.segment_start = len(self.turn.tools)
 
     def _commit_summary(self) -> None:
         if self.state.summary_done or not self.state.turn_started:
@@ -785,24 +803,35 @@ class SessionRenderer:
         return lines
 
     def _plan_lines(self) -> list[str]:
-        """计划勾选单：✓ 做完的、▸ 正在做的、○ 还没做的。步骤太多只显示前几步"""
+        """任务清单：标题行带进度，下面每项一行带序号——✓ 做完的、▸ 正在做的、○ 还没做的。
+        项太多时以正在做的那项为中心显示 PLAN_ROWS 项"""
         plan = self.plan if self.state.plan_touched else None
         if not plan:
             return []
         t = self.theme
-        width = max(self.width - 6, 10)
-        lines = []
-        for item in plan[:PLAN_ROWS]:
+        done = sum(item.get("status") == "completed" for item in plan)
+        mark = t.success("✓") if done == len(plan) else t.accent("☰")
+        lines = [f"{INDENT}{mark} {t.bold('任务')} {t.muted(f'{done}/{len(plan)}')}"]
+        current = next((i for i, item in enumerate(plan) if item.get("status") != "completed"), 0)
+        start = max(0, min(current - 1, len(plan) - PLAN_ROWS))
+        shown = plan[start:start + PLAN_ROWS]
+        number_width = len(str(len(plan)))
+        width = max(self.width - 10 - number_width, 10)
+        if start:
+            lines.append(f"{INDENT}  {t.muted(f'… 前 {start} 项已完成' if start <= done else f'… 前面还有 {start} 项')}")
+        for i, item in enumerate(shown, start + 1):
             step = truncate(str(item.get("step", "")), width)
+            number = f"{i}.".rjust(number_width + 1)
             status = item.get("status")
             if status == "completed":
-                lines.append(f"{INDENT}{t.success('✓')} {t.muted(step)}")
+                lines.append(f"{INDENT}  {t.success('✓')} {t.muted(f'{number} {step}')}")
             elif status == "in_progress":
-                lines.append(f"{INDENT}{t.accent('▸', bold=True)} {t.bold(step)}")
+                lines.append(f"{INDENT}  {t.accent('▸', bold=True)} {t.bold(f'{number} {step}')}")
             else:
-                lines.append(f"{INDENT}{t.muted('○ ' + step)}")
-        if len(plan) > PLAN_ROWS:
-            lines.append(f"{INDENT}{t.muted(f'… 还有 {len(plan) - PLAN_ROWS} 步')}")
+                lines.append(f"{INDENT}  {t.muted(f'○ {number} {step}')}")
+        rest = len(plan) - start - len(shown)
+        if rest > 0:
+            lines.append(f"{INDENT}  {t.muted(f'… 还有 {rest} 项')}")
         return lines
 
     def _tools_line(self) -> str:

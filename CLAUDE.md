@@ -48,6 +48,13 @@ cd packages/pi-coding-agent && pytest tests/test_session.py::test_persistence   
 
 `tests/manual/*.py` 需要真实模型和密钥，不属于离线测试。`packages/pi-agent/tests/CHECKLIST.md` 把每条断言映射到实现位置，断言变红时先查它。
 
+## 分支与合并
+
+- 每实现一个新功能就从 main 新开一条 `feature/<名称>` 分支（依赖还没合并的分支时可以叠在它上面），不在 main 上直接提交。
+- 只有用户明确说"合并进主分支"时才合并：开 PR、以 merge 方式合并；叠加的分支按依赖顺序依次合并。
+- **远端分支总数（含 main）最多 5 条。** 新开分支前先 `git ls-remote --heads origin` 数一下；满了先清理已合并的分支，清完仍然超出就先问用户，不要新建。
+- **分支合并进 main 后立即删除**：远端 `git push origin --delete <分支>`、本地 `git branch -d <分支>`。删除前用 `git fetch --prune && git branch -r --merged origin/main` 确认它已合并；没合并的分支不删。
+
 ## 架构
 
 ### 严格分层（核心约束）

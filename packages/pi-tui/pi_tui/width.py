@@ -111,6 +111,11 @@ def terminal_width(default: int = 80, maximum: int = 0) -> int:
     return min(columns, maximum) if maximum else columns
 
 
+def terminal_height(default: int = 24) -> int:
+    """当前终端高度（行数）"""
+    return shutil.get_terminal_size((80, default)).lines
+
+
 def prose_width(maximum: int = 100) -> int:
     """正文栏宽：长文本铺满整行很难读，这里才需要上限。"""
     return terminal_width(maximum=maximum)

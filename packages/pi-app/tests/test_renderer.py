@@ -27,7 +27,7 @@ from fakes import FAKE_MODEL, Sandbox, fake_models  # noqa: E402
 
 from pi_agent import CustomMessage
 from pi_ai import TextContent, ThinkingContent, ToolCall, Usage, UserMessage  # noqa: E402
-from pi_tui import Theme  # noqa: E402
+from pi_tui import Theme, display_width  # noqa: E402
 from pi_tui.theme import ColorMode  # noqa: E402
 
 from pi_app.renderer import SLOT_LINES, SessionRenderer, ToolRecord  # noqa: E402
@@ -451,6 +451,51 @@ def test_user_echo_multiline() -> None:
           repr(out.getvalue()))
 
 
+def test_user_echo_long() -> None:
+    """粘贴一大段：回显只留开头几行 + 说明（按终端高度），全文在 ctrl+o 里"""
+    import pi_app.renderer as module
+
+    real = module.terminal_height
+    try:
+        module.terminal_height = lambda: 24
+        out = io.StringIO()
+        renderer = SessionRenderer(theme=Theme(ColorMode.NONE), stream=out)
+        text = "\n".join(f"第 {i} 行需求说明" for i in range(1, 31))
+        renderer.user_echo(text)
+        lines = out.getvalue().splitlines()
+        check("长输入: 只留 7 行 + 一行说明", len(lines) == 8 and lines[0] == "❯ 第 1 行需求说明"
+              and lines[6] == "  第 7 行需求说明" and "… 还有 23 行" in lines[7]
+              and "ctrl+o 看全文" in lines[7], str(lines))
+
+        renderer.on_event(ev("agent_start"))
+        renderer.on_event(delta("text_delta", "好的。"))
+        renderer.on_event(ev("message_end", message=SimpleNamespace(
+            role="assistant", content=[], stop_reason="stop", usage=None, text=lambda: "好的。")))
+        renderer.on_event(ev("agent_end", reason="stop"))
+        start = len(out.getvalue())
+        renderer.expand_last_turn()
+        expanded = out.getvalue()[start:]
+        check("长输入: ctrl+o 展开全文", "你的输入（全文）" in expanded and "│ 第 30 行需求说明" in expanded,
+              expanded)
+
+        renderer.user_echo("短句")
+        renderer.on_event(ev("agent_start"))
+        check("长输入: 下一句短的不带上一句的全文", renderer.turn.prompt == "")
+
+        module.terminal_height = lambda: 9
+        out = io.StringIO()
+        renderer = SessionRenderer(theme=Theme(ColorMode.NONE), stream=out)
+        renderer.user_echo("很长" * 400)
+        lines = out.getvalue().splitlines()
+        check("长输入: 矮终端少留几行；一整行超长也按折行后的行数算", len(lines) == 4
+              and "… 还有" in lines[3] and all(display_width(line) <= renderer.width for line in lines),
+              str(lines))
+        renderer.user_echo("第一行\n第二行\n第三行\n第四行")
+        check("长输入: 不超过上限的照常全显示", out.getvalue().endswith("  第四行\n"), out.getvalue()[-40:])
+    finally:
+        module.terminal_height = real
+
+
 def test_collapsed_turn() -> None:
     asyncio.run(case_collapsed_turn())
 
@@ -484,6 +529,7 @@ async def main() -> int:
     test_running_status()
     await case_steering_echo()
     test_user_echo_multiline()
+    test_user_echo_long()
 
     print()
     if FAILURES:

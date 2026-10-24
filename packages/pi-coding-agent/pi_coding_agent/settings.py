@@ -32,6 +32,9 @@ DEFAULT_SETTINGS : dict[str, Any] = {
                              "protectTokens": 40000, "minTokens": 200, "minBatchRatio": 0.1},
                    # rehydrate：压缩后补回最近修改的文件（上限另受可用窗口 8% 约束）
                    "rehydrate": {"enabled": True, "maxFiles": 5, "maxTokens": 10000}},
+    # 改文件、跑命令前确认（builtin_extensions/permissions.py）：mode = ask / acceptEdits / auto；
+    # allow / deny 规则如 "bash(git status*)"、"edit(docs/*)"；nonInteractive：没有界面可问时放行还是拒绝
+    "permissions": {"mode": "ask", "allow": [], "deny": [], "nonInteractive": "allow"},
     "extensions": [],
     "disabledExtensions": [],
     "skills": {"enabled": True}

@@ -216,8 +216,29 @@ async def handle_command(session: AgentSession, line: str) -> bool:
     return True
 
 
+async def confirm_in_terminal(request: dict) -> dict:
+    """权限确认（朴素终端）：y 允许 / a 本会话不再询问 / n 拒绝，n 后面可以跟一句说明"""
+    loop = asyncio.get_running_loop()
+    print(f"\n{YELLOW}? {request.get('question', 'Allow?')}{RESET}")
+    for line in request.get("detail") or []:
+        print(f"{DIM}    {line}{RESET}")
+    choices = "[y]es / [a]lways / [n]o" if request.get("remember") else "[y]es / [n]o"
+    try:
+        raw = await loop.run_in_executor(None, lambda: input(f"{BOLD}{choices} (n 后可写原因): {RESET}"))
+    except (EOFError, KeyboardInterrupt):
+        return {"decision": "abort"}
+    answer = sanitize(raw).strip()
+    key, _, feedback = answer.partition(" ")
+    if key.lower() in ("y", "yes"):
+        return {"decision": "allow"}
+    if key.lower() in ("a", "always") and request.get("remember"):
+        return {"decision": "always"}
+    return {"decision": "deny", "feedback": feedback.strip()}
+
+
 async def run_interactive(session: AgentSession, show_thinking: bool) -> None:
     session.subscribe(make_printer(show_thinking))
+    session.permission_handler = confirm_in_terminal
     model = session.model
     print(f"{BOLD}pi-coding-agent{RESET} {DIM}{session.cwd}{RESET}")
     print(f"{DIM}model: {model.key if model else 'none'} · /help for commands{RESET}\n")

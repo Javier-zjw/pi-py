@@ -1284,6 +1284,175 @@ async def case_network_retry() -> None:
               and calls == ["error"] and events[-1].reason in ("aborted", "error"), str(events[-1]))
 
 
+def test_permission_rules() -> None:
+    """只读命令判断、"不再询问"的范围、规则匹配"""
+    from pi_coding_agent.builtin_extensions.permissions import command_prefixes, is_read_only, rule_matches
+
+    for command in ["ls -la", "git status && git diff HEAD", "cat a.txt | grep x | head -3",
+                    'find . -name "*.py"', "cd src && ls", "git log --oneline -5", "git branch -a"]:
+        check(f"只读命令: {command}", is_read_only(command))
+    for command in ["rm -rf build", "git push", "echo hi > f.txt", "ls $(pwd)", "cat `x`",
+                    "find . -name x -delete", "sleep 5 &", "FOO=1 ls", "git branch new", "ls 2>&1",
+                    "python3 x.py", "", "echo 'unclosed"]:
+        check(f"要问: {command or '(空)'}", not is_read_only(command))
+    check("不再询问: git / npm 记到子命令", command_prefixes("git commit -m x") == ["git commit"]
+          and command_prefixes("npm run build") == ["npm run"])
+    check("不再询问: 其他命令只记命令名", command_prefixes("pytest tests/ -q") == ["pytest"]
+          and command_prefixes("cat a | grep x") == ["cat", "grep"])
+    check("不再询问: 带重定向 / 命令替换的不提供", command_prefixes("make > log") == []
+          and command_prefixes("rm $(ls)") == [])
+    check("规则: 工具名", rule_matches("bash", "bash", {"command": "x"}, "/w"))
+    check("规则: 命令通配", rule_matches("bash(git status*)", "bash", {"command": "git status -s"}, "/w")
+          and not rule_matches("bash(git status*)", "bash", {"command": "git push"}, "/w"))
+    check("规则: 路径通配（相对工作目录）", rule_matches("edit(docs/*)", "edit", {"path": "/w/docs/a.md"}, "/w")
+          and not rule_matches("edit(docs/*)", "edit", {"path": "src/a.py"}, "/w"))
+    check("规则: 别的工具不匹配", not rule_matches("edit(*)", "write", {"path": "a"}, "/w"))
+
+
+def permission_session(cwd: Path, script: list, answers: list | None = None, **settings):
+    """带 bash / write / edit 的会话；answers 是界面依次给的决定（None 表示不挂界面）"""
+    session, _ = make_session(cwd, script, tools=["read", "bash", "write", "edit"])
+    for key, value in settings.items():
+        session.settings.set(f"permissions.{key}", value)
+    asked: list[dict] = []
+    if answers is not None:
+        async def handler(request):
+            asked.append(request)
+            return answers.pop(0)
+        session.permission_handler = handler
+    return session, asked
+
+
+def results(session) -> dict:
+    return {m.tool_call_id: m for m in session.messages if getattr(m, "role", "") == "toolResult"}
+
+
+def bash(call_id: str, command: str) -> ToolCall:
+    return ToolCall(id=call_id, name="bash", arguments={"command": command})
+
+
+async def case_permissions() -> None:
+    """权限确认：只读放行、问用户、拒绝带原因、本会话不再询问、模式、规则、没有界面时、中断"""
+    from pi_coding_agent.builtin_extensions.permissions import set_mode
+
+    with Sandbox() as cwd:
+        (cwd / "keep.txt").write_text("x", "utf-8")
+        session, asked = permission_session(cwd, [
+            [bash("b1", "ls")],
+            [bash("b2", "rm -f keep.txt")],
+            [ToolCall(id="w1", name="write", arguments={"path": "new.txt", "content": "第一行\n第二行\n"})],
+            [TextContent(text="完成")],
+        ], answers=[{"decision": "deny", "feedback": "别删，先备份"}, {"decision": "allow"}])
+        await session.prompt("整理一下")
+        out = results(session)
+        req = asked + [{}, {}]          # 没问到时让检查失败而不是抛 IndexError
+        check("权限: 只读命令不问、照常执行", not out["b1"].is_error and all(a["tool"] != "bash" or "ls" != a["summary"]
+                                                                  for a in asked))
+        check("权限: 删文件要问，请求里有命令", req[0].get("kind") == "bash" and req[0].get("summary") == "rm -f keep.txt"
+              and (req[0].get("remember") or {}).get("keys") == ["bash:rm"], str(req[0]))
+        check("权限: 拒绝后不执行，原因和用户的话给模型", (cwd / "keep.txt").exists() and out["b2"].is_error
+              and "denied" in out["b2"].content[0].text and "别删，先备份" in out["b2"].content[0].text,
+              out["b2"].content[0].text)
+        check("权限: 写文件要问，带预览", req[1].get("question") == "允许创建 new.txt 吗？"
+              and (req[1].get("detail") or [""])[0] == "新建，2 行" and "  第一行" in req[1].get("detail", []),
+              str(req[1]))
+        check("权限: 允许后照常执行", (cwd / "new.txt").read_text("utf-8") == "第一行\n第二行\n")
+
+    with Sandbox() as cwd:
+        session, asked = permission_session(cwd, [
+            [bash("t1", "touch a.txt")], [bash("t2", "touch b.txt")], [bash("t3", "touch c.txt && rm a.txt")],
+            [TextContent(text="完成")],
+        ], answers=[{"decision": "always"}, {"decision": "deny"}])
+        await session.prompt("建文件")
+        check("权限: 选「不再询问」后同类命令不再问", len(asked) == 2 and (cwd / "b.txt").exists()
+              and asked[1]["summary"] == "touch c.txt && rm a.txt", str([a.get("summary") for a in asked]))
+        check("权限: 组合命令里有没允许过的就还要问", results(session)["t3"].is_error and (cwd / "a.txt").exists())
+
+    with Sandbox() as cwd:
+        outside = cwd.parent / f"{cwd.name}-outside.txt"
+        session, asked = permission_session(cwd, [
+            [ToolCall(id="w1", name="write", arguments={"path": "in.txt", "content": "x"})],
+            [ToolCall(id="w2", name="write", arguments={"path": str(outside), "content": "x"})],
+            [bash("b1", "touch z.txt")], [TextContent(text="完成")],
+        ], answers=[{"decision": "deny"}, {"decision": "deny"}])
+        set_mode(session, "acceptEdits")
+        await session.prompt("写")
+        req = asked + [{}, {}]
+        check("acceptEdits: 工作目录里的修改直接做", (cwd / "in.txt").exists() and req[0].get("tool") == "write"
+              and req[0].get("summary") == f"../{outside.name}", str([a.get("summary") for a in asked]))
+        check("acceptEdits: 工作目录外的修改和命令仍然要问", len(asked) == 2 and req[1].get("tool") == "bash"
+              and not outside.exists())
+
+    with Sandbox() as cwd:
+        (cwd / "a.txt").write_text("x", "utf-8")
+        session, asked = permission_session(cwd, [
+            [bash("b1", "rm a.txt")], [bash("b2", "touch t.txt")], [TextContent(text="完成")],
+        ], answers=[], mode="auto", deny=["bash(touch *)"])
+        await session.prompt("清理")
+        out = results(session)
+        check("auto: 全部直接执行", not asked and not (cwd / "a.txt").exists())
+        check("deny 规则: auto 下也拦，原因写明规则", out["b2"].is_error and "bash(touch *)" in out["b2"].content[0].text
+              and not (cwd / "t.txt").exists(), out["b2"].content[0].text)
+
+    with Sandbox() as cwd:
+        session, asked = permission_session(cwd, [[bash("b1", "touch t.txt")], [TextContent(text="完成")]],
+                                            answers=[], allow=["bash(touch *)"])
+        await session.prompt("建")
+        check("allow 规则: 不问直接执行", not asked and (cwd / "t.txt").exists())
+
+    with Sandbox() as cwd:
+        session, _ = permission_session(cwd, [[bash("b1", "touch t.txt")], [TextContent(text="完成")]])
+        await session.prompt("建")
+        check("没有界面: 默认放行（print 模式、网页照旧能用）", (cwd / "t.txt").exists())
+    with Sandbox() as cwd:
+        session, _ = permission_session(cwd, [[bash("b1", "touch t.txt")], [TextContent(text="完成")]],
+                                        nonInteractive="deny")
+        await session.prompt("建")
+        check("没有界面: nonInteractive=deny 时拦下", not (cwd / "t.txt").exists()
+              and "no interactive UI" in results(session)["b1"].content[0].text)
+
+    with Sandbox() as cwd:
+        session, asked = permission_session(cwd, [
+            [bash("b1", "touch t.txt")], [bash("b2", "touch u.txt")], [TextContent(text="不该到这")],
+        ], answers=[{"decision": "abort"}])
+        events = record(session)
+        await session.prompt("建")
+        check("Esc: 拒绝并停止这一轮", events[-1].reason == "aborted" and len(asked) == 1
+              and not (cwd / "t.txt").exists() and not (cwd / "u.txt").exists(), events[-1].reason)
+
+    with Sandbox() as cwd:
+        session, _ = permission_session(cwd, [[bash("b1", "touch t.txt")], [TextContent(text="完成")]])
+
+        async def crashing(request):
+            raise RuntimeError("界面挂了")
+
+        session.permission_handler = crashing
+        await session.prompt("建")
+        check("界面出错: 当作没同意，不执行", not (cwd / "t.txt").exists()
+              and "Could not ask the user" in results(session)["b1"].content[0].text)
+
+    with Sandbox() as cwd:
+        session, asked = permission_session(cwd, [[TextContent(text="x")]], answers=[])
+        text = await session.run_command("permissions", "acceptEdits")
+        check("/permissions: 切换模式并显示", "自动接受文件修改" in text, text)
+        text = await session.run_command("permissions", "nope")
+        check("/permissions: 未知模式报错", "未知的权限模式" in text, text)
+
+        api = session.resources.get_extension_api()
+
+        async def broken(call, session):
+            raise RuntimeError("坏钩子")
+
+        api.tool_call_hooks.insert(0, broken)
+        try:
+            session.agent.stream_fn = scripted_stream([[bash("b1", "ls")], [TextContent(text="完成")]])
+            await session.prompt("看看")
+            check("钩子出错: 不影响工具执行，错误记下来", not results(session)["b1"].is_error
+                  and any("坏钩子" in e for e in api.tool_call_errors))
+        finally:
+            api.tool_call_hooks.remove(broken)
+
+
 def dangling_calls(messages) -> set[str]:
     calls = {c.id for m in messages if getattr(m, "role", "") == "assistant" for c in m.tool_calls()}
     return calls - {m.tool_call_id for m in messages if getattr(m, "role", "") == "toolResult"}
@@ -1923,6 +2092,10 @@ def test_overflow_unrecoverable() -> None:
     asyncio.run(case_overflow_unrecoverable())
 
 
+def test_permissions() -> None:
+    asyncio.run(case_permissions())
+
+
 def test_network_retry() -> None:
     asyncio.run(case_network_retry())
 
@@ -2038,6 +2211,8 @@ async def main() -> int:
     await case_overflow_unrecoverable()
     await case_overflow_other_errors()
     await case_network_retry()
+    test_permission_rules()
+    await case_permissions()
     await case_resume_after_crash_mid_tool()
     await case_abort_mid_tool_call_stream()
     await case_continue_after_crash()

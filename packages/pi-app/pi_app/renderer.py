@@ -203,6 +203,7 @@ class SessionRenderer:
         # 任务清单跨轮保留：批准计划时在一轮开始前生成，执行时一轮轮往下勾
         self.plan: list[dict] | None = None
         self.mode = "chat"      # 当前工作模式，输入框下面显示
+        self.permission = ""    # 不是默认（每次确认）时的权限模式名，输入框下面显示
         self._folded_prompt = ""    # 刚回显时折叠了的用户输入，下一轮开始时记进 TurnRecord
         self.state = RenderState()
         self.turn = TurnRecord()
@@ -273,6 +274,8 @@ class SessionRenderer:
                     f"{t.muted(' · 只读调研，先出计划再动手 · shift+tab 切换')}")
         else:
             hint = t.muted("⏵ 执行模式 · shift+tab 切换到计划模式")
+        if self.permission:
+            hint += f"  {t.warn('⚠ ' + self.permission)}"
         return f"{rule(self.width, '', t)}\n  {hint}"
 
     def on_event(self, event: Any) -> None:

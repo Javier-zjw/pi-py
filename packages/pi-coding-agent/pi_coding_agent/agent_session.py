@@ -66,6 +66,8 @@ from .tools import DEFAULT_TOOL_NAMES, create_tools
 
 # 界面实现的提问回调：问题列表 → 每题的回答（用户跳过返回 None）
 UserInputHandler = Callable[[list[dict[str, Any]]], Awaitable["list[dict[str, Any]] | None"]]
+# 界面实现的权限确认回调：请求（工具、摘要、细节）→ {"decision": allow/always/deny/abort, "feedback"}
+PermissionHandler = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
 
 
 @dataclass
@@ -151,6 +153,7 @@ class AgentSession:
             tool_execution=self.settings.get("toolExecution", "parallel"),
             transform_context=self._transform_context,
             on_stream_error=self._on_stream_error,
+            before_tool_call=self._before_tool_call,
             # 重试次数由 _retry_after_error 按设置控制；这里给够余量（+1 留给上下文超长的那次）
             max_error_retries=int(self.settings.get("retry.maxRetries", 3) or 0) + 1,
         )
@@ -189,6 +192,9 @@ class AgentSession:
         # 界面提供的"向用户提问"入口（pi-tui 弹选择器）。None = 没有可交互的界面（print 模式、网页），
         # 扩展的提问工具据此退回到"在回复里写问题"
         self.user_input: UserInputHandler | None = None
+        # 界面提供的"执行前确认"入口（pi-tui 弹选择器）。None = 没有可交互的界面，
+        # 权限扩展按 permissions.nonInteractive 决定放行还是拒绝
+        self.permission_handler: PermissionHandler | None = None
         self.agent.subscribe(self._on_agent_event)
         self.resources.get_extension_api().session = self
 
@@ -562,6 +568,9 @@ class AgentSession:
                 mode = (entry.data or {}).get("mode") if isinstance(entry.data, dict) else None
                 return mode if mode in modes else "chat"
         return "chat"
+
+    async def _before_tool_call(self, call: Any, state: Any) -> Any:
+        return await self.resources.get_extension_api().run_tool_call_hooks(call, self)
 
     async def ask_user(self, questions: list[dict[str, Any]]) -> list[dict[str, Any]] | None:
         """让界面向用户提问。questions 每项 {question, header?, options: [{label, description?,

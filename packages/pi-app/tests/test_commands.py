@@ -66,12 +66,14 @@ class ScriptedApp(App):
         self.picks: list[tuple[int, str | None] | None] = []
         self.pick_calls: list[tuple[str, list]] = []
         self.pick_headers: list[str] = []
+        self.pick_details: list = []
         self.typed: list[str] = []      # ask_user 选「其他」时依次输入的回答
         self.typed_for: list[tuple[str, str]] = []
 
     async def pick(self, title, items, **kwargs):
         self.pick_calls.append((title, items))
         self.pick_headers.append(kwargs.get("header", ""))
+        self.pick_details.append(kwargs.get("detail"))
         choice = self.picks.pop(0)
         if choice is None:
             return None
@@ -86,13 +88,13 @@ class ScriptedApp(App):
         return self.typed.pop(0)
 
 
-def make_app(cwd: Path, script: list[list] | None = None, persist: bool = False):
+def make_app(cwd: Path, script: list[list] | None = None, persist: bool = False, tools=("read",)):
     models, _ = fake_models(script or [], models=[PLAIN, THINKER])
     agent_dir = cwd / "agent"
     services = create_agent_session_services(cwd=cwd, agent_dir=agent_dir,
                                              model_runtime=ModelRuntime(models, agent_dir))
     manager = SessionManager.create(cwd, agent_dir) if persist else SessionManager.in_memory(cwd)
-    session = AgentSession(services, manager, model=PLAIN, tools=["read"])
+    session = AgentSession(services, manager, model=PLAIN, tools=list(tools))
     out = io.StringIO()
     renderer = SessionRenderer(theme=Theme(ColorMode.NONE), stream=out)
     return ScriptedApp(session, renderer, agent_dir=agent_dir), out
@@ -433,6 +435,54 @@ async def case_plan_ask_user() -> None:
         check("提问: Esc 跳过全部", "跳过了提问" in text and len(app.pick_calls) == 1, text)
 
 
+# -- 权限确认 ---------------------------------------------------------------- #
+
+def sh(call_id: str, command: str) -> ToolCall:
+    return ToolCall(id=call_id, name="bash", arguments={"command": command})
+
+
+async def case_permissions_ui() -> None:
+    """改文件、跑命令前弹「需要你确认」面板：命令写在面板里；拒绝 / 说明 / 不再询问各留一行结论"""
+    with Sandbox() as cwd:
+        (cwd / "keep.txt").write_text("x", "utf-8")
+        app, out = make_app(cwd, [[sh("b1", "rm -f keep.txt")], [sh("b2", "touch t.txt")],
+                                  [sh("b3", "touch u.txt")], [TextContent(text="完成")]], tools=("read", "bash"))
+        app.picks = [(2, None), (1, None)]          # 拒绝；允许并且不再询问 touch
+        start = len(out.getvalue())
+        await app.send("整理")
+        text = tail(out, start)
+        title, items = app.pick_calls[0]
+        check("确认面板: 上边框写明需要确认、问题、命令", app.pick_headers[0] == "需要你确认 · 执行命令"
+              and title == "允许执行这条命令吗？" and "rm -f keep.txt" in "".join(app.pick_details[0]),
+              str((app.pick_headers[0], title, app.pick_details[0])))
+        check("确认面板: 选项", [i.label for i in items] == ["允许", "允许，并且本会话不再询问 rm …", "拒绝", "拒绝并说明"],
+              str([i.label for i in items]))
+        check("拒绝: 不执行，留一行结论", (cwd / "keep.txt").exists() and "✗ 拒绝了 bash rm -f keep.txt" in text, text)
+        check("不再询问: 留一行，同类命令不再弹", "✓ 本会话不再询问 touch …" in text and len(app.pick_calls) == 2
+              and (cwd / "t.txt").exists() and (cwd / "u.txt").exists(), text)
+
+    with Sandbox() as cwd:
+        app, out = make_app(cwd, [[sh("b1", "rm -rf build")], [TextContent(text="好")]], tools=("read", "bash"))
+        app.picks = [(3, None)]
+        app.typed = ["先用 git clean -n 看看"]
+        start = len(out.getvalue())
+        await app.send("清理")
+        result = next(m for m in app.session.messages if getattr(m, "role", "") == "toolResult")
+        check("拒绝并说明: 用户的话给模型", "先用 git clean -n 看看" in result.content[0].text
+              and "拒绝了 bash rm -rf build：先用 git clean -n 看看" in tail(out, start), tail(out, start))
+
+    with Sandbox() as cwd:
+        app, out = make_app(cwd, [], tools=("read", "bash"))
+        app.picks = [(1, None)]
+        await app.dispatch("/permissions")
+        title, items = app.pick_calls[-1]
+        check("/permissions: 选择器列出三种模式", title == "权限模式"
+              and [i.label for i in items] == ["每次确认", "自动接受文件修改", "全部自动"] and items[0].current)
+        check("/permissions: 输入框下显示非默认模式", "⚠ 自动接受文件修改" in app.renderer.input_footer())
+        await app.dispatch("/permissions ask")
+        check("/permissions: 切回默认后不显示", "⚠" not in app.renderer.input_footer())
+
+
 # -- 信息类 ------------------------------------------------------------------ #
 
 async def case_info() -> None:
@@ -497,6 +547,10 @@ def test_plan_ask_user() -> None:
     asyncio.run(case_plan_ask_user())
 
 
+def test_permissions_ui() -> None:
+    asyncio.run(case_permissions_ui())
+
+
 def test_info() -> None:
     asyncio.run(case_info())
 
@@ -517,6 +571,7 @@ async def main() -> int:
     print("计划 / 执行模式")
     await case_plan_mode()
     await case_plan_ask_user()
+    await case_permissions_ui()
     print("信息类")
     await case_info()
 

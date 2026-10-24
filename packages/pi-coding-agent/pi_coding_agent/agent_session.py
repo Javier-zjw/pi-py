@@ -58,6 +58,7 @@ from .model_runtime import ModelRuntime
 from .resources import DefaultResourceLoader, ResourceLoader
 from .session.entries import CustomEntry
 from .session.manager import SessionManager
+from .session_events import ModeChangedEvent
 from .settings import SettingsManager
 from .tools import DEFAULT_TOOL_NAMES, create_tools
 
@@ -174,7 +175,7 @@ class AgentSession:
         self._compaction_blocked = False
         self._overflow_recovered = False
         # 当前工作模式。核心不解释它的含义，具体行为由扩展的 Mode.apply 决定
-        self.mode: str = "chat"
+        self.mode: str = self._restore_mode()
         self._base_system_prompt = state.system_prompt or ""
         self._base_tools = list(active_tools)
         self.agent.subscribe(self._on_agent_event)
@@ -503,11 +504,31 @@ class AgentSession:
 
         return text
 
-    async def set_mode(self, mode: str) -> str:
-        """切换工作模式。写进会话记录，恢复时能还原"""
-        self.mode = mode
+    def switch_mode(self, mode: str) -> str:
+        """切换工作模式（同步，界面的快捷键里也能直接调）。写进会话记录，恢复时能还原；
+        发 mode_changed 事件，界面据此刷新。只在两轮之间生效：下一轮开始时 _apply_mode 重建工具和提示"""
+        if mode == self.mode:
+            return self.mode
+        previous, self.mode = self.mode, mode
         self.session.append_custom_entry("mode_change", {"mode": mode})
+        self._emit(ModeChangedEvent(mode=mode, previous=previous))
         return self.mode
+
+    async def set_mode(self, mode: str) -> str:
+        return self.switch_mode(mode)
+
+    def _restore_mode(self) -> str:
+        """恢复会话时还原上次的模式（以前总是回到 chat，计划模式里 resume 后就丢了）"""
+        modes = self.resources.get_extension_api().modes
+        for entry in reversed(self.session.get_branch()):
+            if getattr(entry, "type", "") == "custom" and getattr(entry, "custom_type", "") == "mode_change":
+                mode = (entry.data or {}).get("mode") if isinstance(entry.data, dict) else None
+                return mode if mode in modes else "chat"
+        return "chat"
+
+    def notify(self, event: Any) -> None:
+        """扩展发会话事件（如计划提交、任务清单更新）给界面"""
+        self._emit(event)
 
     def available_modes(self) -> list[Any]:
         api = self.resources.get_extension_api()

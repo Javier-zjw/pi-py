@@ -24,7 +24,7 @@ for _p in (HERE.parents[1], PACKAGES / "pi-tui", PACKAGES / "pi-coding-agent",
 
 from fakes import FAKE_MODEL, Sandbox, fake_models
 
-from pi_ai import TextContent
+from pi_ai import TextContent, ToolCall
 from pi_app.app import App
 from pi_app.commands import ago, model_items, thinking_choices, usage_bar
 from pi_app.renderer import SessionRenderer
@@ -315,6 +315,69 @@ async def case_resume() -> None:
         check("/resume <文件>: 直接打开", app.session.session_file == first)
 
 
+# -- 计划 / 执行模式 ------------------------------------------------------------ #
+
+def submit(call_id: str = "s1") -> ToolCall:
+    return ToolCall(id=call_id, name="submit_plan", arguments={
+        "title": "加超时配置", "summary": "把超时做成可配置。",
+        "steps": ["读 cfg.py", "改成读环境变量", "跑测试"], "files": ["cfg.py"]})
+
+
+def tick(call_id: str, done: int) -> ToolCall:
+    steps = ["读 cfg.py", "改成读环境变量", "跑测试"]
+    plan = [{"step": step, "status": "completed" if i < done else ("in_progress" if i == done else "pending")}
+            for i, step in enumerate(steps)]
+    return ToolCall(id=call_id, name="update_plan", arguments={"plan": plan})
+
+
+async def case_plan_mode() -> None:
+    with Sandbox() as cwd:
+        (cwd / "cfg.py").write_text("TIMEOUT = 30\n", "utf-8")
+        script = [
+            [ToolCall(id="r1", name="read", arguments={"path": "cfg.py"})],
+            [submit()],
+            [tick("u1", 1)], [tick("u2", 3)], [TextContent(text="都改好了，测试通过。")],
+        ]
+        app, out = make_app(cwd, script)
+        check("shift+tab: 执行 → 计划", (app.cycle_mode(), app.session.mode)[1] == "plan")
+        check("shift+tab: 输入框下显示计划模式", "⏸ 计划模式" in app.renderer.input_footer())
+        check("shift+tab: 计划 → 执行", (app.cycle_mode(), app.session.mode)[1] == "chat")
+
+        app.picks = [(0, None)]
+        start = len(out.getvalue())
+        await app.dispatch("/plan 给配置加一个可调的超时")
+        text = tail(out, start)
+        title, items = app.pick_calls[-1]
+        check("计划: 提交后问要不要执行", title == "执行这个计划？"
+              and [i.label for i in items] == ["执行计划", "继续完善", "先不执行"], str(items))
+        check("计划: 计划单独成块显示", "╭ 计划 加超时配置" in text and "│ 2. 改成读环境变量" in text, text)
+        check("执行: 选「执行计划」后切到执行模式", app.session.mode == "chat")
+        check("执行: 只回显一行标题，不回显整段任务说明", "✓ 执行计划 加超时配置" in text
+              and "执行要求" not in text, text)
+        check("执行: 跑完", "● 都改好了，测试通过。" in text, text)
+        last = text[text.rindex("✻ "):]
+        check("执行: 用时行下面是打完勾的清单", "✓ 读 cfg.py" in last and "✓ 跑测试" in last, last)
+
+    with Sandbox() as cwd:
+        app, out = make_app(cwd, [[submit()]])
+        app.picks = [(1, None)]
+        start = len(out.getvalue())
+        await app.dispatch("/plan 再想想")
+        check("完善: 选「继续完善」留在计划模式", app.session.mode == "plan"
+              and "直接输入修改意见" in tail(out, start), tail(out, start))
+        app.session.switch_mode("chat")
+        app.picks = []
+        await app.dispatch("/build")
+        check("/build: 执行最近提交的计划", app.session.mode == "chat"
+              and "执行计划 加超时配置" in out.getvalue())
+
+    with Sandbox() as cwd:
+        app, out = make_app(cwd, [])
+        start = len(out.getvalue())
+        await app.dispatch("/build")
+        check("/build: 没有计划时提示", "还没有可执行的计划" in tail(out, start), tail(out, start))
+
+
 # -- 信息类 ------------------------------------------------------------------ #
 
 async def case_info() -> None:
@@ -371,6 +434,10 @@ def test_resume() -> None:
     asyncio.run(case_resume())
 
 
+def test_plan_mode() -> None:
+    asyncio.run(case_plan_mode())
+
+
 def test_info() -> None:
     asyncio.run(case_info())
 
@@ -388,6 +455,8 @@ async def main() -> int:
     print("/clear /resume")
     await case_clear()
     await case_resume()
+    print("计划 / 执行模式")
+    await case_plan_mode()
     print("信息类")
     await case_info()
 

@@ -69,7 +69,7 @@ def activate(pi) -> None:
             record["explanation"] = args["explanation"].strip()
         session = pi.session
         if session is not None:
-            session.session.append_custom_entry(ENTRY_TYPE, record)
+            save_todo(session, record)
         done = sum(s["status"] == "completed" for s in steps)
         current = next((s["step"] for s in steps if s["status"] == "in_progress"), None)
         text = f"Plan updated ({done}/{len(steps)} done)."
@@ -89,6 +89,14 @@ def activate(pi) -> None:
         return render_todo_context(record)
 
     pi.compaction_context(todo_context)
+
+
+def save_todo(session, record: dict) -> None:
+    """存进会话记录，并通知界面刷新勾选单（批准计划时生成清单也走这里）"""
+    from pi_coding_agent.session_events import TodoUpdatedEvent
+
+    session.session.append_custom_entry(ENTRY_TYPE, record)
+    session.notify(TodoUpdatedEvent(plan=record["plan"], explanation=record.get("explanation", "")))
 
 
 def latest_todo(session) -> dict | None:

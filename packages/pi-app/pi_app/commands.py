@@ -187,6 +187,18 @@ async def cmd_resume(app: App, rest: str) -> None:
     await app.open_session(target)
 
 
+async def cmd_plan(app: App, rest: str) -> None:
+    app.session.switch_mode("plan")
+    if rest:
+        await app.send(rest)
+    else:
+        app.note("已进入计划模式：只读调研，先出带任务清单的计划。描述你的需求开始（shift+tab 切回）")
+
+
+async def cmd_build(app: App, rest: str) -> None:
+    await app.execute_plan(rest)
+
+
 async def cmd_continue(app: App, rest: str) -> None:
     if not app.session.can_continue:
         app.note("没有可以继续的任务：上一轮已经完成")
@@ -294,6 +306,8 @@ BUILTIN_COMMANDS: list[AppCommand] = [
     AppCommand("think", "设置思考档位", cmd_think, usage="[档位]"),
     AppCommand("clear", "开始新会话（清空上下文）", cmd_clear, aliases=("new", "reset")),
     AppCommand("resume", "恢复历史会话", cmd_resume, usage="[会话文件]"),
+    AppCommand("plan", "进入计划模式（只读调研、先出计划；shift+tab 切换）", cmd_plan, usage="[需求]"),
+    AppCommand("build", "执行最近提交的计划", cmd_build, usage="[补充说明]"),
     AppCommand("continue", "接着执行上次中断的那一轮", cmd_continue),
     AppCommand("compact", "压缩上下文，可附加压缩重点", cmd_compact, usage="[说明]"),
     AppCommand("context", "上下文用量和压缩阈值", cmd_context),

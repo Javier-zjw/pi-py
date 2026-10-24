@@ -376,7 +376,8 @@ async def case_plan_mode_tools() -> None:
 
         await session.set_mode("plan")
         await session._apply_mode()
-        check("计划模式: 只读工具 + submit_plan", names() == {"read", "submit_plan"}, str(names()))
+        check("计划模式: 全部只读工具 + submit_plan（没有写文件、bash、update_plan）",
+              names() == {"read", "grep", "find", "ls", "submit_plan"}, str(names()))
 
         await session.set_mode("chat")
         await session._apply_mode()
@@ -761,6 +762,81 @@ async def case_goal_reanchor() -> None:
               and "「读一下 f0 到 f3」" in wrap[0].text() and not wrap[0].details.get("quiet"),
               str([m.text()[:80] for m in wrap]))
         check("收尾: 没有计划时提示可以列计划", "update_plan" in wrap[0].text(), wrap[0].text())
+
+
+def submit_call(call_id: str, *steps: str, title: str = "加超时配置") -> ToolCall:
+    return ToolCall(id=call_id, name="submit_plan", arguments={
+        "title": title, "summary": "## 思路\n把超时做成可配置项。", "steps": list(steps),
+        "files": ["cfg.py"], "questions": []})
+
+
+async def case_plan_execute_flow() -> None:
+    """计划模式：只读调研 → 提交即停 → 批准后切执行模式、任务变进度单 → 逐项打勾；resume 后模式还在"""
+    from pi_coding_agent.builtin_extensions.plan_mode import approve_plan, latest_plan
+
+    with Sandbox() as cwd:
+        (cwd / "cfg.py").write_text("TIMEOUT = 30\n", "utf-8")
+        script = [
+            [ToolCall(id="r1", name="read", arguments={"path": "cfg.py"})],
+            [submit_call("s1", "读 cfg.py 确认现状", "把 TIMEOUT 改成读环境变量", "跑测试")],
+            [TextContent(text="不该出现：提交计划后应该停下")],
+        ]
+        manager = file_manager(cwd)
+        session, provider = make_session(cwd, script, session_manager=manager,
+                                         tools=["read", "write", "edit", "bash"])
+        events = record(session)
+        session.switch_mode("plan")
+        await session.prompt("给配置加一个可调的超时")
+        types = [e.type for e in events]
+        check("计划: 切模式发 mode_changed", types[0] == "mode_changed" and events[0].mode == "plan")
+        tools = {t.name for t in provider.calls[0]["context"].tools}
+        check("计划: 计划模式只给只读工具和 submit_plan",
+              tools == {"read", "grep", "find", "ls", "submit_plan"}, str(tools))
+        check("计划: 系统提示带计划模式说明", "<plan_mode>" in provider.calls[0]["context"].system_prompt)
+        check("计划: 提交即停（不再调模型）", len(provider.calls) == 2
+              and types[-1] == "agent_end" and events[-1].reason == "terminated", str(len(provider.calls)))
+        proposed = [e for e in events if e.type == "plan_proposed"]
+        check("计划: 发 plan_proposed，带任务", len(proposed) == 1
+              and proposed[0].plan["steps"][1] == "把 TIMEOUT 改成读环境变量", str(proposed))
+        check("计划: 存进会话记录（proposed）", latest_plan(session)["status"] == "proposed")
+        check("计划: 还在计划模式", session.mode == "plan")
+
+        reopened = AgentSession(session.services, SessionManager.open(cwd / "s.jsonl"), model=FAKE_MODEL)
+        check("计划: resume 后模式还在", reopened.mode == "plan", reopened.mode)
+        session.resources.get_extension_api().session = session   # reopened 抢走了绑定，换回来
+
+        events.clear()
+        task = approve_plan(session, "注意兼容旧配置")
+        check("批准: 切到执行模式", session.mode == "chat" and events[0].type == "mode_changed")
+        todo = [e for e in events if e.type == "todo_updated"]
+        check("批准: 任务变成进度单、第一项进行中", len(todo) == 1
+              and [s["status"] for s in todo[0].plan] == ["in_progress", "pending", "pending"], str(todo))
+        check("批准: 记录为 approved", latest_plan(session)["status"] == "approved")
+        check("批准: 任务说明带清单和用户补充", "2. 把 TIMEOUT 改成读环境变量" in task
+              and "注意兼容旧配置" in task and "update_plan" in task, task)
+
+        provider.fn = scripted_stream([
+            [plan_call("u1", ("读 cfg.py 确认现状", "completed"), ("把 TIMEOUT 改成读环境变量", "in_progress"),
+                       ("跑测试", "pending"))],
+            [plan_call("u2", ("读 cfg.py 确认现状", "completed"), ("把 TIMEOUT 改成读环境变量", "completed"),
+                       ("跑测试", "completed"))],
+            [TextContent(text="都做完了")],
+        ])
+        await session.prompt(task)
+        tools = {t.name for t in provider.calls[-1]["context"].tools}
+        check("执行: 执行模式工具齐全", {"write", "edit", "bash", "update_plan"} <= tools, str(tools))
+        updates = [e for e in events if e.type == "todo_updated"]
+        check("执行: 每次 update_plan 都通知界面", [sum(s["status"] == "completed" for s in e.plan)
+                                                  for e in updates] == [0, 1, 3], str(updates))
+        check("执行: 跑完", session.messages[-1].text() == "都做完了")
+
+    with Sandbox() as cwd:
+        session, _ = make_session(cwd, [[TextContent(text="x")]])
+        try:
+            approve_plan(session)
+            check("批准: 没有计划时报错", False)
+        except LookupError as exc:
+            check("批准: 没有计划时报错", "还没有可执行的计划" in str(exc))
 
 
 async def case_prune_disabled() -> None:
@@ -1530,6 +1606,10 @@ def test_todo_plan() -> None:
     asyncio.run(case_todo_plan())
 
 
+def test_plan_execute_flow() -> None:
+    asyncio.run(case_plan_execute_flow())
+
+
 def test_goal_reanchor() -> None:
     asyncio.run(case_goal_reanchor())
 
@@ -1657,6 +1737,7 @@ async def main() -> int:
     await case_prune_skips_small_batches()
     await case_tool_budget()
     await case_todo_plan()
+    await case_plan_execute_flow()
     await case_goal_reanchor()
     await case_reasoning_passback_end_to_end()
     await case_prune_disabled()

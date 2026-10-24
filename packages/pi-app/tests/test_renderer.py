@@ -30,7 +30,7 @@ from pi_ai import TextContent, ThinkingContent, ToolCall, Usage, UserMessage  # 
 from pi_tui import Theme, display_width  # noqa: E402
 from pi_tui.theme import ColorMode  # noqa: E402
 
-from pi_app.renderer import SLOT_LINES, SessionRenderer, ToolRecord  # noqa: E402
+from pi_app.renderer import SLOT_LINES, SessionRenderer  # noqa: E402
 from pi_coding_agent import ModelRuntime, SessionManager  # noqa: E402
 from pi_coding_agent.agent_session import AgentSession, create_agent_session_services  # noqa: E402
 
@@ -93,8 +93,8 @@ async def case_collapsed_turn() -> None:
         check("不落盘: 不打印思考", "先列目录" not in text and "思考" not in text, text)
         summary = [line for line in lines if line.startswith("✻ ")]
         check("用时: 每轮一行，在最上面", len(summary) == 1 and lines[0] == summary[0], str(lines))
-        check("用时: 带工具次数和名字", "4 次工具" in summary[0] and "bash ×2" in summary[0]
-              and "read ×2" in summary[0], summary[0])
+        check("用时: 带工具次数（工具名在活动区和 ctrl+o 里看）", "4 次工具" in summary[0]
+              and "bash" not in summary[0], summary[0])
         check("用时: 失败数醒目标出", "1 失败" in summary[0], summary[0])
         check("用时: 提示怎么展开", "ctrl+o 展开" in summary[0])
         check("用时: 不带文字标签", "用时" not in text and "上下文" not in text, text)
@@ -161,7 +161,7 @@ def test_live_slot() -> None:
                          arguments={"command": "ls -la"}))
     text = live()
     check("活动区: 工具顶掉思考", "bash" in text and "列目录" not in text, text)
-    check("活动区: 不显示工具参数", "ls -la" not in text, text)
+    check("活动区: 工具带上关键参数", "bash  ls -la" in text, text)
     check("活动区: 用时行带工具次数", "执行工具 · 1 次工具" in text, text)
     renderer.on_event(ev("tool_execution_end", tool_call_id="t1", tool_name="bash", is_error=False,
                          result=SimpleNamespace(content=[], details=None)))
@@ -286,7 +286,8 @@ def test_plan_display() -> None:
     renderer.on_event(ev("agent_end", reason="stop"))
     lines = out.getvalue().splitlines()
     summary = next(i for i, line in enumerate(lines) if line.startswith("✻ "))
-    check("计划: 用时行只数真正的工具", "1 次工具 read" in lines[summary], lines[summary])
+    check("计划: 用时行只数真正的工具", "1 次工具" in lines[summary] and "2 次" not in lines[summary],
+          lines[summary])
     check("计划: 最终勾选单写在用时行下面、回答上面",
           lines[summary + 1:summary + 5] == ["  ☰ 任务 2/3", "    ✓ 1. 读取项目结构",
                                              "    ✓ 2. 分析压缩模块", "    ▸ 3. 总结"]
@@ -404,8 +405,8 @@ def test_plan_guard_segment() -> None:
     lines = out.getvalue().splitlines()
     summaries = [i for i, line in enumerate(lines) if line.startswith("✻ ")]
     check("分段: 提醒之后另起一段用时行", len(summaries) == 2, str(lines))
-    check("分段: 第二段只数自己的工具", "2 次工具 bash ×2" in lines[summaries[1]]
-          and "1 次工具 bash" in lines[summaries[0]], str([lines[i] for i in summaries]))
+    check("分段: 第二段只数自己的工具", "2 次工具" in lines[summaries[1]]
+          and "1 次工具" in lines[summaries[0]], str([lines[i] for i in summaries]))
     check("分段: 最终回答上面是最新的清单", lines[summaries[1] + 1] == "  ✓ 任务 2/2"
           and lines.index("● 都做完了。") > summaries[1] + 2, str(lines))
 
@@ -434,24 +435,84 @@ def test_retry_display() -> None:
     check("重试: 次数并进用时行", "重试 1 次" in summary, summary)
 
 
-def test_running_status() -> None:
-    """运行中只显示正在执行的那个工具：名字 + 时长，不带参数"""
-    renderer = SessionRenderer(theme=Theme(ColorMode.NONE), stream=io.StringIO())
-    renderer.agent_running = True
-    renderer.state.turn_started = time.time()
-    record = ToolRecord("t1", "bash", {"command": "pytest -q tests"}, time.time() - 2.0)
-    renderer.state.running["t1"] = record
-    renderer.state.slot, renderer.state.batch = "tools", [record]
-    status = renderer._tools_line()
-    check("工具行: 显示工具名", "bash" in status, status)
-    check("工具行: 不显示参数", "pytest" not in status, status)
-    check("工具行: 显示已执行时长", "2.0s" in status, status)
-    second = ToolRecord("t2", "read", {"path": "a.py"}, time.time())
-    renderer.state.running["t2"] = second
-    renderer.state.batch.append(second)
-    status = renderer._tools_line()
-    check("工具行: 并行时只显示最新的一个", "read" in status and "bash" not in status
-          and "等 2 个" in status, status)
+def test_tool_lines() -> None:
+    """活动区每个工具一行：名字 + 关键参数 + 结果；一轮结束汇总改了哪些文件；状态栏"""
+    out = io.StringIO()
+    renderer = SessionRenderer(theme=Theme(ColorMode.NONE), stream=out)
+    renderer.cwd = "/work"
+    renderer.on_event(ev("agent_start"))
+
+    def start(call_id, name, args):
+        renderer.on_event(ev("tool_execution_start", tool_call_id=call_id, tool_name=name, arguments=args))
+
+    def end(call_id, name, details=None, text="", error=False):
+        renderer.on_event(ev("tool_execution_end", tool_call_id=call_id, tool_name=name, is_error=error,
+                             result=SimpleNamespace(content=[SimpleNamespace(text=text)], details=details)))
+
+    start("b1", "bash", {"command": "pytest -q\n  tests"})
+    renderer.state.running["b1"].started -= 2.0
+    live = "\n".join(renderer._live_lines())
+    check("工具行: 在跑的显示命令和用时", "bash  pytest -q tests  2.0s" in live, live)
+    end("b1", "bash", {"exit_code": 0})
+    start("e1", "edit", {"path": "/work/src/app.py", "old_text": "a", "new_text": "b"})
+    end("e1", "edit", {"path": "/work/src/app.py", "patch": "--- a\n+++ b\n-x\n+y\n+z\n"})
+    start("w1", "write", {"path": "notes.md", "content": "一\n二\n三\n"})
+    end("w1", "write", {"path": "/work/notes.md", "created": True})
+    start("r1", "read", {"path": "/work/README.md", "offset": 10})
+    end("r1", "read", {"path": "/work/README.md", "lines": 42})
+    live = "\n".join(renderer._live_lines())
+    check("工具行: 路径相对工作目录、edit 显示加减行数", "✓ edit  src/app.py  +2 −1" in live, live)
+    check("工具行: write 显示新建几行", "✓ write  notes.md  新建 3 行" in live, live)
+    check("工具行: read 显示行数和起始行", "✓ read  README.md:10  42 行" in live, live)
+    check("工具行: 只显示最新 3 个，前面的折成一行", "… 前面 1 个（完成 1）" in live and "pytest" not in live, live)
+    start("g1", "grep", {"pattern": "TODO", "path": "/work/src"})
+    end("g1", "grep", text="exit 2: bad pattern\nmore", error=True)
+    live = "\n".join(renderer._live_lines())
+    check("工具行: 失败显示错误第一行", "✗ grep  TODO  src  exit 2: bad pattern" in live, live)
+    start("e2", "edit", {"path": "src/app.py"})
+    end("e2", "edit", {"path": "/work/src/app.py", "patch": "+w\n"})
+
+    renderer.on_event(delta("text_delta", "改好了。"))
+    renderer.on_event(ev("message_end", message=SimpleNamespace(
+        role="assistant", content=[], stop_reason="stop", usage=None, text=lambda: "改好了。")))
+    renderer.on_event(ev("agent_end", reason="stop"))
+    lines = out.getvalue().splitlines()
+    summary = next(line for line in lines if line.startswith("✻ "))
+    check("用时行: 改了几个文件、总加减", "6 次工具 · 1 失败 · 改了 2 个文件 +6 −1" in summary, summary)
+    files = lines[lines.index("● 改好了。") + 1:]
+    check("改动汇总: 回答后每个文件一行，同一文件合并", "  src/app.py  +3 −1" in files
+          and "  notes.md    +3 −0  新建" in files, str(files))
+
+    renderer.status.model = "fake/glm-5.2"
+    renderer.context_window, renderer.context_tokens = 200_000, 36_000
+    renderer.status.cost = 0.0123
+    footer = renderer.input_footer().split("\n")[1]
+    check("状态栏: 模型 · 上下文占用 · 费用", footer.endswith("glm-5.2 · 上下文 18% · ¥0.012"), footer)
+
+
+def test_code_highlight() -> None:
+    """代码块按语言着色；没写语言的不上色；表格可以比正文宽"""
+    from pi_tui import highlight, render_markdown
+    from pi_tui.theme import ColorMode as Mode
+
+    t = Theme(Mode.ANSI256)
+    code = highlight("def f(x=1):  # 注释", "py", t)
+    check("着色: 关键字、函数名、数字、注释都有颜色", code.count("\x1b[") >= 4 and "# 注释" in strip(code), code)
+    check("着色: 没写语言原样", highlight("# 标题", "", t) == "# 标题")
+    check("着色: JSON 键和值颜色不同", highlight('{"k": "v"}', "json", t).count("\x1b[38;5;") == 2)
+    check("着色: diff 加删行", "\x1b[" in highlight("+new", "diff", t) and "\x1b[" in highlight("-old", "diff", t))
+    lines = render_markdown("```python\nimport os\n```", 40, t)
+    check("着色: Markdown 代码块用上了", any("\x1b[" in line and "import" in strip(line) for line in lines), str(lines))
+    table = "| 名称 | 说明 |\n|---|---|\n| a | " + "很长的说明" * 8 + " |"
+    narrow = render_markdown(table, 40, Theme(ColorMode.NONE))
+    wide = render_markdown(table, 40, Theme(ColorMode.NONE), table_width=100)
+    check("表格: 可以比正文宽（少折几行）", len(wide) < len(narrow) and max(len(x) for x in wide) > 40,
+          f"{len(narrow)} → {len(wide)}")
+
+
+def strip(text: str) -> str:
+    import re
+    return re.sub(r"\x1b\[[0-9;]*m", "", text)
 
 
 async def case_steering_echo() -> None:
@@ -551,7 +612,8 @@ async def main() -> int:
     print("展开")
     await case_expand()
     print("状态行与回显")
-    test_running_status()
+    test_tool_lines()
+    test_code_highlight()
     await case_steering_echo()
     test_user_echo_multiline()
     test_user_echo_long()

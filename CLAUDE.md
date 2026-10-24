@@ -52,8 +52,10 @@ cd packages/pi-coding-agent && pytest tests/test_session.py::test_persistence   
 
 - 每实现一个新功能就从 main 新开一条 `feature/<名称>` 分支（依赖还没合并的分支时可以叠在它上面），不在 main 上直接提交。
 - 只有用户明确说"合并进主分支"时才合并：开 PR、以 merge 方式合并；叠加的分支按依赖顺序依次合并。
-- **远端分支总数（含 main）最多 5 条。** 新开分支前先 `git ls-remote --heads origin` 数一下；满了先清理已合并的分支，清完仍然超出就先问用户，不要新建。
-- **分支合并进 main 后立即删除**：远端 `git push origin --delete <分支>`、本地 `git branch -d <分支>`。删除前用 `git fetch --prune && git branch -r --merged origin/main` 确认它已合并；没合并的分支不删。
+- **远端分支总数（含 main）最多保留 5 条。** 合并进 main 的分支不马上删，留着方便回看；新开分支前（或推送新分支后）先 `git fetch --prune` 再按时间数一下：
+  `git for-each-ref --sort=committerdate --format='%(committerdate:iso8601) %(refname:short)' refs/remotes/origin`
+  超过 5 条时，从**最早实现的功能分支**（最后一次提交最早的）开始删，直到剩 5 条：远端 `git push origin --delete <分支>`、本地 `git branch -d <分支>`。
+- 只删已经合并进 main 的分支（`git branch -r --merged origin/main` 里有它）；main 和没合并的分支永远不删。如果没合并的分支多到删完已合并的仍超过 5 条，先问用户。
 
 ## 架构
 

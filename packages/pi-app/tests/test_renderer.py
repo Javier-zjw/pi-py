@@ -410,6 +410,30 @@ def test_plan_guard_segment() -> None:
           and lines.index("● 都做完了。") > summaries[1] + 2, str(lines))
 
 
+def test_retry_display() -> None:
+    """限流 / 过载重试：活动区显示原因和等多久，失败那次的思考作废；次数并进用时行"""
+    out = io.StringIO()
+    renderer = SessionRenderer(theme=Theme(ColorMode.NONE), stream=out)
+    renderer.on_event(ev("agent_start"))
+    renderer.on_event(ev("turn_start"))
+    renderer.on_event(delta("thinking_delta", "想到一半"))
+    renderer.on_event(ev("retry", attempt=1, max_attempts=3, delay=2.0,
+                         error="HTTP 529: Overloaded (overloaded_error)"))
+    live = "\n".join(renderer._live_lines())
+    check("重试: 活动区显示原因和等待", "等待重试" in live and "HTTP 529: Overloaded" in live
+          and "2s 后第 1/3 次" in live, live)
+    check("重试: 失败那次的思考不再显示", "想到一半" not in live, live)
+    check("重试: 不往 scrollback 写", out.getvalue() == "", repr(out.getvalue()))
+    renderer.on_event(ev("turn_start"))
+    check("重试: 重新开始后回到思考中", "思考中" in "\n".join(renderer._live_lines()))
+    renderer.on_event(delta("text_delta", "好了"))
+    renderer.on_event(ev("message_end", message=SimpleNamespace(
+        role="assistant", content=[], stop_reason="stop", usage=None, text=lambda: "好了")))
+    renderer.on_event(ev("agent_end", reason="stop"))
+    summary = next(line for line in out.getvalue().splitlines() if line.startswith("✻ "))
+    check("重试: 次数并进用时行", "重试 1 次" in summary, summary)
+
+
 def test_running_status() -> None:
     """运行中只显示正在执行的那个工具：名字 + 时长，不带参数"""
     renderer = SessionRenderer(theme=Theme(ColorMode.NONE), stream=io.StringIO())
@@ -523,6 +547,7 @@ async def main() -> int:
     test_plan_display()
     test_plan_mode_display()
     test_plan_guard_segment()
+    test_retry_display()
     print("展开")
     await case_expand()
     print("状态行与回显")

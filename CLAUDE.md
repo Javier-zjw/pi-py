@@ -69,7 +69,7 @@ pi-web（Vue 3 + Vite，只通过 HTTP/SSE 与 pi-server 通信）
 - **pi-ai**：单次 LLM 调用。`Context` 可序列化；`Models` 注册表提供 `stream`/`complete`（provider 原生）与 `stream_simple`/`complete_simple`（统一 `reasoning`）。provider 只有 `anthropic-messages` 和 `openai-completions`（兼容端点）。凭证优先级：运行时 override > `auth.json` > 环境变量。
   - 推理回传：OpenAI 兼容端点把**调了工具的**回复的思考作为 `reasoning_content` 发回（同 provider 才发）。`Model.reasoning_passback`（models.json `"reasoningPassback"`），None = 自动：DeepSeek / Moonshot(Kimi) 的推理模型开，其余关（严格端点可能拒绝未知字段）。不回传时模型每一步都从头想，长工具链容易跑偏。
   - 用量约定（同 Anthropic）：`usage.input` **不含**命中缓存的部分，上下文大小 = input + cache_read + cache_write。OpenAI 兼容端点的 `prompt_tokens` 包含缓存，必须减掉（`providers/openai.py::apply_openai_usage`，也认 DeepSeek 的 `prompt_cache_hit_tokens`）——曾因此把上下文算成两倍，导致清理/压缩反复误触发。
-  - `errors.py`：HTTP 错误经 `describe_llm_error` 把响应体里的原因写进 `error_message`；`is_context_overflow` 识别各家"上下文超长"（不含限流）。
+  - `errors.py`：HTTP 错误经 `describe_llm_error` 把响应体里的原因写进 `error_message`（有 Retry-After 头时追加 `[retry after Ns]`）；`is_context_overflow` 识别各家"上下文超长"（不含限流）；`is_retryable` 识别值得重试的临时失败（408/409/425/429/5xx/529、overloaded、断网超时），余额不足、密钥错、上下文超长不算；`retry_after` 从错误文本取回等待秒数。
   - Anthropic 前缀缓存：`Model.prompt_cache`（models.json `"promptCache"`）为 None 时只对官方 Anthropic 开启；第三方 anthropic-messages 端点可能不认 `cache_control`，需显式开启。断点：system、最后一个工具、最后两条 user 角色消息。
 - **pi-agent**：`loop.py::run_agent_loop` 回合状态机 + `execute_tool_calls`（校验 → `before_tool_call` → 并行/串行执行 → `after_tool_call`）；`Agent` 管状态、事件、steering/follow-up 队列、abort。
   - 并行工具的双序语义：`tool_execution_end` 按完成顺序发，结果消息按请求顺序存（写入 `results[index]`，不能用 `gather` 返回值）。
@@ -78,9 +78,10 @@ pi-web（Vue 3 + Vite，只通过 HTTP/SSE 与 pi-server 通信）
   - 全程使用 `AgentMessage`，只在 provider 边界 `convert_to_llm`；`CustomMessage.include_in_context` 控制是否给模型看。
   - `default_convert_to_llm` 末尾会 `ensure_tool_results`：没有结果的 tool_call（中途取消、进程在工具执行中退出）补一条"被中断"的结果，否则服务商拒绝整个请求。`Agent.continue_()` 不追加消息、从现有 transcript 续跑。
   - 工具结果 `AgentToolResult(terminate=True)`：这批工具执行完就结束本次运行（reason `terminated`），不再调模型——如提交计划后停下等用户确认。
-  - `LoopConfig.on_stream_error`：模型调用出错时询问上层，返回 True 则丢弃失败回复（不入 transcript、不发 `message_end`）并重试本轮，每次运行最多 `MAX_ERROR_RETRIES` 次。
+  - `LoopConfig.on_stream_error`：模型调用出错时询问上层，返回 True 则丢弃失败回复（不入 transcript、不发 `message_end`）并重试本轮；连续失败最多 `max_error_retries` 次（成功一次清零）。`Agent.wait_cancelled(timeout)` 供重试前的退避等待用，等待中 abort 立刻返回。
 - **pi-coding-agent**：
   - `AgentSession`（`agent_session.py`）是组合点：`AgentSessionServices`（ModelRuntime + SettingsManager + ResourceLoader，按 cwd 解析一次）+ `SessionManager` + `Agent`。持久化靠订阅 agent 事件。会话自己的事件（如压缩）和 agent 事件走同一条 `subscribe` 通道，按 `event.type` 区分。
+  - 网络重试：`_on_stream_error` 先看 `is_retryable` → `_retry_after_error`（`retry.baseDelay`·2^(n-1) 秒、封顶 `retry.maxDelay`，有 Retry-After 按它；连续超过 `retry.maxRetries`（默认 3）放弃），发 `RetryEvent`（`retry`）给界面（pi-tui 活动区显示、用时行计数；网页复用 `injected` 通知帧）；否则走 `_recover_overflow`（上下文超长）。
   - 恢复会话：上下文以工具结果或未回复的用户消息结尾 = 上次在一轮中途中断（`can_continue`）；末尾缺结果的工具调用在打开时补上中断结果并写回文件（`interrupted_tool_calls`）。`continue_()` 和 `prompt()` 共用 `_prepare_run()`（模式、钩子、先压后跑），入口：CLI / pi-tui 的 `/continue`、网页 `POST /api/sessions/{id}/continue`。
   - 模式切换用同步的 `switch_mode()`（`set_mode` 是它的 async 包装），发 `mode_changed` 事件、写 `mode_change` 条目，恢复会话时 `_restore_mode()` 还原。扩展经 `session.notify(event)` 发会话事件给界面（`session_events.py`：`mode_changed` / `plan_proposed` / `todo_updated`）。
   - 模式：`_apply_mode()` 每轮先把系统提示和工具集**从 `_base_system_prompt` / `_base_tools` 基线重建**，再调用模式的 `apply`——不要在上一轮结果上叠加。

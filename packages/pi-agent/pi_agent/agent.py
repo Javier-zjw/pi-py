@@ -45,6 +45,7 @@ class Agent:
             convert_to_llm: ConvertToLlm = default_convert_to_llm,
             stream_options: dict[str, Any] | None = None,
             on_stream_error: Callable[[AssistantMessage], Awaitable[bool]] | None = None,
+            max_error_retries: int = 2,
     ) -> None:
         self.state = initial_state or AgentState()
         self.stream_fn = stream_fn
@@ -56,6 +57,7 @@ class Agent:
         self.convert_to_llm = convert_to_llm
         self.stream_options = stream_options or {}
         self.on_stream_error = on_stream_error
+        self.max_error_retries = max_error_retries
 
         self.steering_queue = PendingMessageQueue(mode=queue_mode)
         self.follower_queue = PendingMessageQueue(mode=queue_mode)
@@ -116,6 +118,7 @@ class Agent:
             on_before_stop=on_before_stop,
             stream_options=self.stream_options,
             on_stream_error=self.on_stream_error,
+            max_error_retries=self.max_error_retries,
         )
 
     @staticmethod
@@ -189,6 +192,14 @@ class Agent:
 
     def abort(self) -> None:
         self._cancel.set()
+
+    async def wait_cancelled(self, timeout: float) -> bool:
+        """等最多 timeout 秒；期间被 abort 返回 True。出错重试前的退避等待用它，等待中也能中断"""
+        try:
+            await asyncio.wait_for(self._cancel.wait(), timeout)
+            return True
+        except asyncio.TimeoutError:
+            return self._cancel.is_set()
 
     async def wait_for_idle(self) -> None:
         await self._idle.wait()

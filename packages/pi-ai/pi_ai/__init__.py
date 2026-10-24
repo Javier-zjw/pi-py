@@ -14,7 +14,7 @@ from .auth import (
 )
 from .catalog import BUILTIN_MODELS
 from .cost import apply_cost, calculate_cost
-from .errors import describe_llm_error, is_context_overflow
+from .errors import describe_llm_error, is_context_overflow, is_retryable, retry_after
 from .events import (
     AssistantMessageEvent,
     AssistantMessageEventStream,
@@ -123,6 +123,8 @@ __all__ = [
     "default_credential_store",
     "get_model",
     "is_context_overflow",
+    "is_retryable",
+    "retry_after",
     "message_from_dict",
     "message_to_dict",
     "openai_compatible_provider",

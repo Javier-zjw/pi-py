@@ -34,6 +34,8 @@ from pi_ai import (
     Usage,
     UserMessage,
     is_context_overflow,
+    is_retryable,
+    retry_after,
 )
 
 from .compaction import (
@@ -58,7 +60,7 @@ from .model_runtime import ModelRuntime
 from .resources import DefaultResourceLoader, ResourceLoader
 from .session.entries import CustomEntry
 from .session.manager import SessionManager
-from .session_events import ModeChangedEvent
+from .session_events import ModeChangedEvent, RetryEvent
 from .settings import SettingsManager
 from .tools import DEFAULT_TOOL_NAMES, create_tools
 
@@ -149,6 +151,8 @@ class AgentSession:
             tool_execution=self.settings.get("toolExecution", "parallel"),
             transform_context=self._transform_context,
             on_stream_error=self._on_stream_error,
+            # 重试次数由 _retry_after_error 按设置控制；这里给够余量（+1 留给上下文超长的那次）
+            max_error_retries=int(self.settings.get("retry.maxRetries", 3) or 0) + 1,
         )
 
         self._listeners: list[Callable[[Any], None]] = []
@@ -177,6 +181,7 @@ class AgentSession:
         self._compaction_attempts = 0
         self._compaction_blocked = False
         self._overflow_recovered = False
+        self._retry_attempts = 0        # 连续几次临时失败了；模型成功回复一次就清零
         # 当前工作模式。核心不解释它的含义，具体行为由扩展的 Mode.apply 决定
         self.mode: str = self._restore_mode()
         self._base_system_prompt = state.system_prompt or ""
@@ -231,6 +236,8 @@ class AgentSession:
     def _on_agent_event(self, event: AgentEvent) -> None:
         if isinstance(event, MessageEndEvent) and event.message is not None:
             self._persist(event.message)
+            if getattr(event.message, "role", "") == "assistant" and event.message.stop_reason != "error":
+                self._retry_attempts = 0
         elif isinstance(event, TurnEndEvent):
             for result in event.tool_results:
                 self._persist(result)
@@ -277,6 +284,30 @@ class AgentSession:
         return await self.resources.get_extension_api().run_context_hook(messages)
 
     async def _on_stream_error(self, message: AssistantMessage) -> bool:
+        """模型调用出错时主循环来问要不要重试本轮：临时失败（限流、过载、断网）等一会儿再试；
+        上下文超长就压缩后再试。返回 False 照常报错"""
+        if is_retryable(message):
+            return await self._retry_after_error(message)
+        return await self._recover_overflow(message)
+
+    async def _retry_after_error(self, message: AssistantMessage) -> bool:
+        """退避重试：等 baseDelay·2^(n-1) 秒（封顶 maxDelay），服务商给了 Retry-After 就按它等。
+        连续失败超过 maxRetries 次就放弃。等待中用户中断（ctrl+c）立刻停下"""
+        get = self.settings.get
+        max_retries = int(get("retry.maxRetries", 3) or 0)
+        if not get("retry.enabled", True) or self._retry_attempts >= max_retries:
+            return False
+        self._retry_attempts += 1
+        base = float(get("retry.baseDelay", 2) or 0)
+        cap = float(get("retry.maxDelay", 60) or 0)
+        wanted = retry_after(message)
+        delay = wanted if wanted is not None else base * 2 ** (self._retry_attempts - 1)
+        delay = max(0.0, min(delay, cap))
+        self._emit(RetryEvent(attempt=self._retry_attempts, max_attempts=max_retries, delay=delay,
+                              error=message.error_message or ""))
+        return not await self.agent.wait_cancelled(delay)
+
+    async def _recover_overflow(self, message: AssistantMessage) -> bool:
         """服务商报上下文超长（说明估算偏小，或单个工具输出特别大）：
         激进清理 + 摘要压缩，然后让主循环重试本轮。每次 prompt 只救一次，再超就照常报错"""
         if self._overflow_recovered or not is_context_overflow(message):
@@ -582,6 +613,7 @@ class AgentSession:
         self._compaction_attempts = 0
         self._compaction_blocked = False
         self._overflow_recovered = False
+        self._retry_attempts = 0
         await self._maybe_compact(extra_text=extra_text)
 
     @property

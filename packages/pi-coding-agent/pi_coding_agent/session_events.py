@@ -25,6 +25,16 @@ class PlanProposedEvent:
 
 
 @dataclass
+class RetryEvent:
+    """模型调用临时失败（限流、过载、断网），等 delay 秒后重试第 attempt 次（共 max_attempts 次）"""
+    attempt: int
+    max_attempts: int
+    delay: float
+    error: str
+    type: Literal["retry"] = "retry"
+
+
+@dataclass
 class TodoUpdatedEvent:
     """任务清单变化：update_plan 更新、或批准计划时按任务生成。plan 是 [{step, status}]"""
     plan: list[dict[str, Any]] = field(default_factory=list)

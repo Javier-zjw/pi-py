@@ -18,7 +18,7 @@ from pi_agent import AgentTool, AgentToolResult, ToolContext
 from pi_ai import TextContent
 
 from ..text import stream_decoder
-from .truncate import DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncate_head
+from .truncate import DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, line_count, truncate_middle
 
 _ANSI = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07")
 DEFAULT_TIMEOUT = 120.0
@@ -51,6 +51,7 @@ async def run_bash(
         ctx: ToolContext | None = None,
         timeout: float = DEFAULT_TIMEOUT,
         max_bytes: int = DEFAULT_MAX_BYTES,
+        max_lines: int = DEFAULT_MAX_LINES,
 ) -> dict[str, Any]:
     kwargs: dict[str, Any] = {}
     if sys.platform != "win32":
@@ -120,15 +121,13 @@ async def run_bash(
 
     output = "".join(chunks)
     full_path: str | None = None
-    if len(output.encode("utf-8")) > max_bytes:
+    # 行数或字节任一超限都要截断；只要截了就把完整输出存下来，模型才能回头看被截掉的部分
+    if line_count(output) > max_lines or len(output.encode("utf-8")) > max_bytes:
         fd, full_path = tempfile.mkstemp(prefix="pi-bash-", suffix=".log")
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(output)
 
-    body, truncated = truncate_head(output, DEFAULT_MAX_LINES, max_bytes)
-    if truncated and full_path:
-        body += f"\n[full output: {full_path}]"
-
+    body, truncated = truncate_middle(output, max_lines, max_bytes, full_path=full_path)
 
     return {
         "output": body,
@@ -161,8 +160,9 @@ def create_bash_tool(cwd: str | Path = ".", timeout: float = DEFAULT_TIMEOUT) ->
         name="bash",
         label="Bash",
         description=(
-            "Run a shell command in the working directory. Output is truncated to the last "
-            "part; long output is written to a temp file whose path is reported."
+            "Run a shell command in the working directory. Long output keeps the beginning "
+            "and the end with the middle omitted; the full output is saved to a temp file "
+            "whose path is reported."
         ),
         parameters={
             "type": "object",

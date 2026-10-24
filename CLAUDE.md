@@ -83,6 +83,7 @@ pi-web（Vue 3 + Vite，只通过 HTTP/SSE 与 pi-server 通信）
   - 恢复会话：上下文以工具结果或未回复的用户消息结尾 = 上次在一轮中途中断（`can_continue`）；末尾缺结果的工具调用在打开时补上中断结果并写回文件（`interrupted_tool_calls`）。`continue_()` 和 `prompt()` 共用 `_prepare_run()`（模式、钩子、先压后跑），入口：CLI / pi-tui 的 `/continue`、网页 `POST /api/sessions/{id}/continue`。
   - 模式：`_apply_mode()` 每轮先把系统提示和工具集**从 `_base_system_prompt` / `_base_tools` 基线重建**，再调用模式的 `apply`——不要在上一轮结果上叠加。
   - 会话（`session/`）：JSONL **树**（`id`/`parentId`），分支=移动 leaf；存于 `~/.pi/agent/sessions/<项目目录名>/`。磁盘格式与 TS 版 pi 保持一致（camelCase 键、v3 entry 类型），改格式会破坏互操作。compaction entry 写 `firstKeptEntryId`（旧文件里的 `retainedTail` 仍可读），`details.state` 存结构化状态。模型/思考档位从完整分支读取，而非裁剪后的上下文。
+  - 工具输出截断：bash 输出超限（2000 行或 50KB，任一）才截：`truncate.py::truncate_middle` 保留开头约 40%、结尾约 60%，按整行截（单行超长才按字符截），中间一行说明省略量和完整输出路径；只要截了就存完整输出到临时文件。
   - 工具（`tools/`）：`read write edit bash grep find ls`。参数是纯 JSON Schema dict，由 `pi_agent.validation` 校验（会把 `"3"` 纠正为 `3`）；非必填字段一律 `args.get()`；`details` 必须可 JSON 序列化（`Path` 先转 `str`）。grep/find 有 rg/fd 时用二进制，否则纯 Python 回退。所有来自 OS 的字符串先过 `text.sanitize`；bash 输出用增量解码器（中文跨块）。
   - 系统提示（`prompt.py::BASE_SYSTEM_PROMPT`，英文，结构参照 Codex）：先判断任务大小、范围以用户请求为准（范围外的只记一句）、隔几步自查够不够回答、多步任务用 `update_plan`、批量工具前一句进度说明、读文件用 `read` 而不是 bash、回答跟随用户语言。`test_resources` 断言了这几条，改提示时别删。
   - 配置：`~/.pi/agent/` 下 `models.json`（自定义 provider/模型，`api` 字段决定协议）、`auth.json`（`{provider_id: {apiKey}}`）、`settings.json`；项目级 `<cwd>/.pi/settings.json` 深度合并覆盖全局（默认值见 `settings.py::DEFAULT_SETTINGS`）。`reasoning: true` 只是能力标记；思考档位来源：CLI `-t` > 会话记录 > settings > `off`。

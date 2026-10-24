@@ -633,6 +633,35 @@ async def case_abort() -> None:
     check("中断: 状态复位", not agent.state.is_streaming and not agent.state.pending_tool_calls)
 
 
+async def case_abort_silent_model() -> None:
+    """模型半天不出字（在想、在排队）时中断也要立刻停，不能等到下一个字"""
+    closed = asyncio.Event()
+
+    def silent(model, context, options=None):
+        async def gen():
+            message = AssistantMessage(api=model.api, provider=model.provider, model=model.id)
+            try:
+                yield StartEvent(partial=message)
+                await asyncio.sleep(30)
+                yield StartEvent(partial=message)
+            finally:
+                closed.set()
+        return gen()
+
+    agent = Agent(stream_fn=silent, initial_state=AgentState(model=MODEL))
+    events: list = []
+    agent.subscribe(events.append)
+    task = asyncio.create_task(agent.prompt("想很久"))
+    await asyncio.sleep(0.05)
+    started = asyncio.get_running_loop().time()
+    agent.abort()
+    await asyncio.wait_for(task, timeout=2)
+    check("中断: 模型没出字时也立刻停", asyncio.get_running_loop().time() - started < 0.5)
+    check("中断: 结束原因 aborted、流被关掉", events[-1].reason == "aborted" and closed.is_set(), events[-1].reason)
+    check("中断: 回复标为 aborted", agent.state.messages[-1].stop_reason == "aborted",
+          agent.state.messages[-1].stop_reason)
+
+
 async def case_max_turns() -> None:
     tool = echo_tool()
     script = [[ToolCall(id=f"c{i}", name="echo", arguments={"text": str(i)})] for i in range(10)]
@@ -944,6 +973,10 @@ def test_abort() -> None:
     asyncio.run(case_abort())
 
 
+def test_abort_silent_model() -> None:
+    asyncio.run(case_abort_silent_model())
+
+
 def test_max_turns() -> None:
     asyncio.run(case_max_turns())
 
@@ -999,6 +1032,7 @@ async def main() -> int:
     await case_steering()
     await case_follow_up()
     await case_abort()
+    await case_abort_silent_model()
     await case_max_turns()
     print("错误路径")
     await case_stream_error()

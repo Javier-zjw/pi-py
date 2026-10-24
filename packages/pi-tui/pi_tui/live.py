@@ -17,7 +17,7 @@ import math
 import sys
 import time
 from collections.abc import Callable
-from typing import TextIO
+from typing import Any, TextIO
 
 from .theme import DEFAULT_THEME, Theme
 from .width import display_width, terminal_width
@@ -42,6 +42,10 @@ class LiveRegion:
     """屏幕底部的可重绘区域。
 
     历史内容正常追加进 scrollback（可滚动、可复制），只有底部状态行在动。
+
+    ``host``：有常驻输入框时（运行中也能打字），活动区画在输入框所在的 prompt_toolkit 界面里，
+    由它负责重画；这里不再自己用光标控制码擦写屏幕（两边同时画会互相踩）。host 要提供
+    ``set_live(lines)``（活动区内容）和 ``print_above(text)``（写进 scrollback）。
     """
 
     def __init__(
@@ -58,6 +62,12 @@ class LiveRegion:
         self._last_draw = 0.0
         self._hidden_cursor = False
         self._at_line_start = True
+        self.host: Any = None
+
+    @property
+    def lines(self) -> list[str]:
+        """活动区当前的内容（host 模式下由宿主拿去画）"""
+        return self._lines
 
     @property
     def interactive(self) -> bool:
@@ -86,6 +96,10 @@ class LiveRegion:
 
     def update(self, lines: list[str], force: bool = False) -> None:
         """重绘状态行。限帧，避免闪烁。"""
+        if self.host is not None:
+            self._lines = list(lines)
+            self.host.set_live(self._lines)
+            return
         if not self.interactive:
             return
         now = time.monotonic()
@@ -109,6 +123,12 @@ class LiveRegion:
         ``live`` 给出插入后活动区的新内容；不给就重画原来的。流式内容一边定稿一边更新预览时要给，
         否则会先把旧预览画一遍（刚定稿的那行在下面重复出现，直到下一次刷新）。"""
         saved = list(self._lines) if live is None else list(live)
+        if self.host is not None:
+            if lines:
+                self.host.print_above("\n".join(lines))
+            self._lines = saved
+            self.host.set_live(saved)
+            return
         self._erase()
         self._ensure_line_start()
         if lines:
@@ -125,6 +145,9 @@ class LiveRegion:
         """
         if not text:
             return
+        if self.host is not None:
+            self.host.print_above(text.rstrip("\n"))
+            return
         self._erase()
         self.stream.write(text)
         self._at_line_start = text.endswith("\n")
@@ -132,6 +155,12 @@ class LiveRegion:
 
     def finalize(self, lines: list[str] | None = None) -> None:
         """收起活动区，可选地写入最终内容。"""
+        if self.host is not None:
+            self._lines = []
+            self.host.set_live([])
+            if lines:
+                self.host.print_above("\n".join(lines))
+            return
         self._erase()
         self._ensure_line_start()
         if lines:

@@ -204,6 +204,7 @@ class SessionRenderer:
         self.plan: list[dict] | None = None
         self.mode = "chat"      # 当前工作模式，输入框下面显示
         self.permission = ""    # 不是默认（每次确认）时的权限模式名，输入框下面显示
+        self.queued: list[str] = []     # 运行中输入、还没送到模型的插话，显示在活动区
         self._folded_prompt = ""    # 刚回显时折叠了的用户输入，下一轮开始时记进 TurnRecord
         self.state = RenderState()
         self.turn = TurnRecord()
@@ -274,9 +275,18 @@ class SessionRenderer:
                     f"{t.muted(' · 只读调研，先出计划再动手 · shift+tab 切换')}")
         else:
             hint = t.muted("⏵ 执行模式 · shift+tab 切换到计划模式")
+        if self.agent_running:
+            hint = f"{t.accent('Esc', bold=True)} {t.muted('中断 · 回车插话 · ')}" + hint
         if self.permission:
             hint += f"  {t.warn('⚠ ' + self.permission)}"
         return f"{rule(self.width, '', t)}\n  {hint}"
+
+    def live_block(self) -> str:
+        """输入框常驻时画在它上方的活动区（LineReader 的 above）"""
+        return "\n".join(self.live.lines)
+
+    def repaint(self) -> None:
+        self._repaint()
 
     def on_event(self, event: Any) -> None:
         handler = getattr(self, f"_on_{event.type}", None)
@@ -394,6 +404,8 @@ class SessionRenderer:
                 self.state.own_prompt = ""
                 return
             # 途中插进来的消息（steering / follow-up）
+            if text in self.queued:
+                self.queued.remove(text)
             self.user_echo(text)
             self._new_segment()
             return
@@ -477,7 +489,9 @@ class SessionRenderer:
         # 没有回答（中断、出错、只调了工具）时，用时在这里写
         self._commit_summary()
         lines = []
-        if event.reason not in ("stop", "terminated"):
+        if event.reason == "aborted":
+            lines.append(self.theme.warn(f"{INDENT}⏹ 已中断"))
+        elif event.reason not in ("stop", "terminated"):
             lines.append(self.theme.warn(f"{INDENT}· 结束原因：{event.reason}"))
         if self.state.plan_touched and self._plan_open() and self.mode != "plan":
             left = sum(s.get("status") != "completed" for s in self.plan)
@@ -822,8 +836,8 @@ class SessionRenderer:
         frame = t.accent(self.spinner.frame())
         detail = f"  {t.muted(self.state.detail)}" if self.state.detail else ""
         if not self.agent_running:
-            # 一轮之外（手动压缩等）
-            return [f"{frame} {t.muted(self.state.label + '…')}{detail}"]
+            # 一轮之外（手动压缩等），或刚提交、这一轮还没开始
+            return [f"{frame} {t.muted(self.state.label + '…')}{detail}", *self._queued_lines()]
         elapsed = t.highlight(_seconds(time.time() - (self.state.turn_started or time.time())))
         head = f"{frame} {elapsed} {t.muted('· ' + self.state.label)}"
         if self.state.tool_total:
@@ -838,7 +852,13 @@ class SessionRenderer:
             lines += [t.thinking(f"{INDENT}{line}", italic=True) for line in self._slot_lines(self.state.shown)]
         elif slot == "text":
             lines += [f"{INDENT}{line}" for line in self._slot_lines(self.state.shown)]
-        return lines
+        return lines + self._queued_lines()
+
+    def _queued_lines(self) -> list[str]:
+        """运行中输入的插话：送到之前一直显示在活动区，送到了由 user_echo 正式写进 scrollback"""
+        t = self.theme
+        return [f"{INDENT}{t.accent('↳')} {t.muted('插话（这一步做完就送到）：')}"
+                f"{truncate(' '.join(text.split()), max(self.width - 24, 10))}" for text in self.queued]
 
     def _plan_lines(self) -> list[str]:
         """任务清单：标题行带进度，下面每项一行带序号——✓ 做完的、▸ 正在做的、○ 还没做的。

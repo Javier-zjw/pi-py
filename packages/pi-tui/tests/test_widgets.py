@@ -167,6 +167,35 @@ def test_picker_render() -> None:
     check("数字键: 超出范围不动", not question.select(3) and not question.select(0) and question.index == 1)
 
 
+def test_live_region_host() -> None:
+    """有宿主（常驻输入框）时活动区交给宿主画、定稿内容交给宿主打印，自己不往终端写光标控制码"""
+    import io
+
+    from pi_tui.live import LiveRegion
+
+    class Host:
+        def __init__(self) -> None:
+            self.live: list[str] = []
+            self.printed: list[str] = []
+
+        def set_live(self, lines: list[str]) -> None:
+            self.live = list(lines)
+
+        def print_above(self, text: str) -> None:
+            self.printed.append(text)
+
+    stream = io.StringIO()
+    region = LiveRegion(stream=stream)
+    region.host = host = Host()
+    region.update(["⠋ 思考中"])
+    check("宿主: 活动区交给宿主", host.live == ["⠋ 思考中"] and region.lines == ["⠋ 思考中"])
+    region.append(["● 第一行"], live=["预览"])
+    check("宿主: 定稿内容打印、活动区换成预览", host.printed == ["● 第一行"] and host.live == ["预览"])
+    region.finalize(["收尾"])
+    check("宿主: 收起活动区再打印", host.live == [] and host.printed[-1] == "收尾")
+    check("宿主: 自己不写终端", stream.getvalue() == "", repr(stream.getvalue()))
+
+
 def main() -> int:
     print("命令补全")
     test_match_commands()
@@ -174,6 +203,7 @@ def main() -> int:
     print("选择器")
     test_picker_state()
     test_picker_render()
+    test_live_region_host()
     print()
     if FAILURES:
         print(f"{len(FAILURES)} 处失败：")

@@ -234,7 +234,7 @@ async def cmd_continue(app: App, rest: str) -> None:
     if not app.session.can_continue:
         app.note("没有可以继续的任务：上一轮已经完成")
         return
-    await app.run_agent(app.session.continue_())
+    await app.spawn(app.run_agent(app.session.continue_()))
 
 
 async def cmd_compact(app: App, rest: str) -> None:

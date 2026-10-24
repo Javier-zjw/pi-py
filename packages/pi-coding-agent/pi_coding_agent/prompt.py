@@ -69,7 +69,8 @@ conventions.
 unless you checked it.
 
 # Final answer
-- Reply in the language the user writes in.
+- Reply in the language the user writes in. The same goes for everything else the user \
+sees: progress notes, questions, plans.
 - Lead with the answer or the outcome, then the supporting details. Be concise: no \
 step-by-step narration of what you did, and don't repeat the plan (the user already sees it).
 - Reference files as `path:line`. Use short Markdown sections and bullets only when they help.

@@ -376,8 +376,8 @@ async def case_plan_mode_tools() -> None:
 
         await session.set_mode("plan")
         await session._apply_mode()
-        check("计划模式: 全部只读工具 + submit_plan（没有写文件、bash、update_plan）",
-              names() == {"read", "grep", "find", "ls", "submit_plan"}, str(names()))
+        check("计划模式: 全部只读工具 + ask_user + submit_plan（没有写文件、bash、update_plan）",
+              names() == {"read", "grep", "find", "ls", "ask_user", "submit_plan"}, str(names()))
 
         await session.set_mode("chat")
         await session._apply_mode()
@@ -790,8 +790,8 @@ async def case_plan_execute_flow() -> None:
         types = [e.type for e in events]
         check("计划: 切模式发 mode_changed", types[0] == "mode_changed" and events[0].mode == "plan")
         tools = {t.name for t in provider.calls[0]["context"].tools}
-        check("计划: 计划模式只给只读工具和 submit_plan",
-              tools == {"read", "grep", "find", "ls", "submit_plan"}, str(tools))
+        check("计划: 计划模式只给只读工具、ask_user 和 submit_plan",
+              tools == {"read", "grep", "find", "ls", "ask_user", "submit_plan"}, str(tools))
         check("计划: 系统提示带计划模式说明", "<plan_mode>" in provider.calls[0]["context"].system_prompt)
         check("计划: 提交即停（不再调模型）", len(provider.calls) == 2
               and types[-1] == "agent_end" and events[-1].reason == "terminated", str(len(provider.calls)))
@@ -837,6 +837,69 @@ async def case_plan_execute_flow() -> None:
             check("批准: 没有计划时报错", False)
         except LookupError as exc:
             check("批准: 没有计划时报错", "还没有可执行的计划" in str(exc))
+
+
+def ask_call(call_id: str) -> ToolCall:
+    return ToolCall(id=call_id, name="ask_user", arguments={"questions": [
+        {"question": "list 金额也改成两位小数吗？", "header": "金额格式",
+         "options": [{"label": "统一改", "description": "list 也显示 10.00", "recommended": True},
+                     {"label": "保持原样"}, {"label": "  "}]},
+        {"question": "   ", "options": [{"label": "空问题会被丢掉"}]},
+        {"question": "budget 金额要校验吗？", "options": [{"label": "同样校验"}, {"label": "不校验"}]},
+    ]})
+
+
+async def case_plan_ask_user() -> None:
+    """计划模式提问：界面弹选项、答案作为工具结果回来，本轮接着规划；没有界面 / 用户跳过时告诉模型怎么办"""
+    script = [
+        [TextContent(text="先确认两个问题。"), ask_call("a1")],
+        [submit_call("s1", "改 report", "改 storage", "补测试")],
+    ]
+    with Sandbox() as cwd:
+        session, provider = make_session(cwd, script)
+        asked: list = []
+
+        async def answer(questions):
+            asked.append(questions)
+            return [{"question": questions[0]["question"], "answer": "统一改", "custom": False},
+                    {"question": questions[1]["question"], "answer": "金额必须大于 0", "custom": True}]
+
+        session.user_input = answer
+        session.switch_mode("plan")
+        await session.prompt("规划一下")
+        check("提问: 问题交给界面，空问题和空选项被丢掉", len(asked) == 1 and len(asked[0]) == 2
+              and [o["label"] for o in asked[0][0]["options"]] == ["统一改", "保持原样"], str(asked))
+        check("提问: 推荐项和主题带给界面", asked[0][0]["options"][0]["recommended"]
+              and asked[0][0]["header"] == "金额格式" and asked[0][1]["options"][0]["label"] == "同样校验",
+              str(asked))
+        result = next(m for m in session.messages if getattr(m, "role", "") == "toolResult")
+        text = result.content[0].text
+        check("提问: 答案作为工具结果给模型", "统一改" in text and "金额必须大于 0 (typed by the user)" in text
+              and not result.is_error, text)
+        check("提问: 答完同一轮接着规划、提交计划", len(provider.calls) == 2
+              and session.mode == "plan", str(len(provider.calls)))
+
+    with Sandbox() as cwd:
+        session, provider = make_session(cwd, [[ask_call("a1")], [TextContent(text="问题如下……")]])
+        session.switch_mode("plan")
+        await session.prompt("规划一下")
+        result = next(m for m in session.messages if getattr(m, "role", "") == "toolResult")
+        check("提问: 没有界面时报错，让模型在回复里问", result.is_error
+              and "Ask them in your reply" in result.content[0].text, result.content[0].text)
+
+    with Sandbox() as cwd:
+        session, provider = make_session(cwd, [[ask_call("a1")], [TextContent(text="按默认")]])
+
+        async def skip(questions):
+            return None
+
+        session.user_input = skip
+        session.switch_mode("plan")
+        await session.prompt("规划一下")
+        result = next(m for m in session.messages if getattr(m, "role", "") == "toolResult")
+        check("提问: 用户跳过时让模型按推荐继续", "skipped" in result.content[0].text
+              and result.details == {"questions": result.details["questions"], "answers": []},
+              result.content[0].text)
 
 
 async def case_prune_disabled() -> None:
@@ -1610,6 +1673,10 @@ def test_plan_execute_flow() -> None:
     asyncio.run(case_plan_execute_flow())
 
 
+def test_plan_ask_user() -> None:
+    asyncio.run(case_plan_ask_user())
+
+
 def test_goal_reanchor() -> None:
     asyncio.run(case_goal_reanchor())
 
@@ -1738,6 +1805,7 @@ async def main() -> int:
     await case_tool_budget()
     await case_todo_plan()
     await case_plan_execute_flow()
+    await case_plan_ask_user()
     await case_goal_reanchor()
     await case_reasoning_passback_end_to_end()
     await case_prune_disabled()

@@ -65,6 +65,7 @@ class ScriptedApp(App):
         super().__init__(*args, **kwargs)
         self.picks: list[tuple[int, str | None] | None] = []
         self.pick_calls: list[tuple[str, list]] = []
+        self.typed: list[str] = []      # ask_user 选「其他」时依次输入的回答
 
     async def pick(self, title, items, **kwargs):
         self.pick_calls.append((title, items))
@@ -76,6 +77,9 @@ class ScriptedApp(App):
         if value is not None:
             item.choice = item.choices.index(value)
         return PickResult(index, item, item.choices[item.choice] if item.choices else None)
+
+    async def _read_answer(self) -> str:
+        return self.typed.pop(0)
 
 
 def make_app(cwd: Path, script: list[list] | None = None, persist: bool = False):
@@ -378,6 +382,44 @@ async def case_plan_mode() -> None:
         check("/build: 没有计划时提示", "还没有可执行的计划" in tail(out, start), tail(out, start))
 
 
+def ask() -> ToolCall:
+    return ToolCall(id="a1", name="ask_user", arguments={"questions": [
+        {"question": "list 金额也改成两位小数吗？", "header": "金额格式",
+         "options": [{"label": "统一改", "description": "list 也显示 10.00", "recommended": True},
+                     {"label": "保持原样"}]},
+        {"question": "budget 金额要校验吗？", "options": [{"label": "同样校验"}, {"label": "不校验"}]},
+    ]})
+
+
+async def case_plan_ask_user() -> None:
+    """计划模式提问：逐题弹选择器（推荐项标出、最后一项自己输入），答案留在 scrollback，接着出计划"""
+    with Sandbox() as cwd:
+        app, out = make_app(cwd, [[TextContent(text="先确认两个问题。"), ask()], [submit()]])
+        app.picks = [(0, None), (2, None), (2, None)]     # 统一改 / 其他（自己输入）/ 先不执行
+        app.typed = ["金额必须大于 0"]
+        start = len(out.getvalue())
+        await app.dispatch("/plan 规划一下")
+        text = tail(out, start)
+        title, items = app.pick_calls[0]
+        check("提问: 选择器标题带主题和进度", title == "金额格式：list 金额也改成两位小数吗？（1/2）", title)
+        check("提问: 推荐项标出，最后一项自己输入", [i.label for i in items] == ["统一改（推荐）", "保持原样", "其他"]
+              and items[0].description == "list 也显示 10.00", str([i.label for i in items]))
+        check("提问: 答案留在 scrollback", "? 金额格式 → 统一改" in text
+              and "? budget 金额要校验吗？ → 金额必须大于 0" in text, text)
+        check("提问: 答完接着出计划、问要不要执行", "╭ 计划 加超时配置" in text
+              and app.pick_calls[-1][0] == "执行这个计划？", text)
+        check("提问: ask_user 不算工具调用", "次工具" not in text, text)
+        check("提问: 答完界面回调还挂在会话上", app.session.user_input == app.ask_user)
+
+    with Sandbox() as cwd:
+        app, out = make_app(cwd, [[ask()], [TextContent(text="按推荐的来：……")]])
+        app.picks = [None]
+        start = len(out.getvalue())
+        await app.dispatch("/plan 规划一下")
+        text = tail(out, start)
+        check("提问: Esc 跳过全部", "跳过了提问" in text and len(app.pick_calls) == 1, text)
+
+
 # -- 信息类 ------------------------------------------------------------------ #
 
 async def case_info() -> None:
@@ -438,6 +480,10 @@ def test_plan_mode() -> None:
     asyncio.run(case_plan_mode())
 
 
+def test_plan_ask_user() -> None:
+    asyncio.run(case_plan_ask_user())
+
+
 def test_info() -> None:
     asyncio.run(case_info())
 
@@ -457,6 +503,7 @@ async def main() -> int:
     await case_resume()
     print("计划 / 执行模式")
     await case_plan_mode()
+    await case_plan_ask_user()
     print("信息类")
     await case_info()
 

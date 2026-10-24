@@ -136,6 +136,7 @@ class App:
         if session is not self.session:
             self.session.dispose()
         self.session = session
+        session.user_input = self.ask_user     # 计划模式的 ask_user 工具经它弹选择器
         render = session.subscribe(self.renderer.on_event)
         own = session.subscribe(self._on_session_event)
         self._unsubscribe = lambda: (render(), own())
@@ -235,6 +236,41 @@ class App:
             self.note("留在计划模式：直接输入修改意见，模型会重新提交完整的计划")
         else:
             self.note("计划已保存，随时用 /build 执行")
+
+    async def ask_user(self, questions: list[dict]) -> list[dict] | None:
+        """模型在一轮中途提问（ask_user 工具）：逐题弹选择器，最后一项是自己输入。
+        Esc 跳过全部（模型按推荐的选项继续）。答案由渲染器在工具结束时写进 scrollback"""
+        self.renderer.pause()
+        try:
+            answers = []
+            for number, question in enumerate(questions, 1):
+                options = question["options"]
+                items = [PickerItem(o["label"] + ("（推荐）" if o.get("recommended") else ""),
+                                    o.get("description", ""), value=o["label"]) for o in options]
+                items.append(PickerItem("其他", "自己输入回答", value=None))
+                start = next((i for i, o in enumerate(options) if o.get("recommended")), 0)
+                topic = f"{question['header']}：" if question.get("header") else ""
+                progress = f"（{number}/{len(questions)}）" if len(questions) > 1 else ""
+                result = await self.pick(f"{topic}{question['question']}{progress}", items, index=start)
+                if result is None:
+                    return None
+                answer, custom = result.item.value, False
+                if answer is None:
+                    answer, custom = await self._read_answer(), True
+                    if not answer:
+                        return None
+                answers.append({"question": question["question"], "answer": answer, "custom": custom})
+            return answers
+        finally:
+            self.renderer.resume()
+
+    async def _read_answer(self) -> str:
+        reader = LineReader(erase_when_done=True)
+        try:
+            raw = await reader.read(self.theme.accent("  你的回答 ❯ ", bold=True))
+        except (EOFError, KeyboardInterrupt):
+            return ""
+        return sanitize(raw).strip()
 
     async def execute_plan(self, extra: str = "") -> None:
         """批准最近的计划：切到执行模式、任务变成清单、开始执行。只回显一行标题，不回显整段任务说明"""

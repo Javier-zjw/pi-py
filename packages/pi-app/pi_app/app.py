@@ -27,6 +27,7 @@ from pi_tui import (
     pad,
     pick,
     truncate,
+    wrap,
 )
 
 from .commands import BUILTIN_COMMANDS, AppCommand
@@ -228,7 +229,7 @@ class App:
             PickerItem("继续完善", "留在计划模式，直接输入修改意见", value="revise"),
             PickerItem("先不执行", "计划已保存，之后可以用 /build 执行", value="later"),
         ]
-        result = await self.pick("执行这个计划？", items)
+        result = await self.pick("执行这个计划？", items, header="需要你确认")
         choice = result.item.value if result else "later"
         if choice == "run":
             await self.execute_plan()
@@ -249,14 +250,17 @@ class App:
                                     o.get("description", ""), value=o["label"]) for o in options]
                 items.append(PickerItem("其他", "自己输入回答", value=None))
                 start = next((i for i, o in enumerate(options) if o.get("recommended")), 0)
-                topic = f"{question['header']}：" if question.get("header") else ""
-                progress = f"（{number}/{len(questions)}）" if len(questions) > 1 else ""
-                result = await self.pick(f"{topic}{question['question']}{progress}", items, index=start)
+                header = "需要你选择"
+                if len(questions) > 1:
+                    header += f" · {number}/{len(questions)}"
+                if question.get("header"):
+                    header += f" · {question['header']}"
+                result = await self.pick(question["question"], items, index=start, header=header)
                 if result is None:
                     return None
                 answer, custom = result.item.value, False
                 if answer is None:
-                    answer, custom = await self._read_answer(), True
+                    answer, custom = await self._read_answer(header, question["question"]), True
                     if not answer:
                         return None
                 answers.append({"question": question["question"], "answer": answer, "custom": custom})
@@ -264,10 +268,20 @@ class App:
         finally:
             self.renderer.resume()
 
-    async def _read_answer(self) -> str:
+    async def _read_answer(self, header: str, question: str) -> str:
+        """选了「其他」：问题留在输入行上面（选择器已经擦掉了），输完连同问题一起擦掉"""
+        t = self.theme
+        bar = t.accent("│", bold=True)
+        prompt = "\n".join([
+            "",
+            t.accent("╭─ ", bold=True) + t.highlight(header, bold=True),
+            *[f"{bar} {t.bold(line)}" for line in wrap(question, max(self.renderer.width - 3, 10))],
+            t.accent("╰─ ", bold=True) + t.highlight("你的回答", bold=True)
+            + t.muted("（Enter 确认，留空取消）") + t.accent(" ❯ ", bold=True),
+        ])
         reader = LineReader(erase_when_done=True)
         try:
-            raw = await reader.read(self.theme.accent("  你的回答 ❯ ", bold=True))
+            raw = await reader.read(prompt)
         except (EOFError, KeyboardInterrupt):
             return ""
         return sanitize(raw).strip()

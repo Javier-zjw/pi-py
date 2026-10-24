@@ -65,10 +65,13 @@ class ScriptedApp(App):
         super().__init__(*args, **kwargs)
         self.picks: list[tuple[int, str | None] | None] = []
         self.pick_calls: list[tuple[str, list]] = []
+        self.pick_headers: list[str] = []
         self.typed: list[str] = []      # ask_user 选「其他」时依次输入的回答
+        self.typed_for: list[tuple[str, str]] = []
 
     async def pick(self, title, items, **kwargs):
         self.pick_calls.append((title, items))
+        self.pick_headers.append(kwargs.get("header", ""))
         choice = self.picks.pop(0)
         if choice is None:
             return None
@@ -78,7 +81,8 @@ class ScriptedApp(App):
             item.choice = item.choices.index(value)
         return PickResult(index, item, item.choices[item.choice] if item.choices else None)
 
-    async def _read_answer(self) -> str:
+    async def _read_answer(self, header: str, question: str) -> str:
+        self.typed_for.append((header, question))
         return self.typed.pop(0)
 
 
@@ -401,7 +405,13 @@ async def case_plan_ask_user() -> None:
         await app.dispatch("/plan 规划一下")
         text = tail(out, start)
         title, items = app.pick_calls[0]
-        check("提问: 选择器标题带主题和进度", title == "金额格式：list 金额也改成两位小数吗？（1/2）", title)
+        check("提问: 选择器标题是问题，上边框写明需要选择、进度和主题",
+              title == "list 金额也改成两位小数吗？"
+              and app.pick_headers[0] == "需要你选择 · 1/2 · 金额格式"
+              and app.pick_headers[1] == "需要你选择 · 2/2", str(app.pick_headers))
+        check("提问: 自己输入时问题还在输入行上面", app.typed_for == [("需要你选择 · 2/2", "budget 金额要校验吗？")],
+              str(app.typed_for))
+        check("提问: 「执行这个计划？」写明需要确认", app.pick_headers[-1] == "需要你确认", str(app.pick_headers))
         check("提问: 推荐项标出，最后一项自己输入", [i.label for i in items] == ["统一改（推荐）", "保持原样", "其他"]
               and items[0].description == "list 也显示 10.00", str([i.label for i in items]))
         check("提问: 答案留在 scrollback", "? 金额格式 → 统一改" in text

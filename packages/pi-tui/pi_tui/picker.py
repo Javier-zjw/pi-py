@@ -1,4 +1,9 @@
-"""选择器：↑↓ 选行，←→ 切换这一行的次要选项（比如模型的思考档位），Enter 确认，Esc 取消。
+"""选择器：↑↓ 选行（或按数字直接选），←→ 切换这一行的次要选项（比如模型的思考档位），
+Enter 确认，Esc 取消。
+
+画成一块带边框的面板（╭ 标题 / │ 内容 / ╰ 按键说明），和上面的模型回复明显区分开——
+用户一眼看出"这里要我选"。``header`` 给了就写在上边框（如"需要你选择 · 1/2"），
+标题作为问题写在面板里；没给就把标题写在上边框。
 
 状态和渲染（PickerState）不依赖 prompt_toolkit，可以离线测试；交互部分有 prompt_toolkit
 时用一个非全屏的小应用（选完整块擦掉，不留在 scrollback 里），没有就退化成输入编号。
@@ -11,7 +16,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .theme import DEFAULT_THEME, Theme
-from .width import display_width, pad, truncate
+from .width import display_width, pad, truncate, wrap
 
 try:  # 可选依赖
     from prompt_toolkit.application import Application
@@ -74,15 +79,45 @@ class PickerState:
         choice = item.choices[item.choice] if item.choices else None
         return PickResult(self.index, item, choice)
 
-    def render(self, title: str, width: int, theme: Theme = DEFAULT_THEME) -> list[str]:
+    def select(self, number: int) -> bool:
+        """按数字选第 number 项（从 1 开始）。超出范围返回 False"""
+        if not 1 <= number <= len(self.items):
+            return False
+        self.index = number - 1
+        return True
+
+    def render(self, title: str, width: int, theme: Theme = DEFAULT_THEME,
+               header: str = "") -> list[str]:
         t = theme
+        bar = t.accent("│", bold=True)
         has_choices = any(i.choices for i in self.items)
-        keys = "↑↓ 选择" + (f" · ←→ {self.choice_label}" if has_choices else "") + " · Enter 确认 · Esc 取消"
-        lines = [f"{t.bold(title)}  {t.muted(keys)}"]
+        count = len(self.items)
+        keys = ["↑↓ 选择"]
+        if count > 1:
+            keys.append(f"1-{min(count, 9)} 直接选")
+        if has_choices:
+            keys.append(f"←→ {self.choice_label}")
+        keys += ["Enter 确认", "Esc 取消"]
+
+        def border(corner: str, text: str, paint) -> str:
+            text = truncate(text, max(width - 7, 4))      # 窄屏时截短，不折行
+            fill = max(width - display_width(text) - 5, 2)
+            return t.accent(f"{corner}─ ", bold=True) + paint(text) + t.accent(" " + "─" * fill, bold=True)
+
+        lines = [""]       # 和上面的内容空一行
+        if header:
+            lines.append(border("╭", header, lambda x: t.highlight(x, bold=True)))
+            lines += [f"{bar} {t.bold(line)}" for line in wrap(title, max(width - 3, 10))]
+            lines.append(bar)
+        else:
+            lines.append(border("╭", title, t.bold))
+
+        number_width = len(str(count))
         label_width = min(max(display_width(i.label) for i in self.items), max(width // 2, 20))
         for i, item in enumerate(self.items):
             selected = i == self.index
             mark = t.accent("❯", bold=True) if selected else " "
+            number = f"{i + 1}.".rjust(number_width + 1) if i < 9 else " " * (number_width + 1)
             label = pad(truncate(item.label, label_width), label_width)
             label = t.accent(label, bold=True) if selected else label
             current = t.success(" ✓ 当前") if item.current else "       "
@@ -94,12 +129,14 @@ class PickerState:
                     side = t.muted(f"{self.choice_label} {value}")
             else:
                 side = t.muted(item.note)
-            line = f"{mark} {label}{current}" + (f"  {side}" if side else "")
+            line = f"{bar} {mark} {t.muted(number) if not selected else number} {label}{current}"
+            line += f"  {side}" if side else ""
             if item.description:
                 room = width - display_width(line) - 4
                 if room > 8:
                     line += f"  {t.muted(truncate(item.description, room))}"
             lines.append(line)
+        lines.append(border("╰", " · ".join(keys), t.muted))
         return lines
 
 
@@ -111,16 +148,24 @@ async def pick(
         choice_label: str = "",
         theme: Theme = DEFAULT_THEME,
         width: int = 80,
+        header: str = "",
 ) -> PickResult | None:
-    """交互选择。取消返回 None。"""
+    """交互选择。取消返回 None。header 写在面板上边框（如"需要你选择"），title 是面板里的问题"""
     state = PickerState(items, index, choice_label)
     if HAS_PROMPT_TOOLKIT:
-        return await _pick_rich(state, title, theme, width)
-    return await _pick_plain(state, title, theme)
+        return await _pick_rich(state, title, theme, width, header)
+    return await _pick_plain(state, title, theme, header)
 
 
-async def _pick_rich(state: PickerState, title: str, theme: Theme, width: int) -> PickResult | None:
+async def _pick_rich(state: PickerState, title: str, theme: Theme, width: int,
+                     header: str) -> PickResult | None:
     bindings = KeyBindings()
+
+    for digit in "123456789":
+        @bindings.add(digit)
+        def _(event, number=int(digit)) -> None:
+            if state.select(number):
+                event.app.exit(result=state.result())
 
     @bindings.add("up")
     @bindings.add("c-p")
@@ -151,7 +196,7 @@ async def _pick_rich(state: PickerState, title: str, theme: Theme, width: int) -
     def _(event) -> None:
         event.app.exit(result=None)
 
-    control = FormattedTextControl(lambda: ANSI("\n".join(state.render(title, width, theme))))
+    control = FormattedTextControl(lambda: ANSI("\n".join(state.render(title, width, theme, header))))
     app: Application = Application(
         layout=Layout(Window(control, dont_extend_height=True, always_hide_cursor=True)),
         key_bindings=bindings,
@@ -161,9 +206,12 @@ async def _pick_rich(state: PickerState, title: str, theme: Theme, width: int) -
     return await app.run_async()
 
 
-async def _pick_plain(state: PickerState, title: str, theme: Theme) -> PickResult | None:
+async def _pick_plain(state: PickerState, title: str, theme: Theme, header: str = "") -> PickResult | None:
     """没有 prompt_toolkit：列出编号，输入编号选择"""
     loop = asyncio.get_running_loop()
+    print()
+    if header:
+        print(theme.highlight(f"【{header}】", bold=True))
     print(theme.bold(title))
     for i, item in enumerate(state.items, 1):
         current = theme.success(" ✓ 当前") if item.current else ""

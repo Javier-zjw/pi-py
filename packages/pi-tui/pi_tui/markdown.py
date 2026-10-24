@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import re
 
+from .highlight import highlight
 from .theme import ACCENT, DEFAULT_THEME, INFO, MUTED, RESET, Theme
 from .width import _tokenize, char_width, display_width, pad
 
@@ -179,11 +180,15 @@ class MarkdownStream:
     """
 
     def __init__(self, width: int, theme: Theme = DEFAULT_THEME,
-                 first_prefix: str = "", prefix: str = "") -> None:
+                 first_prefix: str = "", prefix: str = "", table_width: int | None = None) -> None:
         self.theme = theme
         self.first_prefix = first_prefix
         self.prefix = prefix
-        self.width = max(width - max(display_width(first_prefix), display_width(prefix)), 10)
+        lead = max(display_width(first_prefix), display_width(prefix))
+        self.width = max(width - lead, 10)
+        # 表格可以比正文宽：正文限宽是为了好读，表格挤窄了每格都要折好几行
+        self.table_width = max((table_width or width) - lead, 10)
+        self._lang = ""                 # 代码块的语言（着色用）
         self._buffer = ""
         self._table: list[str] = []
         self._fence = ""                # 在代码块里时是开头的 ``` / ~~~
@@ -252,6 +257,7 @@ class MarkdownStream:
         if self._fence:
             if line.strip().startswith(self._fence):
                 self._fence = ""
+                self._lang = ""
                 return []
             return self._emit(self._code_line(line))
 
@@ -269,6 +275,7 @@ class MarkdownStream:
         fence = _FENCE_RE.match(line)
         if fence:
             self._fence = fence.group(1)[:3]
+            self._lang = fence.group(2)
             return []
         if not stripped:
             self._pending_blank = True
@@ -312,11 +319,13 @@ class MarkdownStream:
         return wrap_ansi(render_inline(line.strip(), t), width)
 
     def _code_line(self, line: str) -> list[str]:
-        """代码块：左边一条灰线，原样不做行内样式；太长就折行"""
+        """代码块：左边一条灰线，按语言着色（不做行内 Markdown 样式）；太长就折行"""
         t = self.theme
         bar = t.paint("│", MUTED) + " "
         code = line.expandtabs(4).rstrip()
-        return [bar + part for part in wrap_ansi(code, self.width - 2)] if code else [bar.rstrip()]
+        if not code:
+            return [bar.rstrip()]
+        return [bar + part for part in wrap_ansi(highlight(code, self._lang, t), self.width - 2)]
 
     def _flush_table(self) -> list[str]:
         rows, self._table = self._table, []
@@ -343,7 +352,7 @@ class MarkdownStream:
         widths = [max(display_width(r[i]) for r in grid) for i in range(columns)]
         widths = [max(w, 1) for w in widths]
         # 太宽就从最宽的列开始收窄，格子里折行
-        room = self.width - (3 * columns + 1)
+        room = self.table_width - (3 * columns + 1)
         while sum(widths) > room and max(widths) > 4:
             widths[widths.index(max(widths))] -= 1
 
@@ -373,7 +382,7 @@ def _cells(row: str) -> list[str]:
 
 
 def render_markdown(text: str, width: int, theme: Theme = DEFAULT_THEME,
-                    first_prefix: str = "", prefix: str = "") -> list[str]:
+                    first_prefix: str = "", prefix: str = "", table_width: int | None = None) -> list[str]:
     """一次性渲染整段 markdown"""
-    stream = MarkdownStream(width, theme, first_prefix, prefix)
+    stream = MarkdownStream(width, theme, first_prefix, prefix, table_width)
     return stream.feed(text) + stream.finish()

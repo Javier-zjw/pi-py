@@ -25,6 +25,7 @@ from .components import (
     usage_line,
     user_message,
 )
+from .highlight import highlight
 from .input import (
     HAS_PROMPT_TOOLKIT, SUSPENDED, LineReader, SlashCommand, SlashCompleter, match_commands,
     missing_dependency_hint,
@@ -57,7 +58,7 @@ __all__ = [
     "StatusBar", "THINKING", "Theme", "WARN", "assistant_text", "badge", "code_block",
     "detect_color_mode", "diff_block", "display_width", "key_value", "markdown_lite",
     "pad", "rule", "strip_ansi", "terminal_height", "terminal_width", "thinking_block", "tool_call",
-    "tool_result", "truncate", "usage_line", "user_message", "wrap", "LineReader", "SUSPENDED", "missing_dependency_hint",
+    "tool_result", "truncate", "usage_line", "user_message", "wrap", "highlight", "LineReader", "SUSPENDED", "missing_dependency_hint",
     "Ticker", "answer_start", "TextStreamer", "SlashCommand", "SlashCompleter", "match_commands",
     "PickerItem", "PickerState", "PickResult", "pick",
     "MarkdownStream", "render_inline", "render_markdown", "wrap_ansi",

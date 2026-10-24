@@ -39,10 +39,10 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 import time
-from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, TextIO
 
@@ -54,9 +54,12 @@ from pi_tui import (
     Theme,
     Ticker,
     diff_block,
+    display_width,
     key_value,
+    pad,
     render_markdown,
     rule,
+    strip_ansi,
     terminal_height,
     terminal_width,
     truncate,
@@ -77,6 +80,33 @@ ASK_TOOL = "ask_user"         # 计划模式向用户提问：界面弹选择器
 QUIET_TOOLS = (PLAN_TOOL, SUBMIT_TOOL, ASK_TOOL)
 PLAN_ROWS = 8         # 计划最多显示几步
 ECHO_ROWS = (4, 8)    # 回显用户输入最多几行（终端高度的 1/3，夹在这个范围里），多的折叠
+TOOL_ROWS = 3         # 活动区里这一批工具最多显示几行（最新的几个）
+FILE_ROWS = 8         # 一轮结束时改动汇总最多列几个文件
+PROSE_MAX = 100       # 回答正文最宽多少列：宽屏下一行拉得太长不好读；表格不受限
+
+
+def diff_stat(patch: str | None) -> tuple[int, int]:
+    """统一 diff 里加了几行、删了几行"""
+    added = removed = 0
+    for line in (patch or "").splitlines():
+        if line.startswith("+") and not line.startswith("+++"):
+            added += 1
+        elif line.startswith("-") and not line.startswith("---"):
+            removed += 1
+    return added, removed
+
+
+def file_change(record: ToolRecord) -> tuple[str, int, int, str] | None:
+    """改文件的工具调用 → (路径, 加, 删, 说明)；不是改文件或失败了返回 None"""
+    if record.is_error or record.name not in ("edit", "write"):
+        return None
+    args = record.arguments if isinstance(record.arguments, dict) else {}
+    path = str(record.details.get("path") or args.get("path") or "")
+    if record.name == "edit":
+        added, removed = diff_stat(record.patch)
+        return path, added, removed, ""
+    lines = len(str(args.get("content") or "").splitlines())
+    return path, lines, 0, "新建" if record.details.get("created") else "覆盖"
 
 
 def summarize_arguments(arguments: Any) -> str:
@@ -132,6 +162,7 @@ class ToolRecord:
     is_error: bool = False
     output: str = ""
     patch: str | None = None
+    details: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -204,6 +235,9 @@ class SessionRenderer:
         self.plan: list[dict] | None = None
         self.mode = "chat"      # 当前工作模式，输入框下面显示
         self.permission = ""    # 不是默认（每次确认）时的权限模式名，输入框下面显示
+        self.cwd = ""           # 工作目录：工具参数里的路径相对它显示
+        self.context_window = 0     # 当前模型的上下文窗口（状态栏算占用）
+        self.context_tokens = 0     # 最近一次实报的上下文大小（跨轮保留）
         self.queued: list[str] = []     # 运行中输入、还没送到模型的插话，显示在活动区
         self._folded_prompt = ""    # 刚回显时折叠了的用户输入，下一轮开始时记进 TurnRecord
         self.state = RenderState()
@@ -279,7 +313,22 @@ class SessionRenderer:
             hint = f"{t.accent('Esc', bold=True)} {t.muted('中断 · 回车插话 · ')}" + hint
         if self.permission:
             hint += f"  {t.warn('⚠ ' + self.permission)}"
+        status = self._status_text()
+        if status:
+            room = self.width - display_width(strip_ansi(hint)) - display_width(status) - 4
+            hint += " " * max(room, 2) + t.muted(status)
         return f"{rule(self.width, '', t)}\n  {hint}"
+
+    def _status_text(self) -> str:
+        """输入框下沿右边：模型 · 上下文占用 · 费用（同 Claude Code 的状态栏）"""
+        parts = []
+        if self.status.model and self.status.model != "none":
+            parts.append(self.status.model.split("/")[-1])
+        if self.context_window and self.context_tokens:
+            parts.append(f"上下文 {self.context_tokens / self.context_window:.0%}")
+        if self.status.cost:
+            parts.append(f"¥{self.status.cost:.3f}")
+        return " · ".join(parts)
 
     def live_block(self) -> str:
         """输入框常驻时画在它上方的活动区（LineReader 的 above）"""
@@ -435,6 +484,7 @@ class SessionRenderer:
             self.status.tokens += usage.total_tokens or (usage.input + usage.output)
             self.status.cost += usage.cost.total
             self.state.context_tokens = usage.input + usage.cache_read + usage.cache_write
+            self.context_tokens = self.state.context_tokens
             self.state.output_tokens += usage.output
             self.state.cost += usage.cost.total
         self.state.text = ""
@@ -473,6 +523,7 @@ class SessionRenderer:
         record.output = "".join(getattr(c, "text", "") or "" for c in (result.content or []))
         details = result.details if isinstance(result.details, dict) else {}
         record.patch = details.get("patch")
+        record.details = details
         if record.is_error:
             self.tool_errors += 1
         if not self.state.running:
@@ -496,6 +547,9 @@ class SessionRenderer:
         if self.state.plan_touched and self._plan_open() and self.mode != "plan":
             left = sum(s.get("status") != "completed" for s in self.plan)
             lines.append(self.theme.muted(f"{INDENT}○ 任务清单还有 {left} 项没完成，说「继续」接着做"))
+        files = self._files_lines()
+        if files:
+            lines += ["", *files]
         tokens = self._token_footer()
         if tokens:
             lines += ["", tokens]
@@ -721,13 +775,16 @@ class SessionRenderer:
         parts = [f"{t.highlight('✻', bold=True)} {t.highlight(_seconds(elapsed), bold=True)}"]
         tools = self.turn.tools[self.state.segment_start:]
         if tools:
-            counts = Counter(r.name for r in tools)
-            names = ", ".join(f"{n} ×{c}" if c > 1 else n for n, c in counts.most_common())
-            parts.append(f"{t.muted(f'{len(tools)} 次工具')} "
-                         f"{t.accent(truncate(names, max(self.width - 50, 20)))}")
+            parts.append(t.muted(f"{len(tools)} 次工具"))
             failed = sum(r.is_error for r in tools)
             if failed:
                 parts.append(t.error(f"{failed} 失败"))
+            files = self._changed_files()
+            if files:
+                added = sum(a for _, a, _, _ in files)
+                removed = sum(r for _, _, r, _ in files)
+                parts.append(f"{t.muted(f'改了 {len(files)} 个文件')} "
+                             f"{t.success(f'+{added}')} {t.error(f'−{removed}')}")
         if self._prune_times:
             parts.append(t.muted(f"清理旧输出 {self._prune_times} 次 −{_k(self._pruned_tokens)}"))
         if self.state.retries:
@@ -774,7 +831,8 @@ class SessionRenderer:
         self.state.answering = True
         self.state.slot, self.state.shown, self.state.text = "", "", ""
         self.state.markdown = MarkdownStream(
-            self.width, self.theme, first_prefix=f"{self.theme.accent(ANSWER_MARK)} ", prefix=INDENT)
+            min(self.width, PROSE_MAX), self.theme, first_prefix=f"{self.theme.accent(ANSWER_MARK)} ",
+            prefix=INDENT, table_width=self.width)
         self.live.finalize()
         self._emit([""])
         self._feed_answer(text)
@@ -847,7 +905,7 @@ class SessionRenderer:
         lines = [head + detail, *self._plan_lines()]
         slot = self.state.slot
         if slot == "tools" and self.state.batch:
-            lines.append(self._tools_line())
+            lines += self._tool_lines()
         elif slot == "thinking" and self.show_thinking:
             lines += [t.thinking(f"{INDENT}{line}", italic=True) for line in self._slot_lines(self.state.shown)]
         elif slot == "text":
@@ -892,22 +950,107 @@ class SessionRenderer:
             lines.append(f"{INDENT}  {t.muted(f'… 还有 {rest} 项')}")
         return lines
 
-    def _tools_line(self) -> str:
-        """这一批工具：在跑的显示最新一个（名字闪烁、不带参数），跑完了显示 ✓ 名字"""
+    def _tool_lines(self) -> list[str]:
+        """这一批工具，每个一行：名字 + 关键参数（文件、命令、搜索词）+ 结果（+12 −3、0.8s、N 行）。
+        在跑的名字闪烁、带用时；只显示最新 TOOL_ROWS 个"""
         t = self.theme
-        running = list(self.state.running.values())
-        if running:
-            current = running[-1]
-            on = int(time.time() * 2) % 2 == 0
-            name = t.accent(current.name, bold=True) if on else t.accent(current.name, dim=True)
-            more = t.muted(f" 等 {len(running)} 个") if len(running) > 1 else ""
-            return f"{INDENT}{name}{more}  {t.muted(_seconds(time.time() - current.started))}"
         batch = self.state.batch
-        counts = Counter(r.name for r in batch)
-        names = ", ".join(f"{n} ×{c}" if c > 1 else n for n, c in counts.most_common())
-        failed = sum(r.is_error for r in batch)
-        mark = t.error("✗") if failed else t.success("✓")
-        return f"{INDENT}{mark} {t.muted(names)}"
+        shown = batch[-TOOL_ROWS:]
+        lines = []
+        if len(batch) > len(shown):
+            done = sum(r.took is not None for r in batch[:-TOOL_ROWS])
+            lines.append(f"{INDENT}{t.muted(f'… 前面 {len(batch) - len(shown)} 个（完成 {done}）')}")
+        on = int(time.time() * 2) % 2 == 0
+        for record in shown:
+            running = record.took is None
+            if running:
+                mark = t.accent("⏺", bold=True) if on else t.accent("⏺", dim=True)
+                result = t.muted(_seconds(time.time() - record.started))
+            else:
+                mark = t.error("✗") if record.is_error else t.success("✓")
+                result = self._tool_result(record)
+            name = t.accent(record.name, bold=True) if running else t.muted(record.name)
+            target = self._tool_target(record)
+            room = max(self.width - display_width(record.name) - display_width(strip_ansi(result)) - 10, 12)
+            line = f"{INDENT}{mark} {name}  {truncate(target, room)}"
+            lines.append(f"{line}  {result}" if result else line)
+        return lines
+
+    def _rel(self, path: str) -> str:
+        if not path:
+            return ""
+        if self.cwd and os.path.isabs(path):
+            rel = os.path.relpath(path, self.cwd)
+            if not rel.startswith(".."):
+                return rel
+        return path
+
+    def _tool_target(self, record: ToolRecord) -> str:
+        """一行里最能说明这次调用的参数：改哪个文件、跑什么命令、搜什么"""
+        args = record.arguments if isinstance(record.arguments, dict) else {}
+        if record.name in ("read", "write", "edit", "ls"):
+            target = self._rel(str(args.get("path") or ""))
+            if record.name == "read" and args.get("offset"):
+                target += f":{args['offset']}"
+            return target
+        if record.name == "bash":
+            return " ".join(str(args.get("command") or "").split())
+        if record.name in ("grep", "find"):
+            where = self._rel(str(args.get("path") or ""))
+            return f"{args.get('pattern', '')}" + (f"  {where}" if where and where != "." else "")
+        return summarize_arguments(args)
+
+    def _tool_result(self, record: ToolRecord) -> str:
+        """跑完之后的一句结果"""
+        t = self.theme
+        details = record.details
+        took = t.muted(_seconds(record.took or 0))
+        if record.is_error:
+            first = first_line(record.output, 40)
+            return t.error(first) if first else took
+        change = file_change(record)
+        if change:
+            _, added, removed, note = change
+            stat = f"{t.success(f'+{added}')} {t.error(f'−{removed}')}" if record.name == "edit" else \
+                t.success(f"{note} {added} 行")
+            return stat
+        if record.name == "read" and details.get("lines") is not None:
+            return t.muted(f"{details['lines']} 行")
+        if record.name == "grep" and details.get("matches") is not None:
+            return t.muted(f"{details['matches']} 处")
+        if record.name in ("find", "ls") and details.get("count") is not None:
+            return t.muted(f"{details['count']} 个")
+        return took
+
+    def _changed_files(self) -> list[tuple[str, int, int, str]]:
+        """这一轮改了哪些文件，同一个文件合并：[(路径, 加, 删, 说明)]，按第一次改的顺序"""
+        files: dict[str, list] = {}
+        for record in self.turn.tools:
+            change = file_change(record)
+            if change is None:
+                continue
+            path, added, removed, note = change
+            entry = files.setdefault(self._rel(path), [0, 0, note])
+            entry[0] += added
+            entry[1] += removed
+        return [(path, a, r, note) for path, (a, r, note) in files.items()]
+
+    def _files_lines(self) -> list[str]:
+        """一轮结束时的改动汇总：每个文件一行 +加 −删"""
+        t = self.theme
+        files = self._changed_files()
+        if not files:
+            return []
+        shown = files[:FILE_ROWS]
+        width = min(max(display_width(path) for path, *_ in shown), max(self.width // 2, 20))
+        lines = []
+        for path, added, removed, note in shown:
+            tag = t.muted(f"  {note}") if note == "新建" else ""
+            lines.append(f"{INDENT}{pad(truncate(path, width), width)}  "
+                         f"{t.success(f'+{added}')} {t.error(f'−{removed}')}{tag}")
+        if len(files) > len(shown):
+            lines.append(f"{INDENT}{t.muted(f'… 还有 {len(files) - len(shown)} 个文件')}")
+        return lines
 
     def _repaint(self) -> None:
         if self.state.answering:

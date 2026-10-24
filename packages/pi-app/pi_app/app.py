@@ -244,6 +244,8 @@ class App:
         self.renderer.status.model = session.model.key if session.model else "none"
         self.renderer.status.thinking = session.thinking_level
         self.renderer.status.hint = "/help"
+        self.renderer.cwd = session.cwd
+        self.renderer.context_window = session.model.context_window if session.model else 0
 
     def greet(self) -> None:
         session = self.session
@@ -265,6 +267,7 @@ class App:
             session.set_thinking_level(level)
         self.renderer.status.model = session.model.key if session.model else "none"
         self.renderer.status.thinking = session.thinking_level
+        self.renderer.context_window = session.model.context_window if session.model else 0
         t = self.theme
         think = t.highlight(level, bold=True) if level != "off" else t.muted("off")
         model_key = t.accent(self.renderer.status.model, bold=True)

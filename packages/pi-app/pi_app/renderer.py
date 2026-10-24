@@ -72,7 +72,8 @@ SLOT_LINES = 6        # 活动区里思考 / 过渡话最多显示几行（只�
 PREVIEW_ROWS = 12     # 回答还没定稿的部分（半行、没收齐的表格）在活动区里最多显示几行
 PLAN_TOOL = "update_plan"   # 任务计划（内置扩展 todo）：不算工具调用，显示成勾选单
 SUBMIT_TOOL = "submit_plan"  # 计划模式提交计划：不算工具调用，计划本身单独成块显示
-QUIET_TOOLS = (PLAN_TOOL, SUBMIT_TOOL)
+ASK_TOOL = "ask_user"         # 计划模式向用户提问：界面弹选择器，答案单独成行显示
+QUIET_TOOLS = (PLAN_TOOL, SUBMIT_TOOL, ASK_TOOL)
 PLAN_ROWS = 8         # 计划最多显示几步
 
 
@@ -420,6 +421,8 @@ class SessionRenderer:
         self._repaint()
 
     def _on_tool_execution_end(self, event) -> None:
+        if event.tool_name == ASK_TOOL:
+            self._show_answers(event.result)
         if event.tool_name in QUIET_TOOLS:
             return
         record = self.state.running.pop(event.tool_call_id, None)
@@ -532,6 +535,41 @@ class SessionRenderer:
         self._emit(["", f"{t.info('╭', bold=True)} {t.info('计划', bold=True)} {t.bold(title)}",
                     *[line if line else bar.rstrip() for line in body], t.info("╰", bold=True)])
         self.turn.steps.append(("text", f"提交计划：{title}"))
+
+    # -- 向用户提问（ask_user） ------------------------------------------ #
+
+    def pause(self) -> None:
+        """运行中要弹选择器：停掉转圈、收起活动区，把屏幕让给选择器"""
+        self.ticker.stop()
+        self._commit_thinking()
+        self.live.finalize()
+
+    def resume(self) -> None:
+        if self.agent_running:
+            self.ticker.start()
+            self._repaint()
+
+    def _show_answers(self, result: Any) -> None:
+        """用户答完的问题留在 scrollback 里：一题一行「? 主题 → 回答」"""
+        details = getattr(result, "details", None)
+        if not isinstance(details, dict) or "answers" not in details:
+            return      # 没问成（没有界面、参数不对）：模型会在回复里问
+        t = self.theme
+        answers = details["answers"]
+        if not answers:
+            lines = [t.muted(f"{INDENT}? 跳过了提问，按推荐的选项继续")]
+        else:
+            lines = []
+            headers = {q["question"]: q.get("header") for q in details.get("questions") or []}
+            for answer in answers:
+                topic = headers.get(answer["question"]) or answer["question"]
+                topic = truncate(topic, max(self.width // 2, 20))
+                lines.append(f"{INDENT}{t.accent('?', bold=True)} {topic} {t.muted('→')} "
+                             f"{t.bold(answer['answer'])}")
+        # ctrl+o 展开时给完整的问题
+        record = [f"提问：{a['question']} → {a['answer']}" for a in answers] or ["跳过了提问"]
+        self.turn.steps.append(("text", "\n".join(record)))
+        self._emit(lines)
 
     def _plan_open(self) -> bool:
         return bool(self.plan) and any(s.get("status") != "completed" for s in self.plan)

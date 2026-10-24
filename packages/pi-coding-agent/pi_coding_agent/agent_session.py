@@ -10,7 +10,7 @@ import asyncio
 import dataclasses
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterable, Sequence
+from typing import Any, Awaitable, Callable, Iterable, Sequence
 
 from pi_agent import (
     Agent,
@@ -61,6 +61,9 @@ from .session.manager import SessionManager
 from .session_events import ModeChangedEvent
 from .settings import SettingsManager
 from .tools import DEFAULT_TOOL_NAMES, create_tools
+
+# 界面实现的提问回调：问题列表 → 每题的回答（用户跳过返回 None）
+UserInputHandler = Callable[[list[dict[str, Any]]], Awaitable["list[dict[str, Any]] | None"]]
 
 
 @dataclass
@@ -178,6 +181,9 @@ class AgentSession:
         self.mode: str = self._restore_mode()
         self._base_system_prompt = state.system_prompt or ""
         self._base_tools = list(active_tools)
+        # 界面提供的"向用户提问"入口（pi-tui 弹选择器）。None = 没有可交互的界面（print 模式、网页），
+        # 扩展的提问工具据此退回到"在回复里写问题"
+        self.user_input: UserInputHandler | None = None
         self.agent.subscribe(self._on_agent_event)
         self.resources.get_extension_api().session = self
 
@@ -525,6 +531,14 @@ class AgentSession:
                 mode = (entry.data or {}).get("mode") if isinstance(entry.data, dict) else None
                 return mode if mode in modes else "chat"
         return "chat"
+
+    async def ask_user(self, questions: list[dict[str, Any]]) -> list[dict[str, Any]] | None:
+        """让界面向用户提问。questions 每项 {question, header?, options: [{label, description?,
+        recommended?}]}；返回每题的 {question, answer, custom}，用户跳过返回 None。
+        没有界面时抛 RuntimeError（先看 user_input 是否为 None）"""
+        if self.user_input is None:
+            raise RuntimeError("no interactive UI to ask the user")
+        return await self.user_input(questions)
 
     def notify(self, event: Any) -> None:
         """扩展发会话事件（如计划提交、任务清单更新）给界面"""

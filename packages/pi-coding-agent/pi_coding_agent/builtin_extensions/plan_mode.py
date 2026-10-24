@@ -6,13 +6,16 @@
 为什么稳：
 
 1. **工具层面强制只读** —— 不是靠提示词请求模型"别改文件"，而是计划模式下只挂 read / grep /
-   find / ls 和 submit_plan。模型想改也调不到。update_plan（执行进度单）在计划模式下也不给，
+   find / ls、ask_user 和 submit_plan。模型想改也调不到。update_plan（执行进度单）在计划模式下也不给，
    避免和"计划"混淆（Codex 同样禁止）。
 2. **提交即停** —— submit_plan 的结果带 terminate，本轮立刻结束、不再调模型，
    等用户决定：执行 / 继续完善 / 放弃。
 3. **计划落进会话记录** —— custom entry "plan"（status: proposed → approved），
    刷新页面、换终端、resume 都还在；压缩后经 compaction_context 补回。
-4. **批准即生成进度单** —— 计划的任务直接变成 update_plan 的清单（第一项 in_progress），
+4. **提问走选择器** —— 代码回答不了、又会改变计划的决定，用 ask_user 一次问完（同 Claude Code 的
+   AskUserQuestion、Codex 的 request_user_input）：界面弹选项，答案作为工具结果回来，本轮接着规划。
+   没有可交互界面（print 模式、网页）时工具报错，模型退回到在回复里提问。
+5. **批准即生成进度单** —— 计划的任务直接变成 update_plan 的清单（第一项 in_progress），
    执行时模型每完成一项就打勾，界面实时显示；目标重锚提醒里也带着这张清单。
 
 模式的注册和生效走 ExtensionAPI 的 register_mode，核心层不认识"计划"这个概念。
@@ -28,6 +31,7 @@ DESCRIPTION = "计划模式：只读调研、提交带任务清单的计划，�
 
 ENTRY_TYPE = "plan"
 READ_ONLY = ("read", "grep", "find", "ls")
+ASK_TOOL = "ask_user"
 
 # 结构参照 Codex 的 Plan Mode 协作模式提示（collaboration-mode-templates/templates/plan.md）
 PLAN_PROMPT = """
@@ -36,31 +40,35 @@ PLAN_PROMPT = """
 You are in PLAN MODE. Your job is to produce a plan, not to do the work.
 
 Mode rules:
-- You stay in plan mode until the user switches modes. If the user asks you to implement \\
+- You stay in plan mode until the user switches modes. If the user asks you to implement \
 something while in plan mode, treat it as a request to plan the implementation.
-- Only read-only tools are available (read, grep, find, ls). Do not try to edit files or run \\
-commands.
+- Only read-only tools are available (read, grep, find, ls), plus `ask_user` and `submit_plan`. \
+Do not try to edit files or run commands.
 
 Work in three phases:
-1. Explore first. Ground yourself in the code: read the relevant files, entry points and \\
+1. Explore first. Ground yourself in the code: read the relevant files, entry points and \
 configs. Answer every question that the repository can answer by looking, not by asking.
-2. Clarify only what you cannot discover. If a decision would materially change the plan \\
-(scope, behavior, trade-offs) and the code cannot settle it, ask the user a few concise \\
-questions in your reply, each with options and a recommended default, then stop without \\
-submitting a plan.
-3. Submit. When the plan is decision complete (an implementer would not need to make any \\
+2. Clarify only what you cannot discover. If a decision would materially change the plan \
+(scope, behavior, trade-offs) and the code cannot settle it, call `ask_user` once with all such \
+questions (1-4), each with 2-4 options and the recommended option marked. The user picks \
+answers in the UI and they come back as the tool result; then continue in the same turn. \
+Don't ask about things with an obvious default: take the default and list it under questions \
+in the plan as an assumption. Don't write questions as plain text in your reply when \
+`ask_user` is available.
+3. Submit. When the plan is decision complete (an implementer would not need to make any \
 decisions), call `submit_plan` exactly once:
    - title: a short name for the change
-   - summary: Markdown, concise: approach, key changes by area, how it will be tested, \\
+   - summary: Markdown, concise: approach, key changes by area, how it will be tested, \
 assumptions
-   - steps: 3-10 ordered tasks. Each is one concrete, verifiable unit of work ("Add X to Y", \\
+   - steps: 3-10 ordered tasks. Each is one concrete, verifiable unit of work ("Add X to Y", \
 "Run the Z tests"); they become the execution checklist the implementer ticks off
    - files: the main files to be changed or created
    - questions: remaining open questions or assumptions (may be empty)
-After calling `submit_plan`, stop. The user will approve it, ask for changes, or drop it. \\
+After calling `submit_plan`, stop. The user will approve it, ask for changes, or drop it. \
 If they ask for changes, submit a complete replacement plan.
 
-Write in the language the user writes in.
+Language: everything the user sees (progress notes, questions and options, the plan) must be \
+in the language the user writes in. If they write Chinese, write Chinese.
 </plan_mode>"""
 
 SUBMIT_DESCRIPTION = (
@@ -68,6 +76,47 @@ SUBMIT_DESCRIPTION = (
     "decision complete; the turn ends right after, waiting for the user. `steps` becomes the "
     "execution checklist, so make each step concrete and verifiable."
 )
+
+ASK_DESCRIPTION = (
+    "Ask the user 1-4 multiple-choice questions and wait for the answers. Use it only for "
+    "decisions that materially change the plan and that the repository cannot answer. Each "
+    "question has 2-4 short options; mark the one you recommend. The UI always adds an option "
+    "for the user to type their own answer. Write questions and options in the user's language."
+)
+
+ASK_PARAMETERS = {
+    "type": "object",
+    "properties": {
+        "questions": {
+            "type": "array",
+            "description": "1-4 questions, asked one after another",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string", "description": "The full question"},
+                    "header": {"type": "string",
+                               "description": "Very short topic label, a few words"},
+                    "options": {
+                        "type": "array",
+                        "description": "2-4 mutually exclusive choices",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "label": {"type": "string", "description": "Short choice text"},
+                                "description": {"type": "string",
+                                                "description": "What choosing it means"},
+                                "recommended": {"type": "boolean"},
+                            },
+                            "required": ["label"],
+                        },
+                    },
+                },
+                "required": ["question", "options"],
+            },
+        },
+    },
+    "required": ["questions"],
+}
 
 SUBMIT_PARAMETERS = {
     "type": "object",
@@ -95,8 +144,35 @@ def activate(pi) -> None:
         session.agent.state.system_prompt = (session.agent.state.system_prompt or "") + PLAN_PROMPT
         excluded = set(session.settings.get("excludeTools") or [])
         tools = create_tools([name for name in READ_ONLY if name not in excluded], session.cwd)
-        tools.append(submit_tool)
+        tools += [ask_tool, submit_tool]
         session.agent.set_tools(tools)
+
+    async def ask_user(args: dict, ctx: ToolContext) -> AgentToolResult:
+        questions = normalize_questions(args.get("questions"))
+        if not questions:
+            return AgentToolResult.text(
+                "questions is empty: give 1-4 questions, each with 2-4 options", is_error=True)
+        session = pi.session
+        if session is None or session.user_input is None:
+            # print 模式、网页等没有可交互界面：退回到在回复里提问
+            return AgentToolResult.text(
+                "No interactive UI is available to show these questions. Ask them in your reply "
+                "instead (each with its options and your recommendation), then stop and wait for "
+                "the user's answer. Do not submit a plan yet.",
+                is_error=True)
+        answers = await session.ask_user(questions)
+        if not answers:
+            return AgentToolResult.text(
+                "The user skipped the questions. Use your recommended options, list them as "
+                "assumptions in the plan's questions field, and continue.",
+                details={"questions": questions, "answers": []})
+        lines = ["The user answered:"]
+        for answer in answers:
+            how = " (typed by the user)" if answer.get("custom") else ""
+            lines.append(f"- {answer['question']} -> {answer['answer']}{how}")
+        lines.append("Continue planning with these decisions; don't ask about them again.")
+        return AgentToolResult.text("\n".join(lines),
+                                    details={"questions": questions, "answers": answers})
 
     async def submit_plan(args: dict, ctx: ToolContext) -> AgentToolResult:
         steps = [str(s).strip() for s in args.get("steps") or [] if str(s).strip()]
@@ -136,6 +212,14 @@ def activate(pi) -> None:
         description=SUBMIT_DESCRIPTION,
         parameters=SUBMIT_PARAMETERS,
         execute=submit_plan,
+    )
+
+    ask_tool = AgentTool(
+        name=ASK_TOOL,
+        label="提问",
+        description=ASK_DESCRIPTION,
+        parameters=ASK_PARAMETERS,
+        execute=ask_user,
     )
 
     pi.register_mode(
@@ -210,6 +294,28 @@ def approve_plan(session, extra: str = "") -> str:
              for i, step in enumerate(plan["steps"])]
     save_todo(session, {"plan": steps, "source": "plan"})
     return render_plan_as_task(approved, extra)
+
+
+def normalize_questions(raw) -> list[dict]:
+    """模型给的问题整理干净：去掉空问题、空选项，选项最多 4 个，问题最多 4 个"""
+    questions = []
+    for item in raw or []:
+        if not isinstance(item, dict) or not str(item.get("question") or "").strip():
+            continue
+        options = []
+        for option in item.get("options") or []:
+            if isinstance(option, str):
+                option = {"label": option}
+            if isinstance(option, dict) and str(option.get("label") or "").strip():
+                options.append({"label": str(option["label"]).strip(),
+                                "description": str(option.get("description") or "").strip(),
+                                "recommended": bool(option.get("recommended"))})
+        if not options:
+            continue
+        questions.append({"question": str(item["question"]).strip(),
+                          "header": str(item.get("header") or "").strip(),
+                          "options": options[:4]})
+    return questions[:4]
 
 
 def latest_plan(session) -> dict | None:

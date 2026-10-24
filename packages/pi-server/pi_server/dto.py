@@ -129,7 +129,10 @@ class EventTranslator:
         if role in ("user", "custom"):
             notice = (getattr(message, "details", None) or {}) if role == "custom" else {}
             if isinstance(notice, dict) and notice.get("notice"):
-                # 扩展插进来的提醒（如 tool_budget）：显示一句说明，不显示给模型看的全文
+                # 扩展插进来的提醒（如 tool_budget）：显示一句说明，不显示给模型看的全文；
+                # quiet 的（定期重锚）不打扰
+                if notice.get("quiet"):
+                    return []
                 return [{"type": "injected", "text": notice["notice"], "notice": True}]
             text = message.text()
             if text.strip() and text.strip() == self.own_prompt.strip():

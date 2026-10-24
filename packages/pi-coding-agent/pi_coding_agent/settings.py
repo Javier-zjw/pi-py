@@ -17,8 +17,9 @@ DEFAULT_SETTINGS : dict[str, Any] = {
     "tools": None,
     "excludeTools": [],
     "toolExecution": "parallel",
-    # 一次请求调用工具达到 softLimit 次时提醒模型收尾，之后每 every 次再提醒（builtin_extensions/tool_budget.py）
-    "toolBudget": {"enabled": True, "softLimit": 40, "every": 20},
+    # 一次请求调用工具达到 softLimit 次时提醒模型收尾，之后每 every 次再提醒；
+    # 每 reanchorEvery 次把用户的请求和当前计划放回上下文末尾（builtin_extensions/tool_budget.py）
+    "toolBudget": {"enabled": True, "softLimit": 40, "every": 20, "reanchorEvery": 15},
     # threshold：上下文达到"可用窗口（窗口 - reserveTokens）"的这个比例时压缩
     # thinking：压缩调用的思考档位，"inherit" 表示沿用会话当前档位
     # prune：L1 清理旧工具输出（不调模型），到 triggerRatio 时清到 targetRatio 以下，最近 protectTokens 不动

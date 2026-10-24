@@ -342,7 +342,11 @@ class SessionRenderer:
         if role in ("user", "custom"):
             details = getattr(message, "details", None) if role == "custom" else None
             if isinstance(details, dict) and details.get("notice"):
-                # 扩展插进来的提醒（如 tool_budget）：一行说明，不当成用户说的话回显
+                # 扩展插进来的提醒（如 tool_budget）：一行说明，不当成用户说的话回显；
+                # quiet 的（定期重锚）不打扰，只记进本轮过程，ctrl+o 看得到
+                if details.get("quiet"):
+                    self.turn.steps.append(("text", f"↺ {details['notice']}"))
+                    return
                 self._emit([f"{INDENT}{self.theme.warn('⚑')} {self.theme.muted(details['notice'])}"])
                 return
             text = message.text()

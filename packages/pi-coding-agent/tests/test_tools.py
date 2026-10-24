@@ -39,6 +39,7 @@ from pi_coding_agent.tools import (  # noqa: E402
     fuzzy_find,
     generate_unified_patch,
     truncate_head,
+    truncate_middle,
     truncate_tail,
 )
 
@@ -165,6 +166,30 @@ def test_truncate() -> None:
 
     out, cut = truncate_head("\n".join(str(i) for i in range(100)), max_lines=10)
     check("truncate_head: 保留尾部", out.strip().endswith("99") and cut, out[-20:])
+
+    # truncate_middle：超限才截，截时保留头尾
+    exact = "".join(f"{i}\n" for i in range(10))
+    out, cut = truncate_middle(exact, max_lines=10)
+    check("truncate_middle: 不超限原样返回（结尾换行不算多一行）", out == exact and not cut, repr(out[-20:]))
+    many = "\n".join(f"line{i}" for i in range(1000))
+    out, cut = truncate_middle(many, max_lines=10, full_path="/tmp/full.log")
+    lines = out.split("\n")
+    check("truncate_middle: 超行数时保留开头和结尾", cut and lines[:4] == ["line0", "line1", "line2", "line3"]
+          and lines[-6:] == [f"line{i}" for i in range(994, 1000)], str(lines))
+    check("truncate_middle: 中间一行说明省略了多少、完整输出在哪",
+          "990 lines" in lines[4] and "/tmp/full.log" in lines[4] and len(lines) == 11, lines[4])
+    big = "\n".join("错误日志" * 20 for _ in range(400))
+    out, cut = truncate_middle(big, max_bytes=2000)
+    body = [line for line in out.split("\n") if not line.startswith("[...")]
+    check("truncate_middle: 超字节时按整行截、两头都在、不超预算",
+          cut and all(line == "错误日志" * 20 for line in body)
+          and len("\n".join(body).encode("utf-8")) <= 2000, str(len(out.encode("utf-8"))))
+    check("truncate_middle: 结尾给得比开头多", out.index("[...") < len(out) / 2, str(out.index("[...")))
+    huge = "数据" * 5000
+    out, cut = truncate_middle(huge, max_bytes=1000)
+    check("truncate_middle: 单行超长时按字符截、不切半个字", cut and "\ufffd" not in out
+          and out.startswith("数据") and out.endswith("数据") and len(out.encode("utf-8")) < 1300,
+          str(len(out.encode("utf-8"))))
 
 
 # --------------------------------------------------------------------------- #
@@ -377,6 +402,20 @@ async def case_bash() -> None:
         if full:
             check("bash: 临时文件路径出现在输出里", full in text_of(r), text_of(r)[-80:])
             Path(full).unlink(missing_ok=True)
+
+        # 只超行数（3000 行，约 14KB < 50KB）：以前截了却不存完整输出，模型找不回被截掉的部分
+        r = await bash.execute({"command": "seq 1 3000"}, ctx())
+        text = text_of(r)
+        full = (r.details or {}).get("full_output_path")
+        check("bash: 只超行数也存完整输出", full and Path(full).exists() and full in text, str(full))
+        check("bash: 输出保留头尾", text.startswith("1\n2\n") and "\n3000" in text
+              and "\n1500\n" not in text, text[:20] + " … " + text[-30:])
+        if full:
+            check("bash: 完整输出文件内容完整", Path(full).read_text().count("\n") == 3000)
+            Path(full).unlink(missing_ok=True)
+        r = await bash.execute({"command": "seq 1 2000"}, ctx())
+        check("bash: 刚好 2000 行不截", (r.details or {}).get("truncated") is False
+              and "omitted" not in text_of(r), str((r.details or {}).get("truncated")))
 
         started = time.monotonic()
         r = await bash.execute({"command": "sleep 5", "timeout": 0.4}, ctx())

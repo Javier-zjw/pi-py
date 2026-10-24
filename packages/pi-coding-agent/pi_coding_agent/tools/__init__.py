@@ -11,7 +11,13 @@ from .bash import create_bash_tool, kill_process_tree, run_bash
 from .edit import create_edit_tool, fuzzy_find, generate_unified_patch
 from .files import create_ls_tool, create_write_tool, create_read_tool, resolve_path
 from .search import create_find_tool, create_grep_tool
-from .truncate import DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES, truncate_head, truncate_tail
+from .truncate import (
+    DEFAULT_MAX_BYTES,
+    DEFAULT_MAX_LINES,
+    truncate_head,
+    truncate_middle,
+    truncate_tail,
+)
 
 ALL_TOOL_NAMES = ("read", "bash", "edit", "write", "grep", "find", "ls")
 DEFAULT_TOOL_NAMES = ("read", "bash", "edit", "write")
@@ -84,5 +90,6 @@ __all__ = [
     "resolve_path",
     "run_bash",
     "truncate_head",
+    "truncate_middle",
     "truncate_tail",
 ]

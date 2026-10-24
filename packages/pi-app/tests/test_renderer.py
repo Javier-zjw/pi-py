@@ -233,9 +233,15 @@ def test_prune_and_notice() -> None:
     text = out.getvalue()
     check("提醒: 显示一行说明", "⚑ 已调用 40 次工具" in text, text)
     check("提醒: 不把给模型的全文当用户的话回显", "给模型看的全文" not in text and "❯" not in text, text)
+    renderer.on_event(ev("message_end", message=CustomMessage(
+        custom_type="tool_budget", content="[系统提醒] 对照一下方向……",
+        details={"notice": "第 15 次工具调用：提醒模型对照用户的请求", "quiet": True})))
+    check("重锚: quiet 的提醒不写进 scrollback", "第 15 次工具调用" not in out.getvalue(), out.getvalue())
     renderer.on_event(ev("agent_end", reason="stop"))
     summary = next(line for line in out.getvalue().splitlines() if line.startswith("✻ "))
     check("清理: 次数和省下的 tokens 并进用时行", "清理旧输出 2 次 −12.0k" in summary, summary)
+    check("重锚: ctrl+o 里看得到", ("text", "↺ 第 15 次工具调用：提醒模型对照用户的请求")
+          in renderer.last_turn.steps, str(renderer.last_turn.steps))
     renderer.on_event(ev("agent_start"))
     renderer.on_event(ev("agent_end", reason="stop"))
     check("清理: 下一轮重新计数", "清理" not in out.getvalue().splitlines()[-3:][0], out.getvalue())

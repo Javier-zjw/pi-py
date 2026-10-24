@@ -726,6 +726,43 @@ async def case_reasoning_passback_end_to_end() -> None:
               json.dumps(calls, ensure_ascii=False)[:300])
 
 
+async def case_goal_reanchor() -> None:
+    """每 reanchorEvery 次工具调用把用户的请求和当前计划放回上下文末尾；update_plan 不计数"""
+    with Sandbox() as cwd:
+        write_files(cwd, 7)
+        script = [[plan_call("p1", ("读文件", "in_progress"), ("总结", "pending"))]] + read_script(7)
+        session, provider = compaction_session(cwd, script, tools=["read"], usage=Usage())
+        session.settings.set("compaction.enabled", False)
+        session.settings.set("toolBudget.reanchorEvery", 3)
+        session.settings.set("toolBudget.softLimit", 100)
+        await session.prompt("把 f0 到 f6 读一遍，然后总结它们的共同点")
+        reminders = [m for m in session.messages
+                     if getattr(m, "role", "") == "custom" and m.custom_type == "tool_budget"]
+        check("重锚: 第 3、6 次工具之后各一次（update_plan 不算）",
+              [m.details["count"] for m in reminders] == [3, 6], str([m.details for m in reminders]))
+        check("重锚: 界面上不单独显示", all(m.details.get("quiet") for m in reminders))
+        text = reminders[0].text()
+        check("重锚: 带上用户的请求", "「把 f0 到 f6 读一遍，然后总结它们的共同点」" in text, text)
+        check("重锚: 带上当前计划", "- [>] 读文件" in text and "- [ ] 总结" in text, text)
+        check("重锚: 要求自查能不能回答", "够不够回答" in text, text)
+        sent = [m for m in provider.calls[-1]["context"].messages if "对照一下方向" in m.text()]
+        check("重锚: 以用户消息送到模型", len(sent) == 2 and all(m.role == "user" for m in sent))
+        check("重锚: 不打断，这一轮照常跑完", session.messages[-1].text() == "都读完了")
+
+    with Sandbox() as cwd:
+        write_files(cwd, 4)
+        session, _ = compaction_session(cwd, read_script(4), tools=["read"], usage=Usage())
+        session.settings.set("compaction.enabled", False)
+        session.settings.set("toolBudget.reanchorEvery", 0)
+        session.settings.set("toolBudget.softLimit", 4)
+        await session.prompt("读一下 f0 到 f3")
+        wrap = [m for m in session.messages if getattr(m, "role", "") == "custom"]
+        check("收尾: 到上限时提醒并带上请求", len(wrap) == 1 and "停止继续探索" in wrap[0].text()
+              and "「读一下 f0 到 f3」" in wrap[0].text() and not wrap[0].details.get("quiet"),
+              str([m.text()[:80] for m in wrap]))
+        check("收尾: 没有计划时提示可以列计划", "update_plan" in wrap[0].text(), wrap[0].text())
+
+
 async def case_prune_disabled() -> None:
     with Sandbox() as cwd:
         write_files(cwd, 6)
@@ -1493,6 +1530,10 @@ def test_todo_plan() -> None:
     asyncio.run(case_todo_plan())
 
 
+def test_goal_reanchor() -> None:
+    asyncio.run(case_goal_reanchor())
+
+
 def test_reasoning_passback_end_to_end() -> None:
     asyncio.run(case_reasoning_passback_end_to_end())
 
@@ -1616,6 +1657,7 @@ async def main() -> int:
     await case_prune_skips_small_batches()
     await case_tool_budget()
     await case_todo_plan()
+    await case_goal_reanchor()
     await case_reasoning_passback_end_to_end()
     await case_prune_disabled()
     await case_rehydrate_after_compaction()

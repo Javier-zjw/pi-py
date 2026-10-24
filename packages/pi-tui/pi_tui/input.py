@@ -25,7 +25,7 @@ try:  # 可选依赖，缺了也能跑
     from prompt_toolkit.completion import Completer, Completion
     from prompt_toolkit.document import Document
     from prompt_toolkit.enums import DEFAULT_BUFFER
-    from prompt_toolkit.filters import Condition, has_focus, is_done, to_filter
+    from prompt_toolkit.filters import Condition, has_completions, has_focus, is_done, to_filter
     from prompt_toolkit.formatted_text import ANSI
     from prompt_toolkit.history import FileHistory
     from prompt_toolkit.key_binding import KeyBindings
@@ -117,7 +117,10 @@ class LineReader:
     - ``key_handlers``：额外快捷键（prompt_toolkit 的键名，如 ``"c-o"``）→ 回调。回调在输入行
       上方打印内容，打完输入行原样恢复，正在输入的字不丢。
     - ``erase_when_done``：提交后擦掉输入框，由上层用自己的样式回显这句话。
-    - ``footer``：编辑时画在输入行下方的一行（如输入框下沿的细线），提交时不留下。
+    - ``key_actions``：不打印东西、只改状态的快捷键（如 ``"s-tab"`` 切换模式）→ 回调，
+      回调后立刻重画（输入框上下的提示随之更新）。补全菜单打开时不抢菜单自己的按键。
+    - ``footer``：编辑时画在输入行下方的内容（如输入框下沿的细线 + 当前模式），可以多行，
+      每次重画都重新取；提交时不留下。
     - ``commands``：行首输入 / 时弹出的命令菜单（见 SlashCompleter）。菜单打开时回车会先补全
       高亮的那条（没高亮就取第一条）再提交，所以 ``/mo`` 回车就是 ``/model``。
 
@@ -129,6 +132,7 @@ class LineReader:
             self,
             history_file: str | Path | None = None,
             key_handlers: dict[str, Callable[[], None]] | None = None,
+            key_actions: dict[str, Callable[[], None]] | None = None,
             erase_when_done: bool = False,
             commands: Commands | None = None,
             footer: Callable[[], str] | None = None,
@@ -170,6 +174,8 @@ class LineReader:
 
         for key, handler in (key_handlers or {}).items():
             bindings.add(key)(_print_above(handler))
+        for key, action in (key_actions or {}).items():
+            bindings.add(key, filter=in_input & ~has_completions)(_act(action))
 
         history = None
         if history_file:
@@ -196,7 +202,8 @@ class LineReader:
             # PromptSession 只提供贴在屏幕最底行的 bottom_toolbar；这里把一行插在输入区正下方
             # （布局最外层 HSplit 的第 0 个孩子是输入区，补全菜单浮在输入区内，所以菜单在这行上面）
             line = ConditionalContainer(
-                Window(FormattedTextControl(lambda: ANSI(footer())), height=1, dont_extend_height=True),
+                # 不定高：按内容行数（细线 + 模式提示可以是两行）
+                Window(FormattedTextControl(lambda: ANSI(footer())), dont_extend_height=True),
                 filter=~is_done,
             )
             self.session.layout.container.children.insert(1, line)
@@ -266,6 +273,13 @@ def _highlight_first(buffer: Any) -> None:
     if len(state.completions) == 1 and state.completions[0].text == buffer.document.text_before_cursor:
         return
     state.complete_index = 0
+
+
+def _act(action: Callable[[], None]) -> Callable[[Any], None]:
+    def run(event) -> None:
+        action()
+        event.app.invalidate()
+    return run
 
 
 def _print_above(handler: Callable[[], None]) -> Callable[[Any], None]:

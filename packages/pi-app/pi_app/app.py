@@ -56,6 +56,7 @@ class App:
         self.turns = 0
         self.reader: LineReader | None = None
         self._unsubscribe: Any = None
+        self._proposed: dict | None = None     # 这一轮里模型提交、等用户确认的计划
         self.attach(session)
 
     @property
@@ -135,7 +136,14 @@ class App:
         if session is not self.session:
             self.session.dispose()
         self.session = session
-        self._unsubscribe = session.subscribe(self.renderer.on_event)
+        render = session.subscribe(self.renderer.on_event)
+        own = session.subscribe(self._on_session_event)
+        self._unsubscribe = lambda: (render(), own())
+        self.renderer.mode = session.mode
+        # 恢复的会话里有没做完的任务清单：接着显示
+        from pi_coding_agent.builtin_extensions.todo import latest_todo
+        record = latest_todo(session)
+        self.renderer.plan = record["plan"] if record else None
         self.renderer.status.model = session.model.key if session.model else "none"
         self.renderer.status.thinking = session.thinking_level
         self.renderer.status.hint = "/help"
@@ -196,6 +204,52 @@ class App:
 
     # -- 运行 ---------------------------------------------------------- #
 
+    # -- 计划 / 执行模式 ------------------------------------------------- #
+
+    def _on_session_event(self, event: Any) -> None:
+        if getattr(event, "type", "") == "plan_proposed":
+            self._proposed = event.plan
+
+    def cycle_mode(self) -> None:
+        """shift+tab：执行 ⇄ 计划（同 Claude Code）。在输入框里按也行：只改状态，下一轮生效"""
+        modes = [m.id for m in self.session.available_modes()]
+        order = [m for m in ("chat", "plan") if m in modes] + [m for m in modes if m not in ("chat", "plan")]
+        if len(order) < 2:
+            return
+        current = self.session.mode if self.session.mode in order else order[0]
+        self.session.switch_mode(order[(order.index(current) + 1) % len(order)])
+
+    async def review_plan(self, plan: dict) -> None:
+        """模型提交了计划：问用户执行 / 继续完善 / 先不执行（同 Codex 的 "Implement this plan?"）"""
+        steps = len(plan.get("steps") or [])
+        items = [
+            PickerItem("执行计划", f"切到执行模式，按 {steps} 项任务逐项完成", value="run"),
+            PickerItem("继续完善", "留在计划模式，直接输入修改意见", value="revise"),
+            PickerItem("先不执行", "计划已保存，之后可以用 /build 执行", value="later"),
+        ]
+        result = await self.pick("执行这个计划？", items)
+        choice = result.item.value if result else "later"
+        if choice == "run":
+            await self.execute_plan()
+        elif choice == "revise":
+            self.note("留在计划模式：直接输入修改意见，模型会重新提交完整的计划")
+        else:
+            self.note("计划已保存，随时用 /build 执行")
+
+    async def execute_plan(self, extra: str = "") -> None:
+        """批准最近的计划：切到执行模式、任务变成清单、开始执行。只回显一行标题，不回显整段任务说明"""
+        from pi_coding_agent.builtin_extensions.plan_mode import approve_plan, latest_plan
+
+        plan = latest_plan(self.session)
+        try:
+            task = approve_plan(self.session, extra)
+        except LookupError as exc:
+            self.error(str(exc))
+            return
+        t = self.theme
+        self.out([f"  {t.success('✓')} 执行计划 {t.bold((plan or {}).get('title') or '')}"])
+        await self.send(task)
+
     async def run_agent(self, run: Awaitable[Any]) -> None:
         self.turns += 1
         try:
@@ -208,7 +262,11 @@ class App:
     async def send(self, text: str) -> None:
         # 输入行已经显示过（或 user_echo 回显过）这句话，渲染器不要再打一遍
         self.renderer.state.own_prompt = text
+        self._proposed = None
         await self.run_agent(self.session.prompt(text))
+        if self._proposed is not None:
+            plan, self._proposed = self._proposed, None
+            await self.review_plan(plan)
 
     async def dispatch(self, line: str) -> bool:
         """执行一条 / 开头的输入。返回 False 表示退出"""
@@ -247,6 +305,7 @@ class App:
         self.reader = LineReader(
             history_file=Path.home() / ".pi" / "agent" / "history",
             key_handlers={"c-o": self.renderer.expand_last_turn},
+            key_actions={"s-tab": self.cycle_mode},
             erase_when_done=True,
             commands=self.slash_commands,
             footer=self.renderer.input_footer,

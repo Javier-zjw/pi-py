@@ -55,6 +55,7 @@ from pi_tui import (
     Ticker,
     diff_block,
     key_value,
+    render_markdown,
     rule,
     terminal_width,
     truncate,
@@ -70,6 +71,8 @@ INDENT = "  "
 SLOT_LINES = 6        # 活动区里思考 / 过渡话最多显示几行（只显示最新的）
 PREVIEW_ROWS = 12     # 回答还没定稿的部分（半行、没收齐的表格）在活动区里最多显示几行
 PLAN_TOOL = "update_plan"   # 任务计划（内置扩展 todo）：不算工具调用，显示成勾选单
+SUBMIT_TOOL = "submit_plan"  # 计划模式提交计划：不算工具调用，计划本身单独成块显示
+QUIET_TOOLS = (PLAN_TOOL, SUBMIT_TOOL)
 PLAN_ROWS = 8         # 计划最多显示几步
 
 
@@ -156,8 +159,8 @@ class RenderState:
     shown: str = ""                 # slot 为 thinking / text 时显示的文字
     batch: list[ToolRecord] = field(default_factory=list)   # slot 为 tools 时的这一批
     summary_done: bool = False      # 本轮的「✻ 用时 · 工具」已经写出
-    # 本轮 update_plan 的最新计划：运行中常驻活动区，回答开始前写在用时行下面
-    plan: list[dict] | None = None
+    # 本轮动过（或带着没做完的）任务清单：运行中常驻活动区，回答开始前写在用时行下面
+    plan_touched: bool = False
     turn_started: float = 0.0
     label: str = "思考中"
     detail: str = ""
@@ -191,6 +194,9 @@ class SessionRenderer:
         # 本轮清理旧工具输出的次数和省下的 tokens（写进「✻ 用时」那一行后清零）
         self._prune_times = 0
         self._pruned_tokens = 0
+        # 任务清单跨轮保留：批准计划时在一轮开始前生成，执行时一轮轮往下勾
+        self.plan: list[dict] | None = None
+        self.mode = "chat"      # 当前工作模式，输入框下面显示
         self.state = RenderState()
         self.turn = TurnRecord()
         self.last_turn: TurnRecord | None = None
@@ -242,8 +248,14 @@ class SessionRenderer:
         return f"{rule(self.width, '', self.theme)}\n{self.theme.accent('❯', bold=True)} "
 
     def input_footer(self) -> str:
-        """输入框下沿"""
-        return rule(self.width, "", self.theme)
+        """输入框下沿 + 当前模式（shift+tab 切换，同 Claude Code）"""
+        t = self.theme
+        if self.mode == "plan":
+            hint = (f"{t.info('⏸ 计划模式', bold=True)}"
+                    f"{t.muted(' · 只读调研，先出计划再动手 · shift+tab 切换')}")
+        else:
+            hint = t.muted("⏵ 执行模式 · shift+tab 切换到计划模式")
+        return f"{rule(self.width, '', t)}\n  {hint}"
 
     def on_event(self, event: Any) -> None:
         handler = getattr(self, f"_on_{event.type}", None)
@@ -298,7 +310,8 @@ class SessionRenderer:
     def _on_agent_start(self, event) -> None:
         self.agent_running = True
         own = self.state.own_prompt
-        self.state = RenderState(turn_started=time.time(), own_prompt=own)
+        self.state = RenderState(turn_started=time.time(), own_prompt=own,
+                                 plan_touched=self._plan_open())
         self.turn = TurnRecord()
         self.spinner.reset()
         self.ticker.start()
@@ -389,8 +402,8 @@ class SessionRenderer:
     def _on_tool_execution_start(self, event) -> None:
         self._commit_thinking()
         self._end_answer()
-        if event.tool_name == PLAN_TOOL:
-            return      # 计划更新不算工具调用，等结果出来再显示（被拒绝的更新不显示）
+        if event.tool_name in QUIET_TOOLS:
+            return      # 计划相关的工具不算工具调用，内容经 todo_updated / plan_proposed 事件显示
         record = ToolRecord(event.tool_call_id, event.tool_name, event.arguments, time.time())
         self.state.running[event.tool_call_id] = record
         if self.state.slot != "tools":
@@ -407,12 +420,7 @@ class SessionRenderer:
         self._repaint()
 
     def _on_tool_execution_end(self, event) -> None:
-        if event.tool_name == PLAN_TOOL:
-            details = getattr(event.result, "details", None)
-            if not event.is_error and isinstance(details, dict) and details.get("plan"):
-                self.state.plan = details["plan"]
-                self.turn.steps.append(("plan", details["plan"]))
-                self._repaint()
+        if event.tool_name in QUIET_TOOLS:
             return
         record = self.state.running.pop(event.tool_call_id, None)
         if record is None:
@@ -441,6 +449,9 @@ class SessionRenderer:
         lines = []
         if event.reason not in ("stop", "terminated"):
             lines.append(self.theme.warn(f"{INDENT}· 结束原因：{event.reason}"))
+        if self.state.plan_touched and self._plan_open() and self.mode != "plan":
+            left = sum(s.get("status") != "completed" for s in self.plan)
+            lines.append(self.theme.muted(f"{INDENT}○ 任务清单还有 {left} 项没完成，说「继续」接着做"))
         tokens = self._token_footer()
         if tokens:
             lines += ["", tokens]
@@ -495,6 +506,36 @@ class SessionRenderer:
         self._emit(lines)
         self._set_status("思考中")
 
+    def _on_todo_updated(self, event) -> None:
+        """任务清单变了（update_plan、批准计划生成清单）：活动区实时刷新"""
+        self.plan = list(event.plan or [])
+        self.state.plan_touched = True
+        self.turn.steps.append(("plan", self.plan))
+        self._repaint()
+
+    def _on_mode_changed(self, event) -> None:
+        # 可能在输入框里按 shift+tab 时触发：只改状态，不打印（输入框重画时自己读）
+        self.mode = event.mode
+
+    def _on_plan_proposed(self, event) -> None:
+        """计划模式下模型提交了计划：用时行之后单独成块显示，下面等用户确认"""
+        from pi_coding_agent.builtin_extensions.plan_mode import plan_markdown
+
+        t = self.theme
+        plan = event.plan
+        self._commit_thinking()
+        self._commit_summary()
+        self.live.finalize()
+        bar = t.info("│", bold=True) + " "
+        body = render_markdown(plan_markdown(plan), self.width, t, bar, bar)
+        title = plan.get("title") or "计划"
+        self._emit(["", f"{t.info('╭', bold=True)} {t.info('计划', bold=True)} {t.bold(title)}",
+                    *[line if line else bar.rstrip() for line in body], t.info("╰", bold=True)])
+        self.turn.steps.append(("text", f"提交计划：{title}"))
+
+    def _plan_open(self) -> bool:
+        return bool(self.plan) and any(s.get("status") != "completed" for s in self.plan)
+
     def _on_context_pruned(self, event) -> None:
         """L1 清理不单独占一行（一轮里可能有好几次，会刷屏）：计数，运行中显示在活动区第一行，
         结束后并进本轮的「✻ 用时」那一行。清理可能发生在一轮开始之前，所以计数不放在 RenderState"""
@@ -540,6 +581,7 @@ class SessionRenderer:
         self.tool_count = 0
         self.tool_errors = 0
         self._prune_times = self._pruned_tokens = 0
+        self.plan = None        # 换了会话：清单由调用方按新会话的记录重新给
         self.status.tokens = 0
         self.status.cost = 0.0
 
@@ -706,7 +748,7 @@ class SessionRenderer:
 
     def _plan_lines(self) -> list[str]:
         """计划勾选单：✓ 做完的、▸ 正在做的、○ 还没做的。步骤太多只显示前几步"""
-        plan = self.state.plan
+        plan = self.plan if self.state.plan_touched else None
         if not plan:
             return []
         t = self.theme

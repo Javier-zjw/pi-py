@@ -46,7 +46,7 @@ from .theme import (
     detect_color_mode,
 )
 from .width import (
-    display_width, pad, prose_width, strip_ansi, terminal_width, truncate, wrap,
+    display_width, pad, prose_width, strip_ansi, terminal_height, terminal_width, truncate, wrap,
 )
 
 __version__ = "0.1.0"
@@ -56,7 +56,7 @@ __all__ = [
     "DEFAULT_THEME", "ERROR", "Gutter", "LiveRegion", "MUTED", "SUCCESS", "Spinner",
     "StatusBar", "THINKING", "Theme", "WARN", "assistant_text", "badge", "code_block",
     "detect_color_mode", "diff_block", "display_width", "key_value", "markdown_lite",
-    "pad", "rule", "strip_ansi", "terminal_width", "thinking_block", "tool_call",
+    "pad", "rule", "strip_ansi", "terminal_height", "terminal_width", "thinking_block", "tool_call",
     "tool_result", "truncate", "usage_line", "user_message", "wrap", "LineReader", "missing_dependency_hint",
     "Ticker", "answer_start", "TextStreamer", "SlashCommand", "SlashCompleter", "match_commands",
     "PickerItem", "PickerState", "PickResult", "pick",

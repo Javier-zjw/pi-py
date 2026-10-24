@@ -57,6 +57,7 @@ from pi_tui import (
     key_value,
     render_markdown,
     rule,
+    terminal_height,
     terminal_width,
     truncate,
     user_message,
@@ -75,6 +76,7 @@ SUBMIT_TOOL = "submit_plan"  # 计划模式提交计划：不算工具调用，�
 ASK_TOOL = "ask_user"         # 计划模式向用户提问：界面弹选择器，答案单独成行显示
 QUIET_TOOLS = (PLAN_TOOL, SUBMIT_TOOL, ASK_TOOL)
 PLAN_ROWS = 8         # 计划最多显示几步
+ECHO_ROWS = (4, 8)    # 回显用户输入最多几行（终端高度的 1/3，夹在这个范围里），多的折叠
 
 
 def summarize_arguments(arguments: Any) -> str:
@@ -143,6 +145,7 @@ class TurnRecord:
     thinking: list[tuple[str, float]] = field(default_factory=list)
     tools: list[ToolRecord] = field(default_factory=list)
     steps: list[tuple[str, Any]] = field(default_factory=list)
+    prompt: str = ""        # 回显时折叠了的用户输入（全文），展开时放在最前面
 
 
 @dataclass
@@ -199,6 +202,7 @@ class SessionRenderer:
         # 任务清单跨轮保留：批准计划时在一轮开始前生成，执行时一轮轮往下勾
         self.plan: list[dict] | None = None
         self.mode = "chat"      # 当前工作模式，输入框下面显示
+        self._folded_prompt = ""    # 刚回显时折叠了的用户输入，下一轮开始时记进 TurnRecord
         self.state = RenderState()
         self.turn = TurnRecord()
         self.last_turn: TurnRecord | None = None
@@ -231,12 +235,23 @@ class SessionRenderer:
         self._emit(["", *user_message(text, self.width, self.theme), ""])
 
     def user_echo(self, text: str) -> None:
-        """输入框提交后被擦掉（erase_when_done），用这一行把用户的话留在 scrollback 里"""
+        """输入框提交后被擦掉（erase_when_done），用这一行把用户的话留在 scrollback 里。
+        太长的（粘贴了一大段）只留开头几行 + 一行说明，全文按 ctrl+o 看——否则小窗口里
+        整屏都是自己刚输的话，模型的输出只能一点点往上挤"""
         t = self.theme
-        lines = text.split("\n") or [""]
+        rows = [row for line in text.split("\n") for row in (wrap(line, self.width - 2) or [""])]
+        limit = max(ECHO_ROWS[0], min(ECHO_ROWS[1], terminal_height() // 3))
+        hidden = 0
+        self._folded_prompt = ""        # 只记最近这一句：上一句可能是没触发运行的命令
+        if len(rows) > limit:
+            hidden = len(rows) - (limit - 1)
+            rows = rows[:limit - 1]
+            self._folded_prompt = text
         out = [] if self._blank_tail else [""]      # 和上一问一答分开
-        out.append(f"{t.accent('❯', bold=True)} {t.bold(lines[0])}")
-        out += [f"{INDENT}{t.bold(line)}" for line in lines[1:]]
+        out.append(f"{t.accent('❯', bold=True)} {t.bold(rows[0])}")
+        out += [f"{INDENT}{t.bold(row)}" for row in rows[1:]]
+        if hidden:
+            out.append(f"{INDENT}{t.muted(f'… 还有 {hidden} 行（共 {len(text)} 字）· ctrl+o 看全文')}")
         self._emit(out)
 
     def input_prompt(self) -> str:
@@ -272,11 +287,15 @@ class SessionRenderer:
         """ctrl+o / /expand：按发生顺序打印上一轮的思考全文、过渡话、每个工具的参数和结果"""
         t = self.theme
         turn = self.last_turn
-        if turn is None or not turn.steps:
+        if turn is None or not (turn.steps or turn.prompt):
             self._emit([t.muted("  上一轮没有可展开的思考或工具调用"), ""])
             return
         width = self.width
         lines = [rule(width, "上一轮详情", t)]
+        if turn.prompt:
+            lines.append(t.accent("❯ 你的输入（全文）", bold=True))
+            lines += [f"{t.accent('│')} {line}" for raw in turn.prompt.split("\n")
+                      for line in (wrap(raw, width - 2) or [""])]
         for kind, value in turn.steps:
             if kind == "thinking":
                 text, seconds = value
@@ -314,7 +333,8 @@ class SessionRenderer:
         own = self.state.own_prompt
         self.state = RenderState(turn_started=time.time(), own_prompt=own,
                                  plan_touched=self._plan_open())
-        self.turn = TurnRecord()
+        self.turn = TurnRecord(prompt=self._folded_prompt)
+        self._folded_prompt = ""
         self.spinner.reset()
         self.ticker.start()
         self._set_status("思考中")

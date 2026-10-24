@@ -19,6 +19,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .width import terminal_height
+
 try:  # 可选依赖，缺了也能跑
     from prompt_toolkit import PromptSession
     from prompt_toolkit.application import get_app, run_in_terminal
@@ -40,6 +42,7 @@ except ImportError:  # pragma: no cover
     Completer = object  # type: ignore[assignment,misc]
 
 MENU_ROWS = 10      # 命令菜单最多同时显示几行，更多的滚动
+INPUT_MIN_ROWS = 5  # 输入框高度上限是半屏，但再矮的终端也至少给这么多行
 
 
 @dataclass(frozen=True)
@@ -212,25 +215,29 @@ class LineReader:
         if footer is not None:
             # 输入窗口默认会撑满下方剩余的空间，这行就被挤到屏幕最底下（和 bottom_toolbar 一样）
             input_window.dont_extend_height = to_filter(True)
+        # 高度由 _input_height 决定：有命令候选时撑开放菜单；粘贴大段文字时不超过半屏，框内滚动
+        input_window.height = self._input_height
         if self.completer is not None:
-            # 菜单浮在输入窗口里，窗口要按候选数撑开（见 _input_height）
-            input_window.height = self._input_height
             self.session.default_buffer.on_completions_changed += _highlight_first
 
     def _input_height(self) -> Dimension:
-        """输入窗口的高度：平时一行；有命令候选时撑开放菜单（不用 reserve_space_for_menu
-        固定预留，否则输入行下面一直空着一大块）。
+        """输入窗口的高度：平时按内容，但最多半屏——粘贴一大段时不会把整个屏幕占满，
+        超出的在框里滚动（光标所在处可见）。有命令候选时撑开放菜单（不用
+        reserve_space_for_menu 固定预留，否则输入行下面一直空着一大块）。
 
         按输入的原文算候选数：↑↓ 浏览时 prompt_toolkit 会把选中的候选写进输入框，
         按那段文字算菜单会缩成一行"""
         buffer = self.session.default_buffer
-        if get_app().is_done or self.completer is None:
+        if get_app().is_done:
             return Dimension()
-        state = buffer.complete_state
-        text = state.original_document.text if state is not None else buffer.text
-        count = len(self.completer.matches(text))
-        lines = buffer.document.line_count
-        return Dimension(min=lines + min(count, MENU_ROWS)) if count else Dimension()
+        cap = max(INPUT_MIN_ROWS, terminal_height() // 2)
+        if self.completer is not None:
+            state = buffer.complete_state
+            text = state.original_document.text if state is not None else buffer.text
+            count = len(self.completer.matches(text))
+            if count:
+                return Dimension(min=min(buffer.document.line_count, cap) + min(count, MENU_ROWS))
+        return Dimension(max=cap)
 
     def _typing_command(self) -> bool:
         text = self.session.default_buffer.document.text_before_cursor

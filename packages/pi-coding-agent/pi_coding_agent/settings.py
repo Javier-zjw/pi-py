@@ -42,7 +42,13 @@ DEFAULT_SETTINGS : dict[str, Any] = {
     # 一轮跑完、或弹出确认 / 提问时，离你上次输入超过 minSeconds 秒才响（一直盯着屏幕就不打扰）；
     # desktop 额外发系统通知（OSC 9，iTerm2 / WezTerm / Ghostty 等支持）
     "theme": "auto",
-    "notifications": {"bell": True, "desktop": False, "minSeconds": 15}
+    "notifications": {"bell": True, "desktop": False, "minSeconds": 15},
+    # 上网（builtin_extensions/web.py）：fetch 每次最多给模型多少字；search 的后端顺序
+    # （"auto" = 配了 key 的 API 在前、再试免 key 的；也可以写后端名列表）、是否用免 key 兜底
+    "web": {
+        "fetch": {"maxChars": 20000, "timeout": 20},
+        "search": {"backends": "auto", "keyless": True, "limit": 5, "timeout": 12},
+    },
 }
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:

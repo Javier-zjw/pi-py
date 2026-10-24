@@ -1084,6 +1084,11 @@ class SessionRenderer:
         if record.name in ("grep", "find"):
             where = self._rel(str(args.get("path") or ""))
             return f"{args.get('pattern', '')}" + (f"  {where}" if where and where != "." else "")
+        if record.name == "web_search":
+            return " ".join(str(args.get("query") or "").split())
+        if record.name == "web_fetch":
+            url = re.sub(r"^https?://(www\.)?", "", str(args.get("url") or "").strip())
+            return url + (f" @{args['start']}" if args.get("start") else "")
         return summarize_arguments(args)
 
     def _tool_result(self, record: ToolRecord) -> str:
@@ -1106,6 +1111,11 @@ class SessionRenderer:
             return t.muted(f"{details['matches']} 处")
         if record.name in ("find", "ls") and details.get("count") is not None:
             return t.muted(f"{details['count']} 个")
+        if record.name == "web_search" and details.get("count") is not None:
+            return t.muted(f"{details['count']} 条 · {details.get('backend', '')}")
+        if record.name == "web_fetch" and details.get("chars") is not None:
+            title = truncate(str(details.get("title") or ""), 24)
+            return t.muted(" · ".join(p for p in (title, f"{details['chars']} 字") if p))
         return took
 
     def _changed_files(self) -> list[tuple[str, int, int, str]]:

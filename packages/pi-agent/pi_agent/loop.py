@@ -171,12 +171,12 @@ async def _run_one_tool(
     except Exception as exc:
         result = AgentToolResult.text(f"{type(exc).__name__}: {exc}", is_error=True)
 
-    terminate = False
+    terminate = result.terminate
     if config.after_tool_call:
         hook = await config.after_tool_call(call, result, state)
         if hook:
             result = hook.result or result
-            terminate = hook.terminate
+            terminate = terminate or hook.terminate
 
     state.pending_tool_calls.discard(call.id)
     emit(

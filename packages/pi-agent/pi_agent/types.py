@@ -66,10 +66,14 @@ class AgentToolResult:
     details: Any = None
     is_error: bool = False
     usage: Usage | None = None
+    # 这批工具执行完后结束本次运行，不再调模型（例如提交计划后要停下来等用户确认）
+    terminate: bool = False
 
     @staticmethod
-    def text(text: str, *, is_error: bool = False, details: Any = None) -> "AgentToolResult":
-        return AgentToolResult(content=[TextContent(text=text)], is_error=is_error, details=details)
+    def text(text: str, *, is_error: bool = False, details: Any = None,
+             terminate: bool = False) -> "AgentToolResult":
+        return AgentToolResult(content=[TextContent(text=text)], is_error=is_error, details=details,
+                               terminate=terminate)
 
 
 @dataclass

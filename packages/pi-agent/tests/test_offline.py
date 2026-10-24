@@ -541,6 +541,21 @@ async def case_after_hook() -> None:
     check("后置钩子: 第二轮没跑",
           all(m.text() != "不该出现" for m in agent2.state.messages))
 
+    # 工具自己也能要求结束（如提交计划后停下等用户确认），不必配钩子
+    async def submit(args, ctx):
+        return AgentToolResult.text("已提交，等用户确认", terminate=True)
+
+    stopper = AgentTool(name="submit", description="提交", parameters={"type": "object", "properties": {}},
+                        execute=submit)
+    agent3, events3 = make_agent(
+        [[ToolCall(id="c1", name="submit", arguments={})], [TextContent(text="不该出现")]], [stopper],
+    )
+    await agent3.prompt("go")
+    check("工具结果: terminate 结束本次运行", events3[-1].reason == "terminated", events3[-1].reason)
+    check("工具结果: 结果照常入 transcript、不再调模型",
+          agent3.state.messages[-1].text() == "已提交，等用户确认"
+          and all(m.text() != "不该出现" for m in agent3.state.messages))
+
 
 async def case_transform_context() -> None:
     seen: list[int] = []

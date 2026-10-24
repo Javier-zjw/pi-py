@@ -605,6 +605,53 @@ async def case_details_viewer() -> None:
           and buffer.getvalue() == "第一行\n全屏时写的\n之后\n", repr(buffer.getvalue()))
 
 
+async def case_attention() -> None:
+    """需要用户时响铃：只在交互模式；离上次输入不到 minSeconds 不响（人在看着）；两秒内不重复"""
+    import time
+
+    import pi_app.app as app_module
+
+    rang: list[tuple[str, bool, bool]] = []
+    real = app_module.notify
+    app_module.notify = lambda message, bell=True, desktop=False: rang.append((message, bell, desktop))
+    try:
+        with Sandbox() as cwd:
+            app, _ = make_app(cwd, [[TextContent(text="好")]])
+            app.attention("这一轮做完了")
+            check("响铃: 非交互模式（测试、管道）不响", rang == [])
+            app.background = True
+            app.attention("这一轮做完了")
+            check("响铃: 刚输入过（人在看着）不响", rang == [])
+            app._last_input = time.monotonic() - 60
+            app.attention("这一轮做完了")
+            check("响铃: 离开久了响", rang == [("pi：这一轮做完了", True, False)], str(rang))
+            app.attention("计划写好了，等你确认")
+            check("响铃: 两秒内不重复", len(rang) == 1)
+            app._last_bell -= 5
+            app.session.settings.set("notifications.desktop", True)
+            app.attention("有问题要问你")
+            check("响铃: desktop 设置时一起发系统通知", rang[-1] == ("pi：有问题要问你", True, True), str(rang))
+            app._last_bell -= 5
+            app.session.settings.set("notifications.bell", False)
+            app.session.settings.set("notifications.desktop", False)
+            app.attention("x")
+            check("响铃: 都关掉时不响", len(rang) == 2)
+            app.session.settings.set("notifications.bell", True)
+            await app.submit("你好")
+            app._last_bell -= 5
+            app.attention("这一轮做完了")
+            check("响铃: 提交输入会重置计时", len(rang) == 2)
+            app._last_input -= 60
+            app.task = asyncio.ensure_future(asyncio.sleep(10))
+            app.interrupt()
+            app.task.cancel()
+            app._last_bell -= 5
+            app.attention("这一轮做完了")
+            check("响铃: 按 Esc 中断也算人在跟前", len(rang) == 2)
+    finally:
+        app_module.notify = real
+
+
 # -- 信息类 ------------------------------------------------------------------ #
 
 async def case_info() -> None:
@@ -681,6 +728,10 @@ def test_details_viewer() -> None:
     asyncio.run(case_details_viewer())
 
 
+def test_attention() -> None:
+    asyncio.run(case_attention())
+
+
 def test_info() -> None:
     asyncio.run(case_info())
 
@@ -704,6 +755,7 @@ async def main() -> int:
     await case_permissions_ui()
     await case_live_input()
     await case_details_viewer()
+    await case_attention()
     print("信息类")
     await case_info()
 

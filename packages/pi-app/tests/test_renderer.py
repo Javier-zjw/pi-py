@@ -629,6 +629,36 @@ def test_user_echo_long() -> None:
         module.terminal_height = real
 
 
+def test_footer_narrow() -> None:
+    """窗口窄时输入框下沿按次要程度丢内容，不折行、不在半个字处被切掉，模式名总在"""
+    import pi_app.renderer as module
+
+    real = module.terminal_width
+    try:
+        renderer = SessionRenderer(theme=Theme(ColorMode.NONE), stream=io.StringIO())
+        renderer.status.model = "fake/glm-5.2"
+        renderer.context_window, renderer.context_tokens = 200_000, 36_000
+        renderer.permission = "自动放行"
+        renderer.agent_running = True
+        shown = {}
+        for cols in (140, 100, 64, 40, 24):
+            module.terminal_width = lambda cols=cols: cols
+            footer = renderer.input_footer().split("\n")
+            shown[cols] = footer[1]
+            check(f"窄窗口: {cols} 列下沿不超宽", len(footer) == 2
+                  and all(display_width(line) <= cols for line in footer), str(footer))
+        check("窄窗口: 宽时全显示", "回车插话" in shown[140] and "shift+tab" in shown[140]
+              and "上下文 18%" in shown[140] and "⚠ 自动放行" in shown[140], shown[140])
+        check("窄窗口: 先丢模式说明、保留状态栏", "shift+tab" not in shown[64]
+              and "执行模式" in shown[64] and "上下文 18%" in shown[64], shown[64])
+        check("窄窗口: 再缩运行提示、丢状态栏，模式和权限还在", "Esc 中断" in shown[40]
+              and "回车插话" not in shown[40] and "执行模式" in shown[40]
+              and "⚠ 自动放行" in shown[40] and "上下文" not in shown[40], shown[40])
+        check("窄窗口: 实在放不下就截断加省略号", shown[24].endswith("…"), shown[24])
+    finally:
+        module.terminal_width = real
+
+
 def test_collapsed_turn() -> None:
     asyncio.run(case_collapsed_turn())
 
@@ -667,6 +697,7 @@ async def main() -> int:
     await case_steering_echo()
     test_user_echo_multiline()
     test_user_echo_long()
+    test_footer_narrow()
 
     print()
     if FAILURES:

@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import shutil
 import signal
 import sys
 import tempfile
@@ -25,6 +26,29 @@ DEFAULT_TIMEOUT = 120.0
 
 def strip_ansi(text: str) -> str:
     return _ANSI.sub("", text)
+
+def windows_bash() -> str | None:
+    """Windows 上找 Git Bash：模型写的是 bash 语法，交给 cmd.exe 大半跑不通。
+    跳过 System32 里的 bash.exe——那是 WSL 的启动器，跑在另一套文件系统里"""
+    found = shutil.which("bash")
+    if found and "system32" not in found.lower():
+        return found
+    roots = [os.environ.get(name) for name in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA")]
+    for root in filter(None, roots):
+        for candidate in (os.path.join(root, "Git", "bin", "bash.exe"),
+                          os.path.join(root, "Programs", "Git", "bin", "bash.exe")):
+            if os.path.exists(candidate):
+                return candidate
+    return None
+
+
+def shell_name() -> str:
+    """系统提示里告诉模型命令在什么 shell 里跑"""
+    if sys.platform != "win32":
+        return os.environ.get("SHELL", "/bin/sh")
+    bash = windows_bash()
+    return f"bash ({bash})" if bash else "cmd.exe (no bash found: use Windows commands, not bash syntax)"
+
 
 def kill_process_tree(process: asyncio.subprocess.Process) -> None:
     """终止Shell进程及其创建的所有子进程"""
@@ -53,17 +77,18 @@ async def run_bash(
         max_bytes: int = DEFAULT_MAX_BYTES,
         max_lines: int = DEFAULT_MAX_LINES,
 ) -> dict[str, Any]:
-    kwargs: dict[str, Any] = {}
+    kwargs: dict[str, Any] = {
+        "cwd": str(cwd), "stdout": asyncio.subprocess.PIPE, "stderr": asyncio.subprocess.STDOUT,
+    }
     if sys.platform != "win32":
         kwargs["preexec_fn"] = os.setsid
-
-    process = await asyncio.create_subprocess_shell(
-        command,
-        cwd=str(cwd),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-        **kwargs
-    )
+        process = await asyncio.create_subprocess_shell(command, **kwargs)
+    else:
+        bash = windows_bash()
+        if bash:
+            process = await asyncio.create_subprocess_exec(bash, "-c", command, **kwargs)
+        else:
+            process = await asyncio.create_subprocess_shell(command, **kwargs)
 
     chunks: list[str] = []
     total = 0

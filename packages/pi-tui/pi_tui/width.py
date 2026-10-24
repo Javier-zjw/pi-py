@@ -7,8 +7,10 @@ unicodedata 就够了，不需要 wcwidth。
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
+import sys
 import unicodedata
 
 ANSI_RE = re.compile(r"\033\[[0-9;]*[a-zA-Z]|\033\][^\007]*\007")
@@ -101,19 +103,33 @@ def _tokenize(text: str):
         yield buffer
 
 
+def _terminal_size(default: tuple[int, int]) -> tuple[int, int]:
+    """直接问终端（ioctl）：shutil.get_terminal_size 先看 COLUMNS / LINES 环境变量，
+    导出过的话拖动窗口后它还是老数，和 prompt_toolkit 看到的不一致。
+    用 sys.__stdout__：输入框开着时 sys.stdout 被 patch_stdout 换成了代理"""
+    try:
+        size = os.get_terminal_size(sys.__stdout__.fileno())
+        if size.columns > 0 and size.lines > 0:
+            return size.columns, size.lines
+    except (AttributeError, OSError, ValueError):
+        pass
+    size = shutil.get_terminal_size(default)
+    return size.columns, size.lines
+
+
 def terminal_width(default: int = 80, maximum: int = 0) -> int:
-    """当前终端宽度。
+    """当前终端宽度（每次现取，窗口拖动后马上变）。
 
     默认不设上限——用户把窗口拉宽就是想让内容跟着宽。需要限制正文栏宽时，
     在调用处传 maximum，而不是在这里一刀切。
     """
-    columns = shutil.get_terminal_size((default, 24)).columns
+    columns = _terminal_size((default, 24))[0]
     return min(columns, maximum) if maximum else columns
 
 
 def terminal_height(default: int = 24) -> int:
     """当前终端高度（行数）"""
-    return shutil.get_terminal_size((80, default)).lines
+    return _terminal_size((80, default))[1]
 
 
 def prose_width(maximum: int = 100) -> int:

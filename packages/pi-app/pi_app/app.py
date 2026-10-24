@@ -11,6 +11,7 @@ import asyncio
 import contextlib
 import re
 import sys
+import time
 from collections.abc import Awaitable
 from pathlib import Path
 from typing import Any
@@ -24,10 +25,13 @@ from pi_tui import (
     PickResult,
     SlashCommand,
     Theme,
+    detect_background,
     display_width,
     missing_dependency_hint,
+    notify,
     pad,
     pick,
+    prepare_terminal,
     truncate,
     view,
     wrap,
@@ -71,6 +75,8 @@ class App:
         self._resumed.set()
         self._screen = asyncio.Lock()       # 同一时间只有一个选择器
         self._screen_owner: asyncio.Task | None = None
+        self._last_input = time.monotonic()     # 用户上次输入 / 选择的时间：离开久了才响铃
+        self._last_bell = 0.0
         self.attach(session)
 
     @property
@@ -90,7 +96,7 @@ class App:
 
     async def pick(self, title: str, items: list[PickerItem], **kwargs: Any) -> PickResult | None:
         async with self.exclusive():
-            return await pick(title, items, theme=self.theme, width=self.renderer.width, **kwargs)
+            return await pick(title, items, theme=self.theme, width=0, **kwargs)
 
     @contextlib.asynccontextmanager
     async def exclusive(self):
@@ -109,7 +115,21 @@ class App:
                 yield
             finally:
                 self._screen_owner = None
+                self._last_input = time.monotonic()     # 刚在选择器里操作过
                 self._resumed.set()
+
+    def attention(self, message: str) -> None:
+        """需要用户时提醒（响铃 / 系统通知）：只在交互模式、且离用户上次输入超过 minSeconds 秒时——
+        一直盯着屏幕的人不需要被响；两秒内不重复响（一轮结束紧接着弹「执行这个计划？」）"""
+        get = self.session.settings.get
+        if not self.background or not get("notifications.bell", True) and not get("notifications.desktop", False):
+            return
+        now = time.monotonic()
+        if now - self._last_input < float(get("notifications.minSeconds", 15) or 0) or now - self._last_bell < 2:
+            return
+        self._last_bell = now
+        notify(f"pi：{message}", bell=bool(get("notifications.bell", True)),
+               desktop=bool(get("notifications.desktop", False)))
 
     # -- 运行中 -------------------------------------------------------- #
 
@@ -128,6 +148,7 @@ class App:
         """Esc / 运行中空行 ctrl+c：中断这一轮。没在跑返回 False"""
         if not self.busy:
             return False
+        self._last_input = time.monotonic()     # 人就在跟前：停下来不用再响铃
         self.session.abort()
         return True
 
@@ -182,6 +203,7 @@ class App:
 
     async def submit(self, line: str) -> bool:
         """处理一行输入。返回 False 表示退出"""
+        self._last_input = time.monotonic()
         if self.busy:
             if line.startswith("/"):
                 self.note("运行中不能执行命令：等这一轮结束，或按 Esc 中断")
@@ -354,6 +376,7 @@ class App:
             PickerItem("继续完善", "留在计划模式，直接输入修改意见", value="revise"),
             PickerItem("先不执行", "计划已保存，之后可以用 /build 执行", value="later"),
         ]
+        self.attention("计划写好了，等你确认")
         result = await self.pick("执行这个计划？", items, header="需要你确认")
         choice = result.item.value if result else "later"
         if choice == "run":
@@ -366,6 +389,7 @@ class App:
     async def ask_user(self, questions: list[dict]) -> list[dict] | None:
         """模型在一轮中途提问（ask_user 工具）：逐题弹选择器，最后一项是自己输入。
         Esc 跳过全部（模型按推荐的选项继续）。答案由渲染器在工具结束时写进 scrollback"""
+        self.attention("有问题要问你")
         self.renderer.pause()
         try:
             async with self.exclusive():
@@ -415,6 +439,7 @@ class App:
         items += [PickerItem("拒绝", "告诉模型别这么做", value="deny"),
                   PickerItem("拒绝并说明", "输入你希望它怎么做", value="explain")]
         header = f"需要你确认 · {request.get('title') or '执行操作'}"
+        self.attention(f"需要你确认：{request.get('title') or '执行操作'}")
         self.renderer.pause()
         try:
             async with self.exclusive():
@@ -481,6 +506,7 @@ class App:
             self.error(f"{type(exc).__name__}: {exc}")
         finally:
             self._restore_undelivered()
+        self.attention("这一轮做完了")
 
     async def send(self, text: str) -> None:
         # 输入行已经显示过（或 user_echo 回显过）这句话，渲染器不要再打一遍
@@ -537,6 +563,7 @@ class App:
             above=self.renderer.live_block,
             on_escape=self.interrupt,
             on_interrupt=self._on_ctrl_c,
+            background=self.theme.background,
         )
         if self.reader.rich:
             # 输入框常驻：一轮在后台跑，活动区画在输入框上方（由 prompt_toolkit 重画）
@@ -548,7 +575,7 @@ class App:
         while True:
             await self._resumed.wait()      # 选择器在用屏幕时先别打开输入框
             try:
-                prompt = self.renderer.input_prompt() if self.reader.rich else "\033[1m❯ \033[0m"
+                prompt = self.renderer.input_prompt if self.reader.rich else "\033[1m❯ \033[0m"
                 draft, self._draft = self._draft, ""
                 raw = await self.reader.read(prompt, default=draft)
             except (EOFError, KeyboardInterrupt):
@@ -642,8 +669,11 @@ async def main_async(argv: list[str] | None = None) -> int:
         print("没有可用模型：设置 ANTHROPIC_API_KEY 或写 ~/.pi/agent/auth.json", file=sys.stderr)
         return 1
 
+    prepare_terminal()
+    background = detect_background(services.settings.get("theme"))
     renderer = SessionRenderer(
-        theme=Theme(), show_thinking=not args.no_thinking, show_diff=not args.no_diff
+        theme=Theme(background=background), show_thinking=not args.no_thinking,
+        show_diff=not args.no_diff,
     )
     app = App(session, renderer, agent_dir=args.agent_dir)
     try:

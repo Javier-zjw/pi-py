@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import os
 import platform
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 
 from .text import read_text_lenient, sanitize
+from .tools.bash import shell_name
 
 # 结构参照 Codex 的基础提示（openai/codex: protocol/src/prompts/base_instructions/default.md），
 # 针对长工具链跑偏补了几条：先判断任务大小、范围以用户的请求为准、隔几步自查一次、够了就回答。
@@ -113,7 +113,7 @@ def environment_block(cwd: str | Path) -> str:
         "<environment>\n"
         f"cwd: {Path(cwd).expanduser().resolve()}\n"
         f"platform: {platform.system().lower()} ({platform.machine()})\n"
-        f"shell: {os.environ.get('SHELL', 'sh')}\n"
+        f"shell: {shell_name()}\n"
         f"date: {date.today().isoformat()}\n"
         "</environment>"
     )

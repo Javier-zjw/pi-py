@@ -23,13 +23,15 @@ DEFAULT_SETTINGS : dict[str, Any] = {
     # threshold：上下文达到"可用窗口（窗口 - reserveTokens）"的这个比例时压缩
     # thinking：压缩调用的思考档位，"inherit" 表示沿用会话当前档位
     # prune：L1 清理旧工具输出（不调模型），到 triggerRatio 时清到 targetRatio 以下，最近 protectTokens 不动
+    # 模型调用临时失败（限流、过载、5xx、断网）时退避重试：baseDelay 起翻倍，封顶 maxDelay；
+    # 服务商给了 Retry-After 就按它等（也封顶）
+    "retry": {"enabled": True, "maxRetries": 3, "baseDelay": 2, "maxDelay": 60},
     "compaction": {"enabled": True, "threshold": 0.85, "reserveTokens": 16384,
                    "keepRecentTokens": 20000, "maxSummaryTokens": 8000, "thinking": "off",
                    "prune": {"enabled": True, "triggerRatio": 0.6, "targetRatio": 0.4,
                              "protectTokens": 40000, "minTokens": 200, "minBatchRatio": 0.1},
                    # rehydrate：压缩后补回最近修改的文件（上限另受可用窗口 8% 约束）
                    "rehydrate": {"enabled": True, "maxFiles": 5, "maxTokens": 10000}},
-    "retry": {"enabled": True, "maxRetries": 3},
     "extensions": [],
     "disabledExtensions": [],
     "skills": {"enabled": True}

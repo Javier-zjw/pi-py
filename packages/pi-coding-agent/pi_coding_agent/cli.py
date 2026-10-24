@@ -71,6 +71,10 @@ def make_printer(show_thinking: bool = False):
         elif isinstance(event, AgentEndEvent):
             sys.stdout.write("\n")
             sys.stdout.flush()
+        elif getattr(event, "type", "") == "retry":
+            sys.stdout.write(f"\n{YELLOW}⟳ {event.error[:100]} — retry {event.attempt}/"
+                             f"{event.max_attempts} in {event.delay:g}s{RESET}\n")
+            sys.stdout.flush()
         elif isinstance(event, ContextPrunedEvent):
             sys.stdout.write(
                 f"\n{DIM}pruned {event.count} old tool outputs: "

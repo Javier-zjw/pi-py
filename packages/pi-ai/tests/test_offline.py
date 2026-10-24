@@ -473,6 +473,50 @@ def test_error_classification() -> None:
     check("超长识别: 非出错消息不算", not is_context_overflow(message))
 
 
+def test_retry_classification() -> None:
+    """哪些错误值得等一会儿重试；服务商要求的等待时间（Retry-After）带进错误文本"""
+    from pi_ai import describe_llm_error, is_retryable, retry_after
+    from pi_ai.transport import parse_retry_after
+
+    retryable = [
+        "HTTP 429: Rate limit reached for requests (rate_limit_error)",
+        "HTTP 529: Overloaded (overloaded_error)",
+        "HTTP 500: Internal server error",
+        "HTTP 502: <html>Bad Gateway</html>",
+        "HTTP 503: Service Unavailable",
+        "Overloaded",                                   # Anthropic 流中途的 error 事件
+        "请求超时（600s",
+        "连不上 https://api.example.com/v1：检查网络，或 base_url 是否写错",
+        "网络错误 RemoteProtocolError：peer closed connection",
+    ]
+    for text in retryable:
+        check(f"可重试: {text[:36]}", is_retryable(text), text)
+    permanent = [
+        "HTTP 400: prompt is too long: 210000 tokens > 200000 maximum",
+        "HTTP 401: invalid x-api-key (authentication_error)",
+        "HTTP 429: You exceeded your current quota (insufficient_quota)",
+        "HTTP 404: model not found",
+        "missing API key for provider 'anthropic'",
+        "",
+    ]
+    for text in permanent:
+        check(f"不重试: {text[:36] or '(空)'}", not is_retryable(text), text)
+    from pi_ai import AssistantMessage
+    message = AssistantMessage(api="x", provider="x", model="x", stop_reason="error",
+                               error_message="HTTP 503: busy")
+    check("可重试: 接受消息对象", is_retryable(message))
+    message.stop_reason = "stop"
+    check("可重试: 没出错的消息不算", not is_retryable(message))
+
+    text = describe_llm_error(LLMError("HTTP 429 from x", 429, json.dumps(
+        {"error": {"type": "rate_limit_error", "message": "slow down"}}), retry_after=7))
+    check("Retry-After: 写进错误文本", text == "HTTP 429: slow down (rate_limit_error) [retry after 7s]", text)
+    check("Retry-After: 从错误文本取回", retry_after(text) == 7.0 and retry_after("HTTP 503: x") is None)
+    check("Retry-After 头: 秒数", parse_retry_after(" 12 ") == 12.0)
+    check("Retry-After 头: 过去的 HTTP 日期算 0", parse_retry_after("Wed, 21 Oct 2015 07:28:00 GMT") == 0.0)
+    check("Retry-After 头: 认不出的忽略", parse_retry_after("soon") is None and parse_retry_after(None) is None)
+
+
 async def case_http_error_body() -> None:
     class RejectingTransport:
         async def stream_sse(self, url, headers, payload, timeout=600.0):
@@ -529,6 +573,7 @@ async def main() -> int:
     test_json_parse()
     test_serde_and_cost()
     test_error_classification()
+    test_retry_classification()
     await case_http_error_body()
 
     print()

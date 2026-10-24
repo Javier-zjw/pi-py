@@ -223,6 +223,12 @@ class EventTranslator:
             "tokensAfter": event.tokens_after,
         }]
 
+    def _on_retry(self, event) -> list[dict]:
+        # 复用"插进来的一句说明"帧：前端不用改就能显示在当前这轮里
+        return [{"type": "injected", "notice": True,
+                 "text": f"⟳ {event.error[:120]} · {event.delay:g}s 后第 "
+                         f"{event.attempt}/{event.max_attempts} 次重试"}]
+
     def _on_agent_end(self, event) -> list[dict]:
         return [{"type": "done", "reason": event.reason, "elapsed": self.elapsed}]
 

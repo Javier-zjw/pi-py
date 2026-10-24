@@ -176,6 +176,7 @@ class RenderState:
     output_tokens: int = 0
     cost: float = 0.0
     tool_total: int = 0
+    retries: int = 0                # 本轮模型调用临时失败后重试了几次（并进用时行）
 
 
 class SessionRenderer:
@@ -532,6 +533,18 @@ class SessionRenderer:
         self._emit(lines)
         self._set_status("思考中")
 
+    def _on_retry(self, event) -> None:
+        """模型调用临时失败（限流、过载、断网），等一会儿重试：活动区显示原因和等多久，不往 scrollback 写
+        （可能连着好几次）；失败那次已经显示的思考 / 正文作废，次数并进本轮的用时行"""
+        self.state.retries += 1
+        self.state.thinking = self.state.text = ""
+        if self.state.slot in ("thinking", "text"):
+            self.state.slot, self.state.shown = "", ""
+        reason = first_line(event.error, 48) or "服务暂时不可用"
+        step = f"⟳ 第 {event.attempt}/{event.max_attempts} 次重试（等 {event.delay:g}s）：{event.error}"
+        self.turn.steps.append(("text", step))
+        self._set_status("等待重试", f"{reason} · {event.delay:g}s 后第 {event.attempt}/{event.max_attempts} 次")
+
     def _on_todo_updated(self, event) -> None:
         """任务清单变了（update_plan、批准计划生成清单）：活动区实时刷新。
         模型调整了清单（带 explanation）就留一行原因——用户批准的计划变了，得让人看到为什么"""
@@ -700,6 +713,8 @@ class SessionRenderer:
                 parts.append(t.error(f"{failed} 失败"))
         if self._prune_times:
             parts.append(t.muted(f"清理旧输出 {self._prune_times} 次 −{_k(self._pruned_tokens)}"))
+        if self.state.retries:
+            parts.append(t.warn(f"重试 {self.state.retries} 次"))
         line = f" {t.muted('·')} ".join(parts)
         if self.turn.steps:
             line += f"   {t.muted(EXPAND_HINT)}"

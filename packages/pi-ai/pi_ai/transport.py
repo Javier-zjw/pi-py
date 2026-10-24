@@ -13,10 +13,33 @@ from typing import Any, AsyncIterator, Protocol
 
 
 class LLMError(RuntimeError):
-    def __init__(self, message: str, status: int | None = None, body: str | None = None) -> None:
+    def __init__(self, message: str, status: int | None = None, body: str | None = None,
+                 retry_after: float | None = None) -> None:
         super().__init__(message)
         self.status = status
         self.body = body
+        self.retry_after = retry_after      # 服务商在 Retry-After 头里要求等待的秒数
+
+
+def parse_retry_after(value: str | None) -> float | None:
+    """Retry-After 头：秒数，或 HTTP 日期。解析不了返回 None"""
+    if not value:
+        return None
+    value = value.strip()
+    try:
+        return max(float(value), 0.0)
+    except ValueError:
+        pass
+    try:
+        from datetime import datetime, timezone
+        from email.utils import parsedate_to_datetime
+
+        when = parsedate_to_datetime(value)
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        return max((when - datetime.now(timezone.utc)).total_seconds(), 0.0)
+    except (TypeError, ValueError, IndexError):
+        return None
 
 
 @dataclass
@@ -59,7 +82,8 @@ class HttpxTransport:
                 if response.status_code >= 400:
                     body = (await response.aread()).decode("utf-8", "replace")
                     raise LLMError(
-                        f"HTTP {response.status_code} from {url}", response.status_code, body
+                        f"HTTP {response.status_code} from {url}", response.status_code, body,
+                        retry_after=parse_retry_after(response.headers.get("retry-after")),
                     )
 
                 event_name: str | None = None

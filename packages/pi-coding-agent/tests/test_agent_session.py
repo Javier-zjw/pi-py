@@ -1158,6 +1158,7 @@ async def case_overflow_unrecoverable() -> None:
 async def case_overflow_other_errors() -> None:
     with Sandbox() as cwd:
         session, calls = await overflow_session(cwd, limit=10, error="HTTP 429: rate limit exceeded")
+        session.settings.set("retry.enabled", False)    # 这里只看压缩；限流重试见 case_network_retry
         events = record(session)
         await session.prompt("继续")
         check("超长兜底: 非超长错误不压缩", not any(e.type == "compaction_start" for e in events)
@@ -1170,6 +1171,117 @@ async def case_overflow_other_errors() -> None:
         await session.prompt("继续")
         check("超长兜底: 关闭压缩后不处理", events[-1].reason == "error" and calls == ["overflow"],
               str(calls))
+
+
+def flaky_model(script: list):
+    """按脚本回复：字符串 = 这次调用失败（错误文本），列表 = 正常回复的内容块"""
+    calls: list[str] = []
+
+    def stream_fn(model, context, options=None):
+        step = script.pop(0) if script else [TextContent(text="好了")]
+        calls.append("error" if isinstance(step, str) else "ok")
+
+        async def gen():
+            message = AssistantMessage(api=model.api, provider=model.provider, model=model.id)
+            yield StartEvent(partial=message)
+            if isinstance(step, str):
+                message.stop_reason = "error"
+                message.error_message = step
+                yield ErrorEvent(error=step, message=message)
+                return
+            message.content.extend(step)
+            message.stop_reason = "toolUse" if any(isinstance(b, ToolCall) for b in step) else "stop"
+            yield DoneEvent(reason=message.stop_reason, message=message)
+
+        return gen()
+
+    return stream_fn, calls
+
+
+def flaky_session(cwd: Path, script: list, **settings):
+    session, _ = make_session(cwd, [], tools=["read"], session_manager=file_manager(cwd))
+    fake, calls = flaky_model(script)
+    session.agent.stream_fn = fake
+    session.settings.set("retry.baseDelay", 0.01)
+    for key, value in settings.items():
+        session.settings.set(f"retry.{key}", value)
+    return session, calls
+
+
+async def case_network_retry() -> None:
+    """限流、过载、断网：退避后重试本轮；失败的回复不进上下文；超过次数照常报错；等待中能中断"""
+    with Sandbox() as cwd:
+        session, calls = flaky_session(cwd, ["HTTP 529: Overloaded (overloaded_error)",
+                                             "网络错误 ReadError：connection reset",
+                                             [TextContent(text="好了")]])
+        events = record(session)
+        await session.prompt("你好")
+        retries = [e for e in events if e.type == "retry"]
+        check("重试: 两次临时失败后成功", calls == ["error", "error", "ok"]
+              and session.messages[-1].text() == "好了" and events[-1].reason == "stop", str(calls))
+        check("重试: 每次发 retry 事件，等待时间翻倍", [(e.attempt, e.max_attempts) for e in retries]
+              == [(1, 3), (2, 3)] and [round(e.delay, 3) for e in retries] == [0.01, 0.02]
+              and "Overloaded" in retries[0].error, str(retries))
+        check("重试: 失败的回复不进上下文、不落盘",
+              all(getattr(m, "stop_reason", "") != "error" for m in session.messages)
+              and all(getattr(e.message, "stop_reason", "") != "error"
+                      for e in session.session.get_entries() if e.type == "message"))
+
+    with Sandbox() as cwd:
+        session, calls = flaky_session(cwd, ["HTTP 429: slow down (rate_limit_error) [retry after 0.05s]",
+                                             [TextContent(text="好了")]])
+        events = record(session)
+        await session.prompt("你好")
+        check("重试: 服务商给了 Retry-After 就按它等", [e.delay for e in events if e.type == "retry"] == [0.05])
+
+    with Sandbox() as cwd:
+        session, calls = flaky_session(cwd, ["HTTP 429: x [retry after 999s]", [TextContent(text="好了")]],
+                                       maxDelay=0.02)
+        events = record(session)
+        await session.prompt("你好")
+        check("重试: 等待时间封顶 maxDelay", [e.delay for e in events if e.type == "retry"] == [0.02])
+
+    with Sandbox() as cwd:
+        session, calls = flaky_session(cwd, ["HTTP 503: unavailable"] * 9, maxRetries=2)
+        events = record(session)
+        await session.prompt("你好")
+        check("重试: 超过 maxRetries 就照常报错", calls == ["error"] * 3 and events[-1].reason == "error"
+              and "HTTP 503" in (session.agent.state.error_message or ""), str(calls))
+
+    with Sandbox() as cwd:
+        session, calls = flaky_session(cwd, ["HTTP 401: invalid api key", [TextContent(text="不该到这")]])
+        events = record(session)
+        await session.prompt("你好")
+        check("重试: 密钥错误这类重试没用的不重试", calls == ["error"]
+              and not any(e.type == "retry" for e in events), str(calls))
+
+    with Sandbox() as cwd:
+        (cwd / "a.txt").write_text("a", "utf-8")
+        read = [ToolCall(id=f"r{i}", name="read", arguments={"path": "a.txt"}) for i in range(2)]
+        session, calls = flaky_session(cwd, ["HTTP 529: Overloaded", "HTTP 529: Overloaded", [read[0]],
+                                             "HTTP 529: Overloaded", "HTTP 529: Overloaded", [read[1]],
+                                             [TextContent(text="好了")]], maxRetries=2)
+        await session.prompt("读两次")
+        check("重试: 只数连续失败，成功一次就重新计数", session.messages[-1].text() == "好了"
+              and calls.count("error") == 4, str(calls))
+
+    with Sandbox() as cwd:
+        session, calls = flaky_session(cwd, ["HTTP 529: Overloaded", [TextContent(text="好了")]], enabled=False)
+        await session.prompt("你好")
+        check("重试: 关掉后不重试", calls == ["error"], str(calls))
+
+    with Sandbox() as cwd:
+        session, calls = flaky_session(cwd, ["HTTP 529: Overloaded", [TextContent(text="不该到这")]],
+                                       baseDelay=30)
+        events = record(session)
+        run = asyncio.ensure_future(session.prompt("你好"))
+        while not any(e.type == "retry" for e in events):
+            await asyncio.sleep(0.01)
+        started = asyncio.get_running_loop().time()
+        session.abort()
+        await asyncio.wait_for(run, 5)
+        check("重试: 等待中按中断立刻停下", asyncio.get_running_loop().time() - started < 1
+              and calls == ["error"] and events[-1].reason in ("aborted", "error"), str(events[-1]))
 
 
 def dangling_calls(messages) -> set[str]:
@@ -1811,6 +1923,10 @@ def test_overflow_unrecoverable() -> None:
     asyncio.run(case_overflow_unrecoverable())
 
 
+def test_network_retry() -> None:
+    asyncio.run(case_network_retry())
+
+
 def test_overflow_other_errors() -> None:
     asyncio.run(case_overflow_other_errors())
 
@@ -1921,6 +2037,7 @@ async def main() -> int:
     await case_overflow_recovery()
     await case_overflow_unrecoverable()
     await case_overflow_other_errors()
+    await case_network_retry()
     await case_resume_after_crash_mid_tool()
     await case_abort_mid_tool_call_stream()
     await case_continue_after_crash()

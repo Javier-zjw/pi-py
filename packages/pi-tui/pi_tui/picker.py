@@ -156,7 +156,7 @@ async def pick(
         detail: list[str] | None = None,
 ) -> PickResult | None:
     """交互选择。取消返回 None。header 写在面板上边框（如"需要你选择"），title 是面板里的问题，
-    detail 是问题下面的几行细节（如要执行的命令）"""
+    detail 是问题下面的几行细节（如要执行的命令）。width=0：跟着窗口宽度走（拖动窗口时重排）"""
     state = PickerState(items, index, choice_label)
     if HAS_PROMPT_TOOLKIT:
         return await _pick_rich(state, title, theme, width, header, detail)
@@ -202,7 +202,13 @@ async def _pick_rich(state: PickerState, title: str, theme: Theme, width: int,
     def _(event) -> None:
         event.app.exit(result=None)
 
-    control = FormattedTextControl(lambda: ANSI("\n".join(state.render(title, width, theme, header, detail))))
+    def text():
+        # 每次重画按当前窗口宽度排（拖动窗口时面板跟着变）；width 给了就不超过它，0 表示跟窗口一样宽
+        columns = app.output.get_size().columns
+        return ANSI("\n".join(state.render(title, min(width, columns) if width else columns,
+                                            theme, header, detail)))
+
+    control = FormattedTextControl(text)
     app: Application = Application(
         layout=Layout(Window(control, dont_extend_height=True, always_hide_cursor=True)),
         key_bindings=bindings,

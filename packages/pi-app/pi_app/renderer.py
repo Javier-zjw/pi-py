@@ -314,21 +314,36 @@ class SessionRenderer:
         return f"{rule(self.width, '', self.theme)}\n{self.theme.accent('❯', bold=True)} "
 
     def input_footer(self) -> str:
-        """输入框下沿 + 当前模式（shift+tab 切换，同 Claude Code）"""
+        """输入框下沿 + 当前模式（shift+tab 切换，同 Claude Code）。
+
+        窗口窄时按次要程度依次丢掉：模式说明 → 运行中提示缩成「Esc 中断」→ 右边的状态栏，
+        都丢了还放不下才截断——不能让一行折到下一行或在半个字处被终端切掉。
+        """
         t = self.theme
         if self.mode == "plan":
-            hint = (f"{t.info('⏸ 计划模式', bold=True)}"
-                    f"{t.muted(' · 只读调研，先出计划再动手 · shift+tab 切换')}")
+            label = t.info("⏸ 计划模式", bold=True)
+            detail = t.muted(" · 只读调研，先出计划再动手 · shift+tab 切换")
         else:
-            hint = t.muted("⏵ 执行模式 · shift+tab 切换到计划模式")
-        if self.agent_running:
-            hint = f"{t.accent('Esc', bold=True)} {t.muted('中断 · 回车插话 · ')}" + hint
-        if self.permission:
-            hint += f"  {t.warn('⚠ ' + self.permission)}"
+            label = t.muted("⏵ 执行模式")
+            detail = t.muted(" · shift+tab 切换到计划模式")
+        running = (f"{t.accent('Esc', bold=True)} {t.muted('中断 · 回车插话 · ')}",
+                   f"{t.accent('Esc', bold=True)} {t.muted('中断 · ')}")
+        warn = f"  {t.warn('⚠ ' + self.permission)}" if self.permission else ""
         status = self._status_text()
-        if status:
-            room = self.width - display_width(strip_ansi(hint)) - display_width(status) - 4
-            hint += " " * max(room, 2) + t.muted(status)
+        room = self.width - 4
+        size = lambda text: display_width(strip_ansi(text))
+
+        candidates = [prefix + mode + warn
+                      for prefix in (running if self.agent_running else ("",))
+                      for mode in (label + detail, label)]
+        for hint in candidates if status else ():
+            if size(hint) + 2 + display_width(status) <= room:
+                gap = room - size(hint) - display_width(status)
+                hint += " " * gap + t.muted(status)
+                break
+        else:
+            hint = next((c for c in candidates if size(c) <= room), None)
+            hint = hint or truncate(candidates[-1], room)
         return f"{rule(self.width, '', t)}\n  {hint}"
 
     def _status_text(self) -> str:

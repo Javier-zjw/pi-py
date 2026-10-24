@@ -624,6 +624,39 @@ def test_find() -> None:
     asyncio.run(case_find())
 
 
+def test_windows_shell() -> None:
+    """Windows：有 Git Bash 用它跑命令（模型写的是 bash 语法），跳过 WSL 的 bash.exe；
+    都没有就退回 cmd.exe，并在系统提示里告诉模型"""
+    import pi_coding_agent.tools.bash as bash_tool
+
+    real_which, real_exists, real_platform = bash_tool.shutil.which, bash_tool.os.path.exists, bash_tool.sys.platform
+    env = {k: os.environ.get(k) for k in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA")}
+    try:
+        bash_tool.sys.platform = "win32"
+        bash_tool.shutil.which = lambda name: r"C:\Tools\Git\bin\bash.exe"
+        check("Windows: PATH 里的 bash 直接用", bash_tool.windows_bash() == r"C:\Tools\Git\bin\bash.exe")
+        bash_tool.shutil.which = lambda name: r"C:\Windows\System32\bash.exe"
+        os.environ["ProgramFiles"] = r"C:\Program Files"
+        os.environ.pop("ProgramFiles(x86)", None)
+        os.environ.pop("LOCALAPPDATA", None)
+        expected = os.path.join(r"C:\Program Files", "Git", "bin", "bash.exe")
+        bash_tool.os.path.exists = lambda path: path == expected
+        check("Windows: 跳过 WSL 的 bash，找默认安装位置的 Git Bash", bash_tool.windows_bash() == expected)
+        check("Windows: 系统提示说是 bash", bash_tool.shell_name().startswith("bash ("))
+        bash_tool.os.path.exists = lambda path: False
+        check("Windows: 都没有时为空", bash_tool.windows_bash() is None)
+        check("Windows: 系统提示让模型用 Windows 命令", "cmd.exe" in bash_tool.shell_name()
+              and "Windows commands" in bash_tool.shell_name())
+    finally:
+        bash_tool.shutil.which, bash_tool.os.path.exists, bash_tool.sys.platform = real_which, real_exists, real_platform
+        for key, value in env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    check("其他系统: 用 $SHELL", bash_tool.shell_name() == os.environ.get("SHELL", "/bin/sh"))
+
+
 async def main() -> int:
     print("text.py 编码边界"); test_text_boundary()
     print("truncate");         test_truncate()
@@ -635,6 +668,7 @@ async def main() -> int:
     print("grep");             await case_grep()
     print("find");             await case_find()
     print("注册表与 schema");  test_registry()
+    print("Windows shell");     test_windows_shell()
 
     print()
     if FAILURES:

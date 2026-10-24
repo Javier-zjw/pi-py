@@ -237,6 +237,68 @@ def test_viewer_state() -> None:
     check("查看器: e 全部展开（没正文的不算）", all(s.expanded for s in sections[:8]) and not sections[8].expanded)
 
 
+def test_background_and_notify() -> None:
+    """浅色背景换一套压暗的颜色；背景深浅的探测顺序；提醒只写真正的终端"""
+    import io
+    import sys
+
+    from pi_tui import notify
+    from pi_tui.theme import (
+        ACCENT,
+        HIGHLIGHT,
+        background_from_colorfgbg,
+        background_from_rgb,
+        detect_background,
+        parse_osc11,
+    )
+
+    dark, light = Theme(ColorMode.TRUECOLOR), Theme(ColorMode.TRUECOLOR, background="light")
+    check("浅色: 同一个颜色换成压暗的版本", dark.paint("x", ACCENT) != light.paint("x", ACCENT)
+          and "38;2;30;90;190" in light.paint("x", ACCENT), repr(light.paint("x", ACCENT)))
+    check("浅色: 亮金在白底上也换掉", "236;196;106" not in light.paint("x", HIGHLIGHT))
+    check("浅色: 没颜色的样式不受影响", light.paint("x", None, bold=True) == dark.paint("x", None, bold=True))
+    check("COLORFGBG: 背景 0 是深色、15 / 7 是浅色", background_from_colorfgbg("15;0") == "dark"
+          and background_from_colorfgbg("0;15") == "light" and background_from_colorfgbg("0;7") == "light"
+          and background_from_colorfgbg("0;default;15") == "light" and background_from_colorfgbg("") is None)
+    check("OSC 11: 解析终端回答（BEL / ST 结尾、2 位或 4 位十六进制）",
+          parse_osc11("\x1b]11;rgb:ffff/ffff/ffff\x1b\\") == (1.0, 1.0, 1.0)
+          and parse_osc11("\x1b]11;rgb:1e/1f/22\x07") is not None and parse_osc11("乱码") is None)
+    check("亮度: 白底浅色、深灰底深色", background_from_rgb((1, 1, 1)) == "light"
+          and background_from_rgb((0.12, 0.12, 0.13)) == "dark")
+    saved = {k: os.environ.pop(k, None) for k in ("PI_THEME", "COLORFGBG")}
+    try:
+        check("探测: 设置优先", detect_background("light") == "light" and detect_background("dark") == "dark")
+        os.environ["PI_THEME"] = "light"
+        check("探测: 其次 PI_THEME", detect_background("auto") == "light")
+        del os.environ["PI_THEME"]
+        os.environ["COLORFGBG"] = "0;15"
+        check("探测: 再看 COLORFGBG", detect_background(None) == "light")
+        del os.environ["COLORFGBG"]
+        check("探测: 不是终端、问不到时默认深色", detect_background(None) == "dark")
+    finally:
+        for key, value in saved.items():
+            if value is not None:
+                os.environ[key] = value
+
+    class Tty(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    real = sys.__stdout__
+    try:
+        sys.__stdout__ = fake = Tty()
+        notify("做完了")
+        check("提醒: 默认只响铃", fake.getvalue() == "\a", repr(fake.getvalue()))
+        sys.__stdout__ = fake = Tty()
+        notify("做完了", desktop=True)
+        check("提醒: desktop 时再发 OSC 9 通知", fake.getvalue() == "\x1b]9;做完了\x07\a", repr(fake.getvalue()))
+        sys.__stdout__ = fake = io.StringIO()
+        notify("做完了", desktop=True)
+        check("提醒: 不是终端（重定向）时什么都不写", fake.getvalue() == "")
+    finally:
+        sys.__stdout__ = real
+
+
 def main() -> int:
     print("命令补全")
     test_match_commands()
@@ -246,6 +308,7 @@ def main() -> int:
     test_picker_render()
     test_live_region_host()
     test_viewer_state()
+    test_background_and_notify()
     print()
     if FAILURES:
         print(f"{len(FAILURES)} 处失败：")

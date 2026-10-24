@@ -113,6 +113,14 @@ MENU_STYLE = {
     "scrollbar.background": "bg:default",
     "scrollbar.button": "bg:#5a5a5a",
 }
+# 浅色背景：亮青、浅灰在白底上看不清
+MENU_STYLE_LIGHT = {
+    **MENU_STYLE,
+    "completion-menu.completion.current": "bg:default fg:#005f87 bold",
+    "completion-menu.meta.completion": "bg:default fg:#6c6c6c",
+    "completion-menu.meta.completion.current": "bg:default fg:#303030",
+    "scrollbar.button": "bg:#a8a8a8",
+}
 
 
 class LineReader:
@@ -150,6 +158,7 @@ class LineReader:
             above: Callable[[], str] | None = None,
             on_escape: Callable[[], Any] | None = None,
             on_interrupt: Callable[[str], bool] | None = None,
+            background: str = "dark",
     ) -> None:
         self.session: Any = None
         self.completer: SlashCompleter | None = None
@@ -220,7 +229,7 @@ class LineReader:
             complete_while_typing=self.completer is not None,
             enable_history_search=self.completer is None,
             erase_when_done=erase_when_done,
-            style=Style.from_dict(MENU_STYLE),
+            style=Style.from_dict(MENU_STYLE_LIGHT if background == "light" else MENU_STYLE),
             # 固定预留会让输入行下面一直空着一大块；菜单空间由 _input_height 按需撑开
             reserve_space_for_menu=0,
         )
@@ -298,20 +307,23 @@ class LineReader:
         """正在读（输入框在屏幕上）"""
         return self._active
 
-    async def read(self, prompt: str = "> ", default: str = "") -> Any:
-        """读一行。上层不要再回显——这里已经显示过了。被 suspend() 收起时返回 SUSPENDED"""
+    async def read(self, prompt: str | Callable[[], str] = "> ", default: str = "") -> Any:
+        """读一行。上层不要再回显——这里已经显示过了。被 suspend() 收起时返回 SUSPENDED。
+        prompt 可以是函数：每次重画重新取（输入框上沿的细线跟着窗口宽度变）"""
         if self.session is not None:
             self._active = True
             self._done.clear()
+            message = (lambda: ANSI(prompt())) if callable(prompt) else ANSI(prompt)
             try:
                 # patch_stdout：流式输出和输入行共存，输出不会把正在输入的内容冲掉
                 with patch_stdout(raw=True):
-                    return await self.session.prompt_async(ANSI(prompt), default=default)
+                    return await self.session.prompt_async(message, default=default)
             finally:
                 self._active = False
                 self._done.set()
+        text = prompt() if callable(prompt) else prompt
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, lambda: input(prompt))
+        return await loop.run_in_executor(None, lambda: input(text))
 
     async def suspend(self) -> str:
         """收起正在读的这一行，等输入框真的离开屏幕再返回；返回已经输入的字"""

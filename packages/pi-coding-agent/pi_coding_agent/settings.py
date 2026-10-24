@@ -37,7 +37,12 @@ DEFAULT_SETTINGS : dict[str, Any] = {
     "permissions": {"mode": "ask", "allow": [], "deny": [], "nonInteractive": "allow"},
     "extensions": [],
     "disabledExtensions": [],
-    "skills": {"enabled": True}
+    "skills": {"enabled": True},
+    # 终端界面：theme 是背景深浅（auto 自动探测 / dark / light）；notifications 是需要你时响铃——
+    # 一轮跑完、或弹出确认 / 提问时，离你上次输入超过 minSeconds 秒才响（一直盯着屏幕就不打扰）；
+    # desktop 额外发系统通知（OSC 9，iTerm2 / WezTerm / Ghostty 等支持）
+    "theme": "auto",
+    "notifications": {"bell": True, "desktop": False, "minSeconds": 15}
 }
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:

@@ -69,6 +69,18 @@ MUTED = Color((128, 128, 128), 244, 90)     # 中灰
 INFO = Color((86, 200, 214), 80, 96)         # 亮青
 HIGHLIGHT = Color((236, 196, 106), 221, 93)  # 亮金
 
+# 浅色背景用的同一套颜色：同色相、压暗。上面那套在白底上发灰（MUTED）、刺眼（HIGHLIGHT 亮金）
+LIGHT = {
+    ACCENT: Color((30, 90, 190), 25, 34),
+    SUCCESS: Color((30, 125, 50), 28, 32),
+    WARN: Color((175, 85, 20), 130, 33),
+    ERROR: Color((185, 40, 40), 124, 31),
+    THINKING: Color((105, 85, 155), 61, 35),
+    MUTED: Color((105, 105, 105), 242, 90),
+    INFO: Color((0, 115, 135), 30, 36),
+    HIGHLIGHT: Color((150, 100, 0), 136, 33),
+}
+
 RESET = "\033[0m"
 BOLD = "\033[1m"
 DIM = "\033[2m"
@@ -80,8 +92,10 @@ STRIKE = "\033[9m"
 class Theme:
     """所有着色都走这里，方便统一降级和测试。"""
 
-    def __init__(self, mode: ColorMode | None = None) -> None:
+    def __init__(self, mode: ColorMode | None = None, background: str = "dark") -> None:
         self.mode = mode if mode is not None else detect_color_mode()
+        self.background = "light" if background == "light" else "dark"
+        self._palette = LIGHT if self.background == "light" else {}
 
     @property
     def enabled(self) -> bool:
@@ -99,6 +113,8 @@ class Theme:
         """只要开头的转义序列（嵌套样式时，内层 RESET 之后要把外层样式补回来）"""
         if not self.enabled:
             return ""
+        if color is not None:
+            color = self._palette.get(color, color)
         prefix = color.fg(self.mode) if color is not None else ""
         for on, code in ((bold, BOLD), (dim, DIM), (italic, ITALIC), (underline, UNDERLINE), (strike, STRIKE)):
             if on:
@@ -135,3 +151,77 @@ class Theme:
 
 
 DEFAULT_THEME = Theme()
+
+
+def background_from_colorfgbg(value: str | None) -> str | None:
+    """COLORFGBG（"前景;背景"，rxvt / iTerm2 / Konsole 会设）：背景是 7 或 9–15（浅色）→ light"""
+    if not value:
+        return None
+    last = value.split(";")[-1].strip()
+    if not last.isdigit():
+        return None
+    return "light" if int(last) == 7 or int(last) >= 9 else "dark"
+
+
+def background_from_rgb(rgb: tuple[float, float, float]) -> str:
+    """0–1 的 RGB → 按感知亮度分深浅"""
+    r, g, b = rgb
+    return "light" if 0.2126 * r + 0.7152 * g + 0.0722 * b > 0.5 else "dark"
+
+
+def parse_osc11(reply: str) -> tuple[float, float, float] | None:
+    """终端对 OSC 11 查询的回答：ESC ] 11 ; rgb:RRRR/GGGG/BBBB（每段 1–4 位十六进制）"""
+    import re
+
+    match = re.search(r"\]11;rgba?:([0-9a-fA-F]{1,4})/([0-9a-fA-F]{1,4})/([0-9a-fA-F]{1,4})", reply)
+    if not match:
+        return None
+    return tuple(int(part, 16) / (16 ** len(part) - 1) for part in match.groups())  # type: ignore[return-value]
+
+
+def query_background(timeout: float = 0.5) -> str | None:
+    """直接问终端背景色（OSC 11）。后面跟一个所有终端都回答的 DA1（ESC [ c）：读到 DA1 的回答
+    就说明前面该回的都回了，不用干等超时，也不会让迟到的回答漏进输入框。
+    不是终端、Windows、或终端不回答时返回 None"""
+    if sys.platform == "win32" or not sys.stdin.isatty() or not sys.stdout.isatty():
+        return None
+    try:
+        import select
+        import termios
+        import tty
+    except ImportError:
+        return None
+    fd = sys.stdin.fileno()
+    try:
+        saved = termios.tcgetattr(fd)
+    except termios.error:
+        return None
+    reply = ""
+    try:
+        tty.setcbreak(fd)
+        sys.stdout.write("\033]11;?\033\\\033[c")
+        sys.stdout.flush()
+        import time
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            ready, _, _ = select.select([fd], [], [], max(deadline - time.monotonic(), 0))
+            if not ready:
+                break
+            reply += os.read(fd, 1024).decode("latin-1")
+            if "\033[?" in reply and reply.rstrip().endswith("c"):
+                break           # DA1 的回答到了
+    except OSError:
+        return None
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+    rgb = parse_osc11(reply)
+    return background_from_rgb(rgb) if rgb else None
+
+
+def detect_background(preference: str | None = None) -> str:
+    """终端是深色还是浅色背景。顺序：设置 / PI_THEME（dark / light）> COLORFGBG > 问终端 > 深色"""
+    for choice in (preference, os.environ.get("PI_THEME")):
+        if choice and choice.lower() in ("dark", "light"):
+            return choice.lower()       # "auto" 不算明确指定：接着看下一个来源
+    return background_from_colorfgbg(os.environ.get("COLORFGBG")) or query_background() or "dark"

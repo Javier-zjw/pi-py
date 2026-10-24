@@ -483,6 +483,91 @@ async def case_permissions_ui() -> None:
         check("/permissions: 切回默认后不显示", "⚠" not in app.renderer.input_footer())
 
 
+# -- 运行中输入、中断 -------------------------------------------------------- #
+
+def slow_model(script: list, delay: float = 0.15):
+    """每次调用先停一会儿再回复：给"运行中"留出时间"""
+    from pi_ai import AssistantMessage, DoneEvent, StartEvent
+
+    def stream_fn(model, context, options=None):
+        step = script.pop(0) if script else [TextContent(text="好了")]
+        seen = [m.text() for m in context.messages if getattr(m, "role", "") == "user"]
+
+        async def gen():
+            message = AssistantMessage(api=model.api, provider=model.provider, model=model.id)
+            yield StartEvent(partial=message)
+            await asyncio.sleep(delay)
+            message.content.extend(step(seen) if callable(step) else step)
+            message.stop_reason = "toolUse" if any(isinstance(b, ToolCall) for b in message.content) else "stop"
+            yield DoneEvent(reason=message.stop_reason, message=message)
+
+        return gen()
+
+    return stream_fn
+
+
+async def case_live_input() -> None:
+    """一轮在后台跑：运行中回车是插话（模型做完这一步就看到），命令要等；Esc 中断；没送到的插话放回输入框"""
+    with Sandbox() as cwd:
+        (cwd / "a.txt").write_text("内容", "utf-8")
+        app, out = make_app(cwd, [])
+        app.background = True
+        app.session.agent.stream_fn = slow_model([
+            [ToolCall(id="r1", name="read", arguments={"path": "a.txt"})],
+            lambda seen: [TextContent(text="看到了：" + " / ".join(seen))],
+        ])
+        await app.submit("读一下")
+        check("后台运行: 提交后马上返回，一轮还在跑", app.busy)
+        await app.submit("顺便看看格式")
+        check("插话: 显示在活动区等着送到", app.renderer.queued == ["顺便看看格式"]
+              and "插话（这一步做完就送到）：顺便看看格式" in "\n".join(app.renderer._live_lines()))
+        start = len(out.getvalue())
+        await app.submit("/context")
+        check("运行中命令: 不执行，提示等一等", "运行中不能执行命令" in tail(out, start)
+              and "上下文" not in tail(out, start), tail(out, start))
+        await app.task
+        text = out.getvalue()
+        check("插话: 做完这一步就送到，模型看到了", app.session.messages[-1].text() == "看到了：读一下 / 顺便看看格式",
+              app.session.messages[-1].text())
+        check("插话: 送到后回显、活动区不再显示", "❯ 顺便看看格式" in text and app.renderer.queued == [], text)
+        check("插话: 输入框下提示 Esc 中断只在运行中出现", "Esc" not in app.renderer.input_footer())
+
+    with Sandbox() as cwd:
+        app, out = make_app(cwd, [])
+        app.background = True
+        app.session.agent.stream_fn = slow_model([[TextContent(text="不该出现")]], delay=30)
+        check("中断: 没在跑时 Esc 不做事", not app.interrupt())
+        await app.submit("想很久")
+        await asyncio.sleep(0.05)
+        check("中断: 运行中输入框下提示 Esc", "Esc" in app.renderer.input_footer())
+        await app.submit("补一句")
+        check("ctrl+c: 有字时不中断（照旧清空这一行）", not app._on_ctrl_c("还有字") and app.busy)
+        started = asyncio.get_running_loop().time()
+        check("中断: Esc 中断正在跑的一轮", app.interrupt())
+        await asyncio.wait_for(app.task, 2)
+        check("中断: 模型还没出字也立刻停", asyncio.get_running_loop().time() - started < 1)
+        text = out.getvalue()
+        check("中断: 留一行「已中断」", "⏹ 已中断" in text and "不该出现" not in text, text)
+        check("中断: 没送到的插话放回输入框", app._draft == "补一句" and "已放回输入框" in text
+              and app.renderer.queued == [] and not app.session.agent.steering_queue, app._draft)
+
+    with Sandbox() as cwd:
+        app, out = make_app(cwd, [])
+        app.background = True
+        app.session.agent.stream_fn = slow_model([[TextContent(text="不该出现")]], delay=30)
+        await app.submit("再想很久")
+        await asyncio.sleep(0.05)
+        check("ctrl+c: 运行中空行是中断", app._on_ctrl_c(""))
+        await asyncio.wait_for(app.task, 2)
+        check("ctrl+c: 中断后空行照旧退出（不再拦）", not app._on_ctrl_c(""))
+
+        async def nested() -> str:
+            async with app.exclusive():  # noqa: SIM117 —— 测的就是嵌套（可重入）
+                async with app.exclusive():
+                    return "ok"
+        check("屏幕交接: 同一次交互里可重入，不会自己卡死", await asyncio.wait_for(nested(), 1) == "ok")
+
+
 # -- 信息类 ------------------------------------------------------------------ #
 
 async def case_info() -> None:
@@ -551,6 +636,10 @@ def test_permissions_ui() -> None:
     asyncio.run(case_permissions_ui())
 
 
+def test_live_input() -> None:
+    asyncio.run(case_live_input())
+
+
 def test_info() -> None:
     asyncio.run(case_info())
 
@@ -572,6 +661,7 @@ async def main() -> int:
     await case_plan_mode()
     await case_plan_ask_user()
     await case_permissions_ui()
+    await case_live_input()
     print("信息类")
     await case_info()
 

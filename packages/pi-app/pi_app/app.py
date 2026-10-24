@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import re
 import sys
 from collections.abc import Awaitable
@@ -17,6 +18,7 @@ from typing import Any
 from pi_coding_agent import SessionManager, create_agent_session, create_agent_session_services
 from pi_coding_agent.text import sanitize
 from pi_tui import (
+    SUSPENDED,
     LineReader,
     PickerItem,
     PickResult,
@@ -37,6 +39,8 @@ from .renderer import SessionRenderer
 COMMAND_NAME = re.compile(r"[A-Za-z][\w-]*")
 
 SHORTCUTS = [
+    ("Esc", "中断正在运行的这一轮"),
+    ("回车（运行中）", "插话：模型做完当前这步就看到"),
     ("ctrl+o", "展开上一轮的思考和工具调用"),
     ("Alt+Enter", "换行"),
     ("↑ ↓", "翻历史；菜单打开时选择命令"),
@@ -58,6 +62,14 @@ class App:
         self.reader: LineReader | None = None
         self._unsubscribe: Any = None
         self._proposed: dict | None = None     # 这一轮里模型提交、等用户确认的计划
+        # 交互模式下一轮在后台跑，输入框常驻（运行中能插话、Esc 中断）；测试里 send() 等跑完再返回
+        self.background = False
+        self.task: asyncio.Task | None = None
+        self._draft = ""                    # 输入框被选择器收起时已经输入的字，恢复时放回去
+        self._resumed = asyncio.Event()     # 选择器用完屏幕，输入框可以回来了
+        self._resumed.set()
+        self._screen = asyncio.Lock()       # 同一时间只有一个选择器
+        self._screen_owner: asyncio.Task | None = None
         self.attach(session)
 
     @property
@@ -76,7 +88,86 @@ class App:
         self.out([self.theme.error(f"  ✗ {text}")])
 
     async def pick(self, title: str, items: list[PickerItem], **kwargs: Any) -> PickResult | None:
-        return await pick(title, items, theme=self.theme, width=self.renderer.width, **kwargs)
+        async with self.exclusive():
+            return await pick(title, items, theme=self.theme, width=self.renderer.width, **kwargs)
+
+    @contextlib.asynccontextmanager
+    async def exclusive(self):
+        """选择器要用屏幕：先把常驻的输入框收起来（字留着），用完再放回去。
+        prompt_toolkit 同一时间只能跑一个界面。可重入：一次交互里接连几个选择器（几道提问、
+        确认后再输入原因）整段占着屏幕，中间不让输入框冒出来——否则那一瞬间按的键会落进输入框"""
+        if self._screen_owner is not None and self._screen_owner is asyncio.current_task():
+            yield
+            return
+        async with self._screen:
+            self._screen_owner = asyncio.current_task()
+            self._resumed.clear()       # 主循环这时如果正要重新打开输入框，会先等着
+            try:
+                if self.reader is not None and self.reader.active:
+                    self._draft = await self.reader.suspend()
+                yield
+            finally:
+                self._screen_owner = None
+                self._resumed.set()
+
+    # -- 运行中 -------------------------------------------------------- #
+
+    @property
+    def busy(self) -> bool:
+        return self.task is not None and not self.task.done()
+
+    async def spawn(self, work: Awaitable[Any]) -> None:
+        """交互模式下放到后台跑（输入框接着收输入），否则等它跑完"""
+        if not self.background:
+            await work
+            return
+        self.task = asyncio.ensure_future(work)
+
+    def interrupt(self) -> bool:
+        """Esc / 运行中空行 ctrl+c：中断这一轮。没在跑返回 False"""
+        if not self.busy:
+            return False
+        self.session.abort()
+        return True
+
+    def _on_ctrl_c(self, text: str) -> bool:
+        return not text and self.interrupt()
+
+    def steer(self, line: str) -> None:
+        """运行中输入的话：模型做完当前这一步（工具批次之后、或准备结束时）就看到"""
+        self.session.steer(line)
+        self.renderer.queued.append(line)
+        self.renderer.repaint()
+
+    def _restore_undelivered(self) -> None:
+        """一轮结束了（中断、出错）还没送到的插话：从队列里拿出来放回输入框，别悄悄丢了"""
+        left = self.session.agent.steering_queue.take()
+        self.renderer.queued.clear()
+        texts = [m.text() for m in left if getattr(m, "role", "") == "user"]
+        if not texts:
+            return
+        text = "\n".join(texts)
+        self.note("插话没来得及送到，已放回输入框")
+        if self.reader is not None and self.reader.active:
+            self.reader.set_text(text)
+        else:
+            self._draft = text
+
+    async def submit(self, line: str) -> bool:
+        """处理一行输入。返回 False 表示退出"""
+        if self.busy:
+            if line.startswith("/"):
+                self.note("运行中不能执行命令：等这一轮结束，或按 Esc 中断")
+                return True
+            self.steer(line)
+            return True
+        if self.reader is not None and self.reader.rich:
+            # 输入框提交后被擦掉了，用紧凑的样式把这句话留在 scrollback 里
+            self.renderer.user_echo(line)
+        if line.startswith("/"):
+            return await self.dispatch(line)
+        await self.send(line)
+        return True
 
     # -- 命令表 -------------------------------------------------------- #
 
@@ -247,30 +338,34 @@ class App:
         Esc 跳过全部（模型按推荐的选项继续）。答案由渲染器在工具结束时写进 scrollback"""
         self.renderer.pause()
         try:
-            answers = []
-            for number, question in enumerate(questions, 1):
-                options = question["options"]
-                items = [PickerItem(o["label"] + ("（推荐）" if o.get("recommended") else ""),
-                                    o.get("description", ""), value=o["label"]) for o in options]
-                items.append(PickerItem("其他", "自己输入回答", value=None))
-                start = next((i for i, o in enumerate(options) if o.get("recommended")), 0)
-                header = "需要你选择"
-                if len(questions) > 1:
-                    header += f" · {number}/{len(questions)}"
-                if question.get("header"):
-                    header += f" · {question['header']}"
-                result = await self.pick(question["question"], items, index=start, header=header)
-                if result is None:
-                    return None
-                answer, custom = result.item.value, False
-                if answer is None:
-                    answer, custom = await self._read_answer(header, question["question"]), True
-                    if not answer:
-                        return None
-                answers.append({"question": question["question"], "answer": answer, "custom": custom})
-            return answers
+            async with self.exclusive():
+                return await self._ask_questions(questions)
         finally:
             self.renderer.resume()
+
+    async def _ask_questions(self, questions: list[dict]) -> list[dict] | None:
+        answers = []
+        for number, question in enumerate(questions, 1):
+            options = question["options"]
+            items = [PickerItem(o["label"] + ("（推荐）" if o.get("recommended") else ""),
+                                o.get("description", ""), value=o["label"]) for o in options]
+            items.append(PickerItem("其他", "自己输入回答", value=None))
+            start = next((i for i, o in enumerate(options) if o.get("recommended")), 0)
+            header = "需要你选择"
+            if len(questions) > 1:
+                header += f" · {number}/{len(questions)}"
+            if question.get("header"):
+                header += f" · {question['header']}"
+            result = await self.pick(question["question"], items, index=start, header=header)
+            if result is None:
+                return None
+            answer, custom = result.item.value, False
+            if answer is None:
+                answer, custom = await self._read_answer(header, question["question"]), True
+                if not answer:
+                    return None
+            answers.append({"question": question["question"], "answer": answer, "custom": custom})
+        return answers
 
     async def confirm_tool(self, request: dict) -> dict:
         """改文件、跑命令前确认（权限扩展发来的请求）：允许 / 本会话不再询问 / 拒绝 / 拒绝并说明。
@@ -292,12 +387,14 @@ class App:
         header = f"需要你确认 · {request.get('title') or '执行操作'}"
         self.renderer.pause()
         try:
-            result = await self.pick(request.get("question") or "允许吗？", items, header=header, detail=detail)
-            choice = result.item.value if result else "abort"
-            feedback = ""
-            if choice == "explain":
-                feedback = await self._read_answer(header, "告诉模型你希望它怎么做")
-                choice = "deny"
+            async with self.exclusive():
+                result = await self.pick(request.get("question") or "允许吗？", items,
+                                         header=header, detail=detail)
+                choice = result.item.value if result else "abort"
+                feedback = ""
+                if choice == "explain":
+                    feedback = await self._read_answer(header, "告诉模型你希望它怎么做")
+                    choice = "deny"
         finally:
             self.renderer.resume()
         summary = truncate(" ".join(str(request.get("summary") or "").split()), max(self.renderer.width - 20, 20))
@@ -323,11 +420,12 @@ class App:
             + t.muted("（Enter 确认，留空取消）") + t.accent(" ❯ ", bold=True),
         ])
         reader = LineReader(erase_when_done=True)
-        try:
-            raw = await reader.read(prompt)
-        except (EOFError, KeyboardInterrupt):
-            return ""
-        return sanitize(raw).strip()
+        async with self.exclusive():
+            try:
+                raw = await reader.read(prompt)
+            except (EOFError, KeyboardInterrupt):
+                return ""
+        return sanitize(raw).strip() if isinstance(raw, str) else ""
 
     async def execute_plan(self, extra: str = "") -> None:
         """批准最近的计划：切到执行模式、任务变成清单、开始执行。只回显一行标题，不回显整段任务说明"""
@@ -351,11 +449,16 @@ class App:
             self.session.abort()
         except Exception as exc:
             self.error(f"{type(exc).__name__}: {exc}")
+        finally:
+            self._restore_undelivered()
 
     async def send(self, text: str) -> None:
         # 输入行已经显示过（或 user_echo 回显过）这句话，渲染器不要再打一遍
         self.renderer.state.own_prompt = text
         self._proposed = None
+        await self.spawn(self._send(text))
+
+    async def _send(self, text: str) -> None:
         await self.run_agent(self.session.prompt(text))
         if self._proposed is not None:
             plan, self._proposed = self._proposed, None
@@ -402,28 +505,39 @@ class App:
             erase_when_done=True,
             commands=self.slash_commands,
             footer=self.renderer.input_footer,
+            above=self.renderer.live_block,
+            on_escape=self.interrupt,
+            on_interrupt=self._on_ctrl_c,
         )
+        if self.reader.rich:
+            # 输入框常驻：一轮在后台跑，活动区画在输入框上方（由 prompt_toolkit 重画）
+            self.background = True
+            self.renderer.live.host = ReaderHost(self.reader)
         hint = missing_dependency_hint(self.theme)
         if hint:
             print(hint)
         while True:
+            await self._resumed.wait()      # 选择器在用屏幕时先别打开输入框
             try:
                 prompt = self.renderer.input_prompt() if self.reader.rich else "\033[1m❯ \033[0m"
-                raw = await self.reader.read(prompt)
+                draft, self._draft = self._draft, ""
+                raw = await self.reader.read(prompt, default=draft)
             except (EOFError, KeyboardInterrupt):
+                if self.interrupt():
+                    continue
                 print()
                 break
+            if raw is SUSPENDED:
+                continue
             line = sanitize(raw).strip()
             if not line:
                 continue
-            if self.reader.rich:
-                # 输入框提交后被擦掉了，用紧凑的样式把这句话留在 scrollback 里
-                self.renderer.user_echo(line)
-            if line.startswith("/"):
-                if not await self.dispatch(line):
-                    break
-                continue
-            await self.send(line)
+            if not await self.submit(line):
+                break
+        if self.busy:
+            self.session.abort()
+            with contextlib.suppress(Exception):
+                await self.task
 
         model = self.session.model
         self.renderer.summary(
@@ -433,6 +547,21 @@ class App:
             model.context_window if model else 0,
         )
         return 0
+
+
+class ReaderHost:
+    """LiveRegion 的宿主：输入框常驻时，活动区交给输入框上方那块画，定稿内容打印到它上面"""
+
+    def __init__(self, reader: LineReader) -> None:
+        self.reader = reader
+
+    def set_live(self, lines: list[str]) -> None:
+        self.reader.invalidate()
+
+    def print_above(self, text: str) -> None:
+        # 输入框开着时 sys.stdout 是 patch_stdout 的代理，写进去的内容出现在输入框上方
+        sys.stdout.write(text + "\n")
+        sys.stdout.flush()
 
 
 async def run(session: Any, renderer: SessionRenderer, agent_dir: str | Path | None = None) -> int:

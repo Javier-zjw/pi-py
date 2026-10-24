@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
@@ -290,25 +291,46 @@ async def _stream_turn(
     final: AssistantMessage | None = None
     started = False
     stream = config.stream_fn(state.model, context, options)
-    async for event in stream:
-        if not started:
-            started = True
-            state.streaming_message = getattr(event, "partial", None)
-            if state.streaming_message is not None:
-                emit(MessageStartEvent(message=state.streaming_message))
-        emit(MessageUpdateEvent(assistant_message_event=event))
-        if isinstance(event, (DoneEvent, ErrorEvent)):
-            final = event.message
-        if cancel_event.is_set():
-            aclose = getattr(stream, "aclose", None)
-            if aclose:
+    events = stream.__aiter__()
+    # 等下一个事件的同时等中断：模型可能还没出第一个字（在想、在排队），几十秒没有事件，
+    # 只在事件之间检查的话，用户按了 Esc 也得等到下一个字才停
+    cancelled = asyncio.ensure_future(cancel_event.wait())
+    try:
+        while True:
+            step = asyncio.ensure_future(events.__anext__())
+            await asyncio.wait({step, cancelled}, return_when=asyncio.FIRST_COMPLETED)
+            if not step.done():
+                step.cancel()
+                with contextlib.suppress(BaseException):
+                    await step
+                break
+            try:
+                event = step.result()
+            except StopAsyncIteration:
+                break
+            if not started:
+                started = True
+                state.streaming_message = getattr(event, "partial", None)
+                if state.streaming_message is not None:
+                    emit(MessageStartEvent(message=state.streaming_message))
+            emit(MessageUpdateEvent(assistant_message_event=event))
+            if isinstance(event, (DoneEvent, ErrorEvent)):
+                final = event.message
+            if cancel_event.is_set():
+                break
+    finally:
+        cancelled.cancel()
+
+    if cancel_event.is_set():
+        aclose = getattr(stream, "aclose", None)
+        if aclose:
+            with contextlib.suppress(Exception):
                 await aclose()
-            if final is None:
-                final = state.streaming_message or AssistantMessage(
-                    api=state.model.api, provider=state.model.provider, model=state.model.id
-                )
-            final.stop_reason = "aborted"
-            break
+        if final is None:
+            final = state.streaming_message or AssistantMessage(
+                api=state.model.api, provider=state.model.provider, model=state.model.id
+            )
+        final.stop_reason = "aborted"
 
     if final is None:
         final = AssistantMessage(

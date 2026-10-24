@@ -42,6 +42,7 @@ except ImportError:  # pragma: no cover
     Completer = object  # type: ignore[assignment,misc]
 
 MENU_ROWS = 10      # 命令菜单最多同时显示几行，更多的滚动
+SUSPENDED = object()    # read() 被 suspend() 收起时的返回值
 INPUT_MIN_ROWS = 5  # 输入框高度上限是半屏，但再矮的终端也至少给这么多行
 
 
@@ -126,6 +127,13 @@ class LineReader:
       每次重画都重新取；提交时不留下。
     - ``commands``：行首输入 / 时弹出的命令菜单（见 SlashCompleter）。菜单打开时回车会先补全
       高亮的那条（没高亮就取第一条）再提交，所以 ``/mo`` 回车就是 ``/model``。
+    - ``above``：画在输入框上方的内容（运行中的活动区：转圈、思考、工具、任务清单），每次重画
+      重新取；外面状态变了调 ``invalidate()``。配合 LiveRegion.host，运行中输入框也能常驻。
+    - ``on_escape``：按 Esc（菜单没打开时）调用，如中断正在运行的一轮。
+    - ``on_interrupt``：ctrl+c 时先问它（参数是输入框里的字），返回 True 表示处理掉了
+      （如空行时中断运行），否则照旧：有字清空、空行退出。
+    - ``suspend()``：把正在读的这一行收起来（返回已输入的字），让别的界面（选择器）用屏幕；
+      之后用 ``read(default=...)`` 接着读。
 
     不用 prompt_toolkit 的 bottom_toolbar：它固定在屏幕最底行，输入行和它之间会空出一大块，
     提交后这块空白还留在 scrollback 里。提示信息放进输入框上方的分隔线即可。
@@ -139,9 +147,15 @@ class LineReader:
             erase_when_done: bool = False,
             commands: Commands | None = None,
             footer: Callable[[], str] | None = None,
+            above: Callable[[], str] | None = None,
+            on_escape: Callable[[], Any] | None = None,
+            on_interrupt: Callable[[str], bool] | None = None,
     ) -> None:
         self.session: Any = None
         self.completer: SlashCompleter | None = None
+        self._active = False
+        self._done = asyncio.Event()
+        self._done.set()
         if not HAS_PROMPT_TOOLKIT:
             return
 
@@ -169,11 +183,20 @@ class LineReader:
 
         @bindings.add("c-c", filter=in_input)
         def _(event) -> None:
-            """有字时清空这一行，空行时才退出（同 Claude Code）"""
+            """有字时清空这一行，空行时才退出（同 Claude Code）；运行中空行是中断（on_interrupt）"""
+            if on_interrupt is not None and on_interrupt(event.current_buffer.text):
+                return
             if event.current_buffer.text:
                 event.current_buffer.reset()
             else:
                 event.app.exit(exception=KeyboardInterrupt, style="class:aborting")
+
+        if on_escape is not None:
+            # 不用 eager：Alt+Enter 是 Esc 再跟回车，eager 会把它拆成"中断 + 提交"。
+            # 等 ttimeoutlen（下面调到 50ms）没有后续键再算单独的 Esc
+            @bindings.add("escape", filter=in_input & ~has_completions)
+            def _(event) -> None:
+                on_escape()
 
         for key, handler in (key_handlers or {}).items():
             bindings.add(key)(_print_above(handler))
@@ -201,6 +224,15 @@ class LineReader:
             # 固定预留会让输入行下面一直空着一大块；菜单空间由 _input_height 按需撑开
             reserve_space_for_menu=0,
         )
+        if on_escape is not None:
+            self.session.app.ttimeoutlen = 0.05
+        if above is not None:
+            # 输入框上方：运行中的活动区。没内容时不占行
+            block = ConditionalContainer(
+                Window(FormattedTextControl(lambda: ANSI(above())), dont_extend_height=True),
+                filter=~is_done & Condition(lambda: bool(above())),
+            )
+            self.session.layout.container.children.insert(0, block)
         if footer is not None:
             # PromptSession 只提供贴在屏幕最底行的 bottom_toolbar；这里把一行插在输入区正下方
             # （布局最外层 HSplit 的第 0 个孩子是输入区，补全菜单浮在输入区内，所以菜单在这行上面）
@@ -209,7 +241,8 @@ class LineReader:
                 Window(FormattedTextControl(lambda: ANSI(footer())), dont_extend_height=True),
                 filter=~is_done,
             )
-            self.session.layout.container.children.insert(1, line)
+            index = 2 if above is not None else 1
+            self.session.layout.container.children.insert(index, line)
         input_window = next(w for w in self.session.layout.find_all_windows()
                             if getattr(w.content, "buffer", None) is self.session.default_buffer)
         if footer is not None:
@@ -260,14 +293,47 @@ class LineReader:
     def rich(self) -> bool:
         return self.session is not None
 
-    async def read(self, prompt: str = "> ") -> str:
-        """读一行。上层不要再回显——这里已经显示过了。"""
+    @property
+    def active(self) -> bool:
+        """正在读（输入框在屏幕上）"""
+        return self._active
+
+    async def read(self, prompt: str = "> ", default: str = "") -> Any:
+        """读一行。上层不要再回显——这里已经显示过了。被 suspend() 收起时返回 SUSPENDED"""
         if self.session is not None:
-            # patch_stdout：流式输出和输入行共存，输出不会把正在输入的内容冲掉
-            with patch_stdout(raw=True):
-                return await self.session.prompt_async(ANSI(prompt))
+            self._active = True
+            self._done.clear()
+            try:
+                # patch_stdout：流式输出和输入行共存，输出不会把正在输入的内容冲掉
+                with patch_stdout(raw=True):
+                    return await self.session.prompt_async(ANSI(prompt), default=default)
+            finally:
+                self._active = False
+                self._done.set()
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, lambda: input(prompt))
+
+    async def suspend(self) -> str:
+        """收起正在读的这一行，等输入框真的离开屏幕再返回；返回已经输入的字"""
+        if not self._active or self.session is None:
+            return ""
+        text = self.session.default_buffer.text
+        app = self.session.app
+        if app.is_running and not app.future.done():
+            app.exit(result=SUSPENDED)
+        await self._done.wait()
+        return text
+
+    def invalidate(self) -> None:
+        """外面的状态变了（活动区、模式），重画输入框这块"""
+        if self._active and self.session is not None:
+            self.session.app.invalidate()
+
+    def set_text(self, text: str) -> None:
+        """往正在读的输入框里放字（如没送达的插话放回来）"""
+        if self._active and self.session is not None:
+            self.session.default_buffer.text = text
+            self.session.default_buffer.cursor_position = len(text)
 
 
 def _highlight_first(buffer: Any) -> None:

@@ -320,7 +320,7 @@ async def cmd_tools(app: App, rest: str) -> None:
 
 
 async def cmd_expand(app: App, rest: str) -> None:
-    app.renderer.expand_last_turn()
+    await app.show_details()
 
 
 async def cmd_help(app: App, rest: str) -> None:
@@ -347,7 +347,7 @@ BUILTIN_COMMANDS: list[AppCommand] = [
     AppCommand("cost", "本次会话的 token 与费用", cmd_cost, aliases=("usage",)),
     AppCommand("status", "模型、会话、工具、扩展等状态", cmd_status, aliases=("session",)),
     AppCommand("tools", "列出当前启用的工具", cmd_tools),
-    AppCommand("expand", "展开上一轮的思考和工具调用（ctrl+o）", cmd_expand),
+    AppCommand("expand", "全屏查看上一轮的思考和工具调用（ctrl+o）", cmd_expand),
     AppCommand("exit", "退出", cmd_exit, aliases=("quit",)),
 ]
 

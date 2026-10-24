@@ -49,6 +49,7 @@ from typing import Any, TextIO
 from pi_tui import (
     LiveRegion,
     MarkdownStream,
+    Section,
     Spinner,
     StatusBar,
     Theme,
@@ -68,8 +69,9 @@ from pi_tui import (
 )
 
 TOOL_SUMMARY_KEYS = ("path", "command", "pattern", "url", "query", "old_text")
-EXPAND_HINT = "ctrl+o 展开"
+EXPAND_HINT = "ctrl+o 详情"
 EXPAND_RESULT_LINES = 20
+VIEWER_BODY_LINES = 400   # 查看器里每段最多显示几行（读了个大文件时不至于卡住）
 ANSWER_MARK = "●"
 INDENT = "  "
 SLOT_LINES = 6        # 活动区里思考 / 过渡话最多显示几行（只显示最新的）
@@ -255,17 +257,27 @@ class SessionRenderer:
         return terminal_width()
 
     def header(self, cwd: str, model: str, thinking: str = "off") -> None:
+        """启动时的欢迎框：目录、模型、模式，下面一行常用操作"""
         t = self.theme
-        from pathlib import Path
-
-        think = f" · think {thinking}" if thinking != "off" else ""
-        self._emit([
-            (f"{t.accent('✻', bold=True)} {t.bold('pi coding agent')}  "
-             f"{t.muted(f'{model}{think}')}"),
-            f"  {t.muted(f'{Path(cwd).name}  {cwd}')}",
-            f"  {t.muted('/help 查看命令 · ctrl+o 展开上一轮的思考和工具 · /exit 退出')}",
+        home = os.path.expanduser("~")
+        where = "~" + cwd[len(home):] if cwd == home or cwd.startswith(home + os.sep) else cwd
+        think = f" · 思考 {thinking}" if thinking != "off" else ""
+        mode = "计划模式" if self.mode == "plan" else "执行模式"
+        permission = f" · 权限 {self.permission}" if self.permission else ""
+        rows = [
+            f"{t.accent('✻', bold=True)} {t.bold('pi')} {t.muted('coding agent')}",
             "",
-        ])
+            f"  {t.muted('目录')}  {where}",
+            f"  {t.muted('模型')}  {model}{t.muted(think)}",
+            f"  {t.muted('模式')}  {mode}{t.muted(permission)}",
+        ]
+        tips = t.muted("/ 命令 · shift+tab 计划模式 · ctrl+o 上一轮详情 · Esc 中断")
+        inner = min(max(max(display_width(r) for r in rows) + 6, 44), self.width - 4)
+        bar = t.accent("│")
+        box = [t.accent("╭" + "─" * (inner + 2) + "╮")]
+        box += [f"{bar} {pad(truncate(row, inner), inner)} {bar}" for row in rows]
+        box += [t.accent("╰" + "─" * (inner + 2) + "╯")]
+        self._emit([*box, f"  {truncate(tips, self.width - 4)}", ""])
 
     def prompt_echo(self, text: str) -> None:
         """只在输入层没有回显时才调用（管道输入、print 模式）。"""
@@ -345,6 +357,65 @@ class SessionRenderer:
     def stop(self) -> None:
         self.ticker.stop()
         self.live.finalize()
+
+    def turn_sections(self, turn: TurnRecord | None) -> list[Section]:
+        """一轮的过程，按发生顺序切成查看器里可折叠的段落：标题一行（做了什么、结果），
+        正文是全文（思考原文、命令输出、diff、读到的内容）"""
+        if turn is None:
+            return []
+        t = self.theme
+        width = max(self.width - 8, 20)
+        sections: list[Section] = []
+
+        def clip(lines: list[str]) -> list[str]:
+            if len(lines) <= VIEWER_BODY_LINES:
+                return lines
+            return lines[:VIEWER_BODY_LINES] + [t.muted(f"… 还有 {len(lines) - VIEWER_BODY_LINES} 行")]
+
+        def wrapped(text: str, paint=None) -> list[str]:
+            out = [line for raw in text.rstrip().split("\n") for line in (wrap(raw, width) or [""])]
+            return clip([paint(line) if paint else line for line in out])
+
+        if turn.prompt:
+            sections.append(Section(t.accent("❯ 你的输入（全文）", bold=True), wrapped(turn.prompt)))
+        for kind, value in turn.steps:
+            if kind == "thinking":
+                text, seconds = value
+                preview = first_line(text, 60)
+                sections.append(Section(f"{t.thinking(f'✻ 思考 {_seconds(seconds)}')}  {t.muted(preview)}",
+                                        wrapped(text.strip(), t.muted)))
+            elif kind == "text":
+                lines = wrapped(value)
+                title = f"{t.muted('◦')} {lines[0] if lines else ''}"
+                sections.append(Section(title, lines[1:] if len(lines) > 1 else []))
+            elif kind == "plan":
+                done = sum(item.get("status") == "completed" for item in value)
+                marks = {"completed": t.success("✓"), "in_progress": t.accent("▸")}
+                body = [f"{marks.get(item.get('status'), t.muted('○'))} {item.get('step', '')}" for item in value]
+                sections.append(Section(f"{t.accent('☰')} 任务 {done}/{len(value)}", body))
+            else:
+                record = value
+                if record.took is None:
+                    mark, result = t.accent("⏺"), t.muted("运行中")
+                else:
+                    mark = t.error("✗") if record.is_error else t.success("✓")
+                    result = self._tool_result(record)
+                title = (f"{mark} {t.accent(record.name, bold=True)}  "
+                         f"{truncate(self._tool_target(record), max(width - 30, 20))}  {result}")
+                body: list[str] = []
+                if record.name == "bash":
+                    command = str((record.arguments or {}).get("command") or "")
+                    body += [t.accent("$ ") + line for line in command.splitlines()]
+                if record.patch:
+                    # ---/+++ 两行是带绝对路径的文件头，标题里已经有文件了
+                    patch = "\n".join(line for line in record.patch.splitlines()
+                                       if not line.startswith(("---", "+++")))
+                    body += [line[2:] for line in diff_block(patch, width + 2, t,
+                                                             max_lines=VIEWER_BODY_LINES)]
+                elif record.output.strip():
+                    body += wrapped(record.output, t.muted if not record.is_error else t.error)
+                sections.append(Section(title, clip(body), expanded=record.is_error))
+        return sections
 
     def expand_last_turn(self) -> None:
         """ctrl+o / /expand：按发生顺序打印上一轮的思考全文、过渡话、每个工具的参数和结果"""

@@ -29,6 +29,7 @@ from pi_tui import (
     pad,
     pick,
     truncate,
+    view,
     wrap,
 )
 
@@ -41,7 +42,7 @@ COMMAND_NAME = re.compile(r"[A-Za-z][\w-]*")
 SHORTCUTS = [
     ("Esc", "中断正在运行的这一轮"),
     ("回车（运行中）", "插话：模型做完当前这步就看到"),
-    ("ctrl+o", "展开上一轮的思考和工具调用"),
+    ("ctrl+o", "全屏查看上一轮的思考和工具调用（q 返回）"),
     ("Alt+Enter", "换行"),
     ("↑ ↓", "翻历史；菜单打开时选择命令"),
     ("Tab", "补全命令名，接着输参数"),
@@ -129,6 +130,32 @@ class App:
             return False
         self.session.abort()
         return True
+
+    def open_viewer(self) -> None:
+        """ctrl+o：全屏查看这一轮（运行中）或上一轮的过程。快捷键回调是同步的，这里排进事件循环"""
+        asyncio.ensure_future(self.show_details())
+
+    async def show_details(self) -> None:
+        renderer = self.renderer
+        turn = renderer.turn if renderer.agent_running else renderer.last_turn
+        sections = renderer.turn_sections(turn)
+        if not sections:
+            self.note("还没有可以查看的过程（思考、工具调用）")
+            return
+        if self.reader is None or not self.reader.rich:
+            renderer.expand_last_turn()     # 没有 prompt_toolkit：照旧打印出来
+            return
+        title = "这一轮的过程（进行中）" if renderer.agent_running else "上一轮的过程"
+        host = renderer.live.host
+        async with self.exclusive():
+            # 全屏期间后台那一轮可能还在往外写：先攒着，关掉查看器再打印，否则会写花全屏界面
+            if isinstance(host, ReaderHost):
+                host.hold()
+            try:
+                await view(sections, title, theme=self.theme)
+            finally:
+                if isinstance(host, ReaderHost):
+                    host.release()
 
     def _on_ctrl_c(self, text: str) -> bool:
         return not text and self.interrupt()
@@ -503,8 +530,7 @@ class App:
         self.greet()
         self.reader = LineReader(
             history_file=Path.home() / ".pi" / "agent" / "history",
-            key_handlers={"c-o": self.renderer.expand_last_turn},
-            key_actions={"s-tab": self.cycle_mode},
+            key_actions={"s-tab": self.cycle_mode, "c-o": self.open_viewer},
             erase_when_done=True,
             commands=self.slash_commands,
             footer=self.renderer.input_footer,
@@ -557,14 +583,28 @@ class ReaderHost:
 
     def __init__(self, reader: LineReader) -> None:
         self.reader = reader
+        self._held: list[str] | None = None
 
     def set_live(self, lines: list[str]) -> None:
         self.reader.invalidate()
 
     def print_above(self, text: str) -> None:
+        if self._held is not None:
+            self._held.append(text)
+            return
         # 输入框开着时 sys.stdout 是 patch_stdout 的代理，写进去的内容出现在输入框上方
         sys.stdout.write(text + "\n")
         sys.stdout.flush()
+
+    def hold(self) -> None:
+        """全屏界面开着时先别往终端写：攒起来，release() 时一起打印"""
+        if self._held is None:
+            self._held = []
+
+    def release(self) -> None:
+        held, self._held = self._held or [], None
+        for text in held:
+            self.print_above(text)
 
 
 async def run(session: Any, renderer: SessionRenderer, agent_dir: str | Path | None = None) -> int:

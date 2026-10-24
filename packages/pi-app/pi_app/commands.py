@@ -199,6 +199,37 @@ async def cmd_build(app: App, rest: str) -> None:
     await app.execute_plan(rest)
 
 
+async def cmd_permissions(app: App, rest: str) -> None:
+    """权限模式：每次确认 / 自动接受文件修改 / 全部自动。只对当前会话生效，长期设置写 settings.json"""
+    from pi_coding_agent.builtin_extensions.permissions import (
+        MODES,
+        current_mode,
+        describe,
+        set_mode,
+    )
+
+    session = app.session
+    if rest:
+        try:
+            set_mode(session, rest)
+        except ValueError as exc:
+            app.error(str(exc))
+            return
+    else:
+        notes = {"ask": "改文件、跑命令前都问（只读命令除外）",
+                 "acceptEdits": "工作目录里的文件修改直接做，命令仍然要问",
+                 "auto": "全部直接执行，不再询问（deny 规则仍然生效）"}
+        mode = current_mode(session)
+        items = [PickerItem(label, notes[key], current=key == mode, value=key) for key, label in MODES.items()]
+        result = await app.pick("权限模式", items, index=list(MODES).index(mode))
+        if result is None:
+            app.note("已取消，权限模式未变")
+            return
+        set_mode(session, result.item.value)
+    app.renderer.permission = MODES[current_mode(session)] if current_mode(session) != "ask" else ""
+    app.out([f"  {line}" for line in describe(session).splitlines()])
+
+
 async def cmd_continue(app: App, rest: str) -> None:
     if not app.session.can_continue:
         app.note("没有可以继续的任务：上一轮已经完成")
@@ -309,6 +340,8 @@ BUILTIN_COMMANDS: list[AppCommand] = [
     AppCommand("plan", "进入计划模式（只读调研、先出计划；shift+tab 切换）", cmd_plan, usage="[需求]"),
     AppCommand("build", "执行最近提交的计划", cmd_build, usage="[补充说明]"),
     AppCommand("continue", "接着执行上次中断的那一轮", cmd_continue),
+    AppCommand("permissions", "权限模式：每次确认 / 自动接受文件修改 / 全部自动", cmd_permissions,
+               usage="[ask|acceptEdits|auto]"),
     AppCommand("compact", "压缩上下文，可附加压缩重点", cmd_compact, usage="[说明]"),
     AppCommand("context", "上下文用量和压缩阈值", cmd_context),
     AppCommand("cost", "本次会话的 token 与费用", cmd_cost, aliases=("usage",)),

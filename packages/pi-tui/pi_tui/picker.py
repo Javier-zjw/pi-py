@@ -87,7 +87,7 @@ class PickerState:
         return True
 
     def render(self, title: str, width: int, theme: Theme = DEFAULT_THEME,
-               header: str = "") -> list[str]:
+               header: str = "", detail: list[str] | None = None) -> list[str]:
         t = theme
         bar = t.accent("│", bold=True)
         has_choices = any(i.choices for i in self.items)
@@ -108,9 +108,13 @@ class PickerState:
         if header:
             lines.append(border("╭", header, lambda x: t.highlight(x, bold=True)))
             lines += [f"{bar} {t.bold(line)}" for line in wrap(title, max(width - 3, 10))]
-            lines.append(bar)
         else:
             lines.append(border("╭", title, t.bold))
+        if detail:
+            # 调用方给的几行细节（要执行的命令、diff 预览），可以带颜色；超宽截短
+            lines += [f"{bar}   {truncate(line, max(width - 5, 10))}" for line in detail]
+        if header or detail:
+            lines.append(bar)
 
         number_width = len(str(count))
         label_width = min(max(display_width(i.label) for i in self.items), max(width // 2, 20))
@@ -149,16 +153,18 @@ async def pick(
         theme: Theme = DEFAULT_THEME,
         width: int = 80,
         header: str = "",
+        detail: list[str] | None = None,
 ) -> PickResult | None:
-    """交互选择。取消返回 None。header 写在面板上边框（如"需要你选择"），title 是面板里的问题"""
+    """交互选择。取消返回 None。header 写在面板上边框（如"需要你选择"），title 是面板里的问题，
+    detail 是问题下面的几行细节（如要执行的命令）"""
     state = PickerState(items, index, choice_label)
     if HAS_PROMPT_TOOLKIT:
-        return await _pick_rich(state, title, theme, width, header)
-    return await _pick_plain(state, title, theme, header)
+        return await _pick_rich(state, title, theme, width, header, detail)
+    return await _pick_plain(state, title, theme, header, detail)
 
 
 async def _pick_rich(state: PickerState, title: str, theme: Theme, width: int,
-                     header: str) -> PickResult | None:
+                     header: str, detail: list[str] | None = None) -> PickResult | None:
     bindings = KeyBindings()
 
     for digit in "123456789":
@@ -196,7 +202,7 @@ async def _pick_rich(state: PickerState, title: str, theme: Theme, width: int,
     def _(event) -> None:
         event.app.exit(result=None)
 
-    control = FormattedTextControl(lambda: ANSI("\n".join(state.render(title, width, theme, header))))
+    control = FormattedTextControl(lambda: ANSI("\n".join(state.render(title, width, theme, header, detail))))
     app: Application = Application(
         layout=Layout(Window(control, dont_extend_height=True, always_hide_cursor=True)),
         key_bindings=bindings,
@@ -206,13 +212,16 @@ async def _pick_rich(state: PickerState, title: str, theme: Theme, width: int,
     return await app.run_async()
 
 
-async def _pick_plain(state: PickerState, title: str, theme: Theme, header: str = "") -> PickResult | None:
+async def _pick_plain(state: PickerState, title: str, theme: Theme, header: str = "",
+                      detail: list[str] | None = None) -> PickResult | None:
     """没有 prompt_toolkit：列出编号，输入编号选择"""
     loop = asyncio.get_running_loop()
     print()
     if header:
         print(theme.highlight(f"【{header}】", bold=True))
     print(theme.bold(title))
+    for line in detail or []:
+        print(f"    {line}")
     for i, item in enumerate(state.items, 1):
         current = theme.success(" ✓ 当前") if item.current else ""
         print(f"  {i}. {item.label}{current}  {theme.muted(item.note or item.description)}")

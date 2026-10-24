@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from pi_agent import AgentEvent, AgentTool, AgentToolResult, ToolContext
+from pi_agent import AgentEvent, AgentTool, AgentToolResult, BeforeToolCallResult, ToolContext
 
 
 @dataclass
@@ -84,6 +84,11 @@ class ExtensionAPI:
     compaction_context_hooks: list[Callable[[Any], Awaitable[str | None]]] = field(
         default_factory=list
     )
+    # 工具执行前的钩子：(调用, 会话) → BeforeToolCallResult | None。权限确认就挂在这里
+    tool_call_hooks: list[Callable[[Any, Any], Awaitable[BeforeToolCallResult | None]]] = field(
+        default_factory=list
+    )
+    tool_call_errors: list[str] = field(default_factory=list)
     owner: str = ""
     # 当前正在 activate 的扩展名，用于把注册项归属到扩展上
     ownership: dict[str, list[str]] = field(default_factory=dict)
@@ -191,6 +196,32 @@ class ExtensionAPI:
                 errors.append(f"{type(exc).__name__}: {exc}")
 
         return errors
+
+    def before_tool_call(
+            self, handler: Callable[[Any, Any], Awaitable[BeforeToolCallResult | None]]
+    ) -> None:
+        """工具执行前调用 handler(call, session)：返回 block=True 拦下这次调用（reason 作为工具结果
+        给模型看），返回 arguments 改写参数，返回 None 放行。多个钩子按注册顺序跑，第一个拦下的生效"""
+        self.tool_call_hooks.append(handler)
+        self._own("hook", "before_tool_call")
+
+    async def run_tool_call_hooks(self, call: Any, session: Any) -> BeforeToolCallResult | None:
+        arguments = None
+        for handler in list(self.tool_call_hooks):
+            try:
+                result = await handler(call, session)
+            except Exception as exc:  # noqa: BLE001
+                # 坏钩子不该让所有工具都跑不了；记下来，放行（权限扩展自己兜住界面出错，出错即拒绝）
+                self.tool_call_errors.append(f"{type(exc).__name__}: {exc}")
+                continue
+            if result is None:
+                continue
+            if result.block:
+                return result
+            if result.arguments is not None:
+                arguments = result.arguments
+                call.arguments = arguments
+        return BeforeToolCallResult(arguments=arguments) if arguments is not None else None
 
     async def run_context_hook(self, messages: list) -> list:
         for handler in list(self.context_hooks):

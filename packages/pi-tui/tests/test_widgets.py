@@ -158,6 +158,11 @@ def test_picker_render() -> None:
     check("提问面板: 问题在面板里，长问题折行", len(body) >= 2 and body[0].startswith("│ list 命令")
           and all(display_width(line) <= 40 for line in lines), str(lines))
 
+    lines = [strip_ansi(line) for line in question.render("允许执行这条命令吗？", 40, plain,
+                                                         header="需要你确认 · 执行命令",
+                                                         detail=["rm -rf build " + "x" * 60])]
+    check("细节: 问题下面缩进显示，超宽截短", lines[3].startswith("│   rm -rf build") and lines[4] == "│"
+          and all(display_width(line) <= 40 for line in lines), str(lines))
     check("数字键: 选中对应项", question.select(2) and question.index == 1)
     check("数字键: 超出范围不动", not question.select(3) and not question.select(0) and question.index == 1)
 

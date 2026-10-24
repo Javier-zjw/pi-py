@@ -138,10 +138,14 @@ class App:
             self.session.dispose()
         self.session = session
         session.user_input = self.ask_user     # 计划模式的 ask_user 工具经它弹选择器
+        session.permission_handler = self.confirm_tool     # 改文件、跑命令前经它确认
         render = session.subscribe(self.renderer.on_event)
         own = session.subscribe(self._on_session_event)
         self._unsubscribe = lambda: (render(), own())
         self.renderer.mode = session.mode
+        from pi_coding_agent.builtin_extensions.permissions import MODES, current_mode
+        mode = current_mode(session)
+        self.renderer.permission = MODES[mode] if mode != "ask" else ""
         # 恢复的会话里有没做完的任务清单：接着显示
         from pi_coding_agent.builtin_extensions.todo import latest_todo
         record = latest_todo(session)
@@ -267,6 +271,45 @@ class App:
             return answers
         finally:
             self.renderer.resume()
+
+    async def confirm_tool(self, request: dict) -> dict:
+        """改文件、跑命令前确认（权限扩展发来的请求）：允许 / 本会话不再询问 / 拒绝 / 拒绝并说明。
+        Esc 拒绝并停止这一轮。结论留一行在 scrollback 里"""
+        t = self.theme
+        detail = []
+        for line in request.get("detail") or []:
+            if line.startswith("- "):
+                detail.append(t.error(line))
+            elif line.startswith("+ "):
+                detail.append(t.success(line))
+            else:
+                detail.append(t.muted(line) if request.get("kind") != "bash" else t.bold(line))
+        items = [PickerItem("允许", "只这一次", value="allow")]
+        if request.get("remember"):
+            items.append(PickerItem("允许，并且" + request["remember"]["label"], value="always"))
+        items += [PickerItem("拒绝", "告诉模型别这么做", value="deny"),
+                  PickerItem("拒绝并说明", "输入你希望它怎么做", value="explain")]
+        header = f"需要你确认 · {request.get('title') or '执行操作'}"
+        self.renderer.pause()
+        try:
+            result = await self.pick(request.get("question") or "允许吗？", items, header=header, detail=detail)
+            choice = result.item.value if result else "abort"
+            feedback = ""
+            if choice == "explain":
+                feedback = await self._read_answer(header, "告诉模型你希望它怎么做")
+                choice = "deny"
+        finally:
+            self.renderer.resume()
+        summary = truncate(" ".join(str(request.get("summary") or "").split()), max(self.renderer.width - 20, 20))
+        if choice == "always":
+            self.out([f"  {t.success('✓')} {t.muted(request['remember']['label'])}"])
+        elif choice == "deny":
+            note = f"：{feedback}" if feedback else ""
+            text = f"拒绝了 {request.get('tool', '')} {summary}{note}"
+            self.out([f"  {t.error('✗')} {t.muted(text)}"])
+        elif choice == "abort":
+            self.out([f"  {t.error('✗')} {t.muted(f'拒绝并停止：{summary}')}"])
+        return {"decision": choice, "feedback": feedback}
 
     async def _read_answer(self, header: str, question: str) -> str:
         """选了「其他」：问题留在输入行上面（选择器已经擦掉了），输完连同问题一起擦掉"""

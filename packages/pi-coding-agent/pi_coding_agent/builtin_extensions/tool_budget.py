@@ -112,4 +112,8 @@ def current_plan(session) -> str:
     record = latest_todo(session)
     if not record or all(s["status"] == "completed" for s in record["plan"]):
         return ""
-    return "\n".join(f"- {MARKS.get(s['status'], '[ ]')} {s['step']}" for s in record["plan"])
+    lines = [f"- {MARKS.get(s['status'], '[ ]')} {s['step']}" for s in record["plan"]]
+    current = next((s for s in record["plan"] if s["status"] == "in_progress"), None)
+    if current and current.get("done_when"):
+        lines.append(f"当前这一项的完成标准：{current['done_when']}（验证通过再标 completed）")
+    return "\n".join(lines)

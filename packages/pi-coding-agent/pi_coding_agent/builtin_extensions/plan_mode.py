@@ -15,8 +15,14 @@
 4. **提问走选择器** —— 代码回答不了、又会改变计划的决定，用 ask_user 一次问完（同 Claude Code 的
    AskUserQuestion、Codex 的 request_user_input）：界面弹选项，答案作为工具结果回来，本轮接着规划。
    没有可交互界面（print 模式、网页）时工具报错，模型退回到在回复里提问。
-5. **批准即生成进度单** —— 计划的任务直接变成 update_plan 的清单（第一项 in_progress），
-   执行时模型每完成一项就打勾，界面实时显示；目标重锚提醒里也带着这张清单。
+5. **任务表** —— 每项任务带「完成标准」（怎么验证做完了：命令、测试、可观察的结果）和涉及文件，
+   界面画成一张表。批准后任务直接变成 update_plan 的清单（第一项 in_progress），执行时每完成
+   一项先按完成标准验证再打勾，界面实时显示；目标重锚提醒里带着清单和当前这项的完成标准。
+6. **执行时守住计划**（todo.py 校验 + 这里的收尾检查）——
+   - 已批准的任务不能悄悄删掉或改写，不能跳过前面没做的去做后面的；确需调整要写 explanation，
+     界面显示调整原因；
+   - 模型想结束回答时清单还没做完：用 follow-up 提醒它继续下一项或说明卡在哪（每次运行最多
+     MAX_NUDGES 次，不会死循环）。
 
 模式的注册和生效走 ExtensionAPI 的 register_mode，核心层不认识"计划"这个概念。
 界面（pi-tui / 网页）调 approve_plan() 或 /build 来执行计划。
@@ -24,7 +30,7 @@
 
 from __future__ import annotations
 
-from pi_agent import AgentTool, AgentToolResult, ToolContext
+from pi_agent import AgentTool, AgentToolResult, CustomMessage, ToolContext
 
 NAME = "plan_mode"
 DESCRIPTION = "计划模式：只读调研、提交带任务清单的计划，批准后切到执行模式按清单逐项完成"
@@ -32,6 +38,8 @@ DESCRIPTION = "计划模式：只读调研、提交带任务清单的计划，�
 ENTRY_TYPE = "plan"
 READ_ONLY = ("read", "grep", "find", "ls")
 ASK_TOOL = "ask_user"
+GUARD_TYPE = "plan_guard"   # 清单没做完就想收尾时的提醒（CustomMessage）
+MAX_NUDGES = 2              # 每次运行最多提醒几次：确实做不下去时让模型能停下来
 
 # 结构参照 Codex 的 Plan Mode 协作模式提示（collaboration-mode-templates/templates/plan.md）
 PLAN_PROMPT = """
@@ -60,8 +68,10 @@ decisions), call `submit_plan` exactly once:
    - title: a short name for the change
    - summary: Markdown, concise: approach, key changes by area, how it will be tested, \
 assumptions
-   - steps: 3-10 ordered tasks. Each is one concrete, verifiable unit of work ("Add X to Y", \
-"Run the Z tests"); they become the execution checklist the implementer ticks off
+   - steps: 3-10 ordered tasks, shown to the user as a task table and used as the execution \
+checklist. Each task has a title (one concrete unit of work: "Add X to Y"), the files it \
+touches, and done_when: how to verify it is done (a command to run, a test that passes, an \
+observable result). Make done_when specific enough that the implementer can check it.
    - files: the main files to be changed or created
    - questions: remaining open questions or assumptions (may be empty)
 After calling `submit_plan`, stop. The user will approve it, ask for changes, or drop it. \
@@ -125,8 +135,22 @@ SUBMIT_PARAMETERS = {
         "title": {"type": "string", "description": "Short name for the change"},
         "summary": {"type": "string",
                     "description": "Markdown: approach, key changes, test plan, assumptions"},
-        "steps": {"type": "array", "items": {"type": "string"},
-                  "description": "3-10 ordered, concrete, verifiable tasks"},
+        "steps": {
+            "type": "array",
+            "description": "3-10 ordered tasks: the task table and the execution checklist",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "One concrete unit of work"},
+                    "files": {"type": "array", "items": {"type": "string"},
+                              "description": "Files this task changes or creates"},
+                    "done_when": {"type": "string",
+                                  "description": "How to verify it is done: a command, a test, "
+                                                 "an observable result"},
+                },
+                "required": ["title", "done_when"],
+            },
+        },
         "files": {"type": "array", "items": {"type": "string"},
                   "description": "Main files to change or create"},
         "questions": {"type": "array", "items": {"type": "string"},
@@ -176,15 +200,17 @@ def activate(pi) -> None:
                                     details={"questions": questions, "answers": answers})
 
     async def submit_plan(args: dict, ctx: ToolContext) -> AgentToolResult:
-        steps = [str(s).strip() for s in args.get("steps") or [] if str(s).strip()]
-        if not steps:
+        tasks = normalize_tasks(args.get("steps"))
+        if not tasks:
             return AgentToolResult.text("steps is empty: give the ordered tasks of the plan",
                                         is_error=True)
+        steps = [task["title"] for task in tasks]
         summary = str(args.get("summary") or "").strip()
         plan = {
             "title": str(args.get("title") or "").strip() or _first_line(summary) or "实施计划",
             "summary": summary,
-            "steps": steps,
+            "steps": steps,         # 只有标题：旧版本和别处按字符串列表读
+            "tasks": tasks,         # 完整任务：标题 + 涉及文件 + 完成标准
             "files": [str(f) for f in args.get("files") or []],
             "questions": [str(q) for q in args.get("questions") or []],
             "status": "proposed",
@@ -274,6 +300,34 @@ def activate(pi) -> None:
 
     pi.compaction_context(plan_context)
 
+    nudges = {"count": 0}
+
+    def on_agent_start(event) -> None:
+        nudges["count"] = 0
+
+    def on_turn_end(event) -> None:
+        """模型这次调用没调工具（要结束回答了），而批准的清单还没做完：提醒它继续或说明原因。
+        turn_end 在循环取 follow-up 之前同步发出，这里塞进去的消息当场就会被取走"""
+        session = pi.session
+        message = getattr(event, "message", None)
+        if session is None or message is None or getattr(event, "tool_results", None):
+            return
+        if getattr(message, "stop_reason", "") in ("error", "aborted") or session.mode == "plan":
+            return
+        left = unfinished_plan_steps(session)
+        if not left or nudges["count"] >= MAX_NUDGES:
+            return
+        nudges["count"] += 1
+        session.agent.follow_up(CustomMessage(
+            custom_type=GUARD_TYPE,
+            content=render_guard(left),
+            details={"notice": f"计划还有 {len(left)} 项没完成，提醒模型继续"
+                               f"（{nudges['count']}/{MAX_NUDGES}）", "left": len(left)},
+        ))
+
+    pi.on("agent_start", on_agent_start)
+    pi.on("turn_end", on_turn_end)
+
     pi.register_command("plan", "进入计划模式（可直接带上需求）", cmd_plan, usage="/plan [需求]")
     pi.register_command("build", "批准最近的计划并开始执行", cmd_build, usage="/build [补充说明]")
     pi.register_command("show_plan", "查看当前计划", cmd_show_plan)
@@ -291,10 +345,65 @@ def approve_plan(session, extra: str = "") -> str:
     approved = {**plan, "status": "approved"}
     session.session.append_custom_entry(ENTRY_TYPE, approved)
     session.switch_mode("chat")
-    steps = [{"step": step, "status": "in_progress" if i == 0 else "pending"}
-             for i, step in enumerate(plan["steps"])]
+    steps = [{"step": task["title"], "status": "in_progress" if i == 0 else "pending",
+              "done_when": task["done_when"]}
+             for i, task in enumerate(plan_tasks(plan))]
     save_todo(session, {"plan": steps, "source": "plan"})
     return render_plan_as_task(approved, extra)
+
+
+def normalize_tasks(raw) -> list[dict]:
+    """模型给的任务整理干净：{title, files, done_when}；去掉空标题。也接受纯字符串（旧格式）"""
+    tasks = []
+    for item in raw or []:
+        if isinstance(item, str):
+            item = {"title": item}
+        if not isinstance(item, dict):
+            continue
+        title = " ".join(str(item.get("title") or "").split())
+        if not title:
+            continue
+        tasks.append({
+            "title": title,
+            "files": [str(f).strip() for f in item.get("files") or [] if str(f).strip()],
+            "done_when": " ".join(str(item.get("done_when") or "").split()),
+        })
+    return tasks
+
+
+def plan_tasks(plan: dict) -> list[dict]:
+    """计划的任务列表。旧计划只有 steps（字符串），补成没有完成标准的任务"""
+    tasks = plan.get("tasks")
+    if isinstance(tasks, list) and tasks:
+        return normalize_tasks(tasks)
+    return normalize_tasks(plan.get("steps"))
+
+
+def unfinished_plan_steps(session) -> list[dict]:
+    """正在执行的已批准计划里还没做完的项；没有在执行的计划返回空"""
+    from pi_coding_agent.builtin_extensions.todo import latest_todo
+
+    record = latest_todo(session)
+    if not record or record.get("source") != "plan":
+        return []
+    return [s for s in record["plan"] if s.get("status") != "completed"]
+
+
+def render_guard(left: list[dict]) -> str:
+    from pi_coding_agent.builtin_extensions.todo import MARKS
+
+    lines = [f"[系统提醒] 用户批准的计划还有 {len(left)} 项没完成：", ""]
+    for step in left:
+        lines.append(f"- {MARKS.get(step.get('status'), '[ ]')} {step['step']}")
+        if step.get("done_when"):
+            lines.append(f"  完成标准：{step['done_when']}")
+    lines += [
+        "",
+        "接着做下一项：先用 update_plan 把它标为 in_progress，做完按完成标准验证，再标 completed。",
+        ("如果确实做不下去（缺信息、被阻塞、需要用户决定），用 update_plan 写 explanation 调整清单，"
+         "然后告诉用户卡在哪里、需要什么。"),
+    ]
+    return "\n".join(lines)
 
 
 def normalize_questions(raw) -> list[dict]:
@@ -335,14 +444,35 @@ def _first_line(text: str) -> str:
     return ""
 
 
+def _cell(text: str) -> str:
+    return " ".join(str(text).split()).replace("|", "/") or "—"
+
+
+def task_table(tasks: list[dict]) -> list[str]:
+    """任务表（Markdown 表格）：# | 任务 | 完成标准 | 涉及文件；没有的列不画"""
+    with_done = any(t["done_when"] for t in tasks)
+    with_files = any(t["files"] for t in tasks)
+    header = ["#", "任务"] + (["完成标准"] if with_done else []) + (["涉及文件"] if with_files else [])
+    lines = ["| " + " | ".join(header) + " |", "|" + "---|" * len(header)]
+    for i, task in enumerate(tasks, 1):
+        row = [str(i), _cell(task["title"])]
+        if with_done:
+            row.append(_cell(task["done_when"]))
+        if with_files:
+            row.append(_cell("、".join(task["files"])))
+        lines.append("| " + " | ".join(row) + " |")
+    return lines
+
+
 def plan_markdown(plan: dict) -> str:
-    """给人看的计划（界面渲染成 Markdown）"""
+    """给人看的计划（界面渲染成 Markdown）：概述 + 任务表"""
     lines = []
     if plan.get("summary"):
         lines += [plan["summary"].strip(), ""]
-    lines.append("**任务**")
-    lines += [f"{i}. {s}" for i, s in enumerate(plan.get("steps") or [], 1)]
-    if plan.get("files"):
+    tasks = plan_tasks(plan)
+    lines.append(f"**任务（{len(tasks)} 项）**")
+    lines += ["", *task_table(tasks)]
+    if plan.get("files") and not any(t["files"] for t in tasks):
         lines += ["", "**涉及文件**：" + "、".join(f"`{f}`" for f in plan["files"])]
     if plan.get("questions"):
         lines += ["", "**待确认**", *[f"- {q}" for q in plan["questions"]]]
@@ -353,13 +483,24 @@ def render_plan_context(plan: dict, note: str) -> str:
     lines = ["## 当前计划", note, "", f"目标：{plan.get('title') or plan.get('summary', '')}", ""]
     if plan.get("summary") and plan.get("title"):
         lines += [plan["summary"], ""]
-    lines.append("步骤：")
-    lines += [f"{i}. {s}" for i, s in enumerate(plan.get("steps") or [], 1)]
+    lines.append("任务：")
+    lines += _task_lines(plan_tasks(plan))
     if plan.get("files"):
         lines += ["", "涉及文件：" + "、".join(plan["files"])]
     if plan.get("questions"):
         lines += ["", "待确认：", *[f"- {q}" for q in plan["questions"]]]
     return "\n".join(lines)
+
+
+def _task_lines(tasks: list[dict]) -> list[str]:
+    lines = []
+    for i, task in enumerate(tasks, 1):
+        lines.append(f"{i}. {task['title']}")
+        if task["done_when"]:
+            lines.append(f"   完成标准：{task['done_when']}")
+        if task["files"]:
+            lines.append(f"   涉及文件：{'、'.join(task['files'])}")
+    return lines
 
 
 def render_plan_as_task(plan: dict, extra: str = "") -> str:
@@ -368,7 +509,7 @@ def render_plan_as_task(plan: dict, extra: str = "") -> str:
     if plan.get("summary"):
         lines += [plan["summary"], ""]
     lines.append("任务清单（已写进 update_plan，第 1 项已设为 in_progress）：")
-    lines += [f"{i}. {s}" for i, s in enumerate(plan.get("steps") or [], 1)]
+    lines += _task_lines(plan_tasks(plan))
     if plan.get("files"):
         lines += ["", "涉及文件：" + "、".join(plan["files"])]
     if extra:
@@ -376,8 +517,11 @@ def render_plan_as_task(plan: dict, extra: str = "") -> str:
     lines += [
         "",
         "执行要求：",
-        "- 按清单顺序逐项完成。做完一项立刻用 update_plan 把它标为 completed，并把下一项设为 in_progress。",
-        "- 不做清单以外的改动。遇到计划没预料到的情况，先说明原因，再用 update_plan 调整清单（写 explanation）。",
-        "- 全部完成后，简要汇报改了什么、怎么验证的。",
+        ("- 按清单顺序逐项完成。每做完一项，先按它的「完成标准」实际验证（运行命令、跑测试），"
+         "验证通过再用 update_plan 标为 completed，同时把下一项设为 in_progress。"),
+        ("- 清单是用户批准的：不要删除、改写或跳过任务。确需调整（拆分、跳过、新增）时，"
+         "在 update_plan 里写 explanation 说明原因。"),
+        "- 不做清单以外的改动。",
+        "- 全部完成后汇报：每项改了什么、怎么验证的、结果如何。",
     ]
     return "\n".join(lines)

@@ -267,17 +267,17 @@ def test_plan_display() -> None:
     plan_events(renderer, "p1", [("读取项目结构", "completed"), ("分析压缩模块", "in_progress"),
                                  ("总结", "pending")])
     live = "\n".join(renderer._live_lines())
-    check("计划: 活动区显示勾选单", "✓ 读取项目结构" in live and "▸ 分析压缩模块" in live
-          and "○ 总结" in live, live)
+    check("计划: 活动区显示勾选单（带进度和序号）", "☰ 任务 1/3" in live and "✓ 1. 读取项目结构" in live
+          and "▸ 2. 分析压缩模块" in live and "○ 3. 总结" in live, live)
     check("计划: 不算工具调用", renderer.state.tool_total == 0 and "次工具" not in live, live)
     renderer.on_event(ev("tool_execution_start", tool_call_id="t1", tool_name="read",
                          arguments={"path": "a.py"}))
     live = "\n".join(renderer._live_lines())
-    check("计划: 执行别的工具时勾选单还在", "▸ 分析压缩模块" in live and "read" in live, live)
+    check("计划: 执行别的工具时勾选单还在", "▸ 2. 分析压缩模块" in live and "read" in live, live)
     renderer.on_event(ev("tool_execution_end", tool_call_id="t1", tool_name="read", is_error=False,
                          result=SimpleNamespace(content=[], details=None)))
     plan_events(renderer, "p2", [("全部", "in_progress"), ("一起", "in_progress")], is_error=True)
-    check("计划: 被拒绝的更新不显示", "▸ 分析压缩模块" in "\n".join(renderer._live_lines()))
+    check("计划: 被拒绝的更新不显示", "▸ 2. 分析压缩模块" in "\n".join(renderer._live_lines()))
     plan_events(renderer, "p3", [("读取项目结构", "completed"), ("分析压缩模块", "completed"),
                                  ("总结", "in_progress")])
     renderer.on_event(delta("text_delta", "结论。"))
@@ -288,8 +288,9 @@ def test_plan_display() -> None:
     summary = next(i for i, line in enumerate(lines) if line.startswith("✻ "))
     check("计划: 用时行只数真正的工具", "1 次工具 read" in lines[summary], lines[summary])
     check("计划: 最终勾选单写在用时行下面、回答上面",
-          lines[summary + 1:summary + 4] == ["  ✓ 读取项目结构", "  ✓ 分析压缩模块", "  ▸ 总结"]
-          and out.getvalue().index("▸ 总结") < out.getvalue().index("● 结论"), str(lines))
+          lines[summary + 1:summary + 5] == ["  ☰ 任务 2/3", "    ✓ 1. 读取项目结构",
+                                             "    ✓ 2. 分析压缩模块", "    ▸ 3. 总结"]
+          and out.getvalue().index("▸ 3. 总结") < out.getvalue().index("● 结论"), str(lines))
     before = len(out.getvalue())
     renderer.expand_last_turn()
     expanded = out.getvalue()[before:]
@@ -312,15 +313,21 @@ def test_plan_mode_display() -> None:
     renderer.on_event(ev("tool_execution_start", tool_call_id="s1", tool_name="submit_plan", arguments={}))
     renderer.on_event(ev("plan_proposed", plan={
         "title": "加超时配置", "summary": "## 思路\n把超时做成**可配置**。",
-        "steps": ["读 cfg.py", "改成读环境变量", "跑测试"], "files": ["cfg.py"], "questions": []}))
+        "steps": ["读 cfg.py", "改成读环境变量", "跑测试"],
+        "tasks": [{"title": "读 cfg.py", "files": ["cfg.py"], "done_when": "确认 TIMEOUT 的用法"},
+                  {"title": "改成读环境变量", "files": ["cfg.py"], "done_when": "PI_TIMEOUT=5 时生效"},
+                  {"title": "跑测试", "files": [], "done_when": "pytest 全部通过"}],
+        "files": ["cfg.py"], "questions": []}))
     renderer.on_event(ev("tool_execution_end", tool_call_id="s1", tool_name="submit_plan", is_error=False,
                          result=SimpleNamespace(content=[], details=None)))
     renderer.on_event(ev("agent_end", reason="terminated"))
     text = out.getvalue()
     lines = text.splitlines()
     check("计划块: 标题行", any(line.startswith("╭ 计划 加超时配置") for line in lines), text)
-    check("计划块: Markdown 排版、任务有序号", "│ 思路" in text and "│ 把超时做成可配置。" in text
-          and "│ 1. 读 cfg.py" in text and "│ 3. 跑测试" in text, text)
+    check("计划块: Markdown 排版", "│ 思路" in text and "│ 把超时做成可配置。" in text, text)
+    check("计划块: 任务表（序号、任务、完成标准、涉及文件）", "任务（3 项）" in text
+          and any("# " in line and "任务" in line and "完成标准" in line and "涉及文件" in line for line in lines)
+          and any("│ 2 │ 改成读环境变量" in line and "PI_TIMEOUT=5 时生效" in line for line in lines), text)
     check("计划块: 在用时行下面", text.index("✻ ") < text.index("╭ 计划"))
     check("计划块: submit_plan 不算工具调用", "次工具" not in text, text)
     check("计划块: 提交即停不显示「结束原因」", "结束原因" not in text, text)
@@ -331,20 +338,76 @@ def test_plan_mode_display() -> None:
                                                {"step": "跑测试", "status": "pending"}], explanation=""))
     renderer.on_event(ev("agent_start"))
     live = "\n".join(renderer._live_lines())
-    check("执行: 批准时生成的清单在执行这一轮一开始就显示", "▸ 读 cfg.py" in live and "○ 跑测试" in live, live)
+    check("执行: 批准时生成的清单在执行这一轮一开始就显示", "▸ 1. 读 cfg.py" in live and "○ 3. 跑测试" in live, live)
     plan_events(renderer, "u1", [("读 cfg.py", "completed"), ("改成读环境变量", "in_progress"),
                                  ("跑测试", "pending")])
     live = "\n".join(renderer._live_lines())
-    check("执行: 做完一项实时打勾", "✓ 读 cfg.py" in live and "▸ 改成读环境变量" in live, live)
+    check("执行: 做完一项实时打勾", "✓ 1. 读 cfg.py" in live and "▸ 2. 改成读环境变量" in live, live)
     start = len(out.getvalue())
     renderer.on_event(ev("agent_end", reason="stop"))
     tail = out.getvalue()[start:]
     check("执行: 一轮结束清单没做完时提示", "还有 2 项没完成" in tail, tail)
 
     renderer.on_event(ev("agent_start"))
-    check("执行: 下一轮清单还在", "▸ 改成读环境变量" in "\n".join(renderer._live_lines()))
+    check("执行: 下一轮清单还在", "▸ 2. 改成读环境变量" in "\n".join(renderer._live_lines()))
+    start = len(out.getvalue())
+    renderer.on_event(ev("todo_updated", plan=[{"step": "读 cfg.py", "status": "completed"},
+                                               {"step": "跑测试", "status": "in_progress"}],
+                         explanation="改成读环境变量已在上一轮顺手完成"))
+    check("执行: 调整清单时留一行原因", "↻ 调整计划：改成读环境变量已在上一轮顺手完成" in out.getvalue()[start:],
+          out.getvalue()[start:])
+
+    many = [{"step": f"第 {i} 项", "status": "completed" if i < 9 else "pending"} for i in range(1, 13)]
+    many[8]["status"] = "in_progress"
+    renderer.on_event(ev("todo_updated", plan=many, explanation=""))
+    live = "\n".join(renderer._live_lines())
+    check("执行: 项太多时围绕正在做的那项显示", "☰ 任务 8/12" in live and "▸  9. 第 9 项" in live
+          and "前 4 项已完成" in live and "○ 12. 第 12 项" in live and "第 1 项" not in live, live)
+    early = [{"step": f"第 {i} 项", "status": "completed" if i < 3 else "pending"} for i in range(1, 13)]
+    early[2]["status"] = "in_progress"
+    renderer.on_event(ev("todo_updated", plan=early, explanation=""))
+    live = "\n".join(renderer._live_lines())
+    check("执行: 后面的项太多时截掉并说明", "✓  2. 第 2 项" in live and "▸  3. 第 3 项" in live
+          and "… 还有 3 项" in live and "前 1 项已完成" in live, live)
     renderer.reset()
     check("换会话: 清单清掉", renderer.plan is None)
+
+
+def test_plan_guard_segment() -> None:
+    """回答之后被提醒继续（计划没做完）：后面算新的一段，最终回答前重新写用时行和最新清单"""
+    out = io.StringIO()
+    renderer = SessionRenderer(theme=Theme(ColorMode.NONE), stream=out)
+    steps = ["改 report", "改 storage"]
+
+    def answer(text: str) -> None:
+        renderer.on_event(delta("text_delta", text))
+        renderer.on_event(ev("message_end", message=SimpleNamespace(
+            role="assistant", content=[], stop_reason="stop", usage=None, text=lambda: text)))
+
+    def tool(call_id: str) -> None:
+        renderer.on_event(ev("tool_execution_start", tool_call_id=call_id, tool_name="bash", arguments={}))
+        renderer.on_event(ev("tool_execution_end", tool_call_id=call_id, tool_name="bash", is_error=False,
+                             result=SimpleNamespace(content=[], details=None)))
+
+    renderer.on_event(ev("agent_start"))
+    plan_events(renderer, "u0", [(steps[0], "in_progress"), (steps[1], "pending")])
+    tool("b1")
+    plan_events(renderer, "u1", [(steps[0], "completed"), (steps[1], "in_progress")])
+    answer("先到这里。")
+    renderer.on_event(ev("message_end", message=SimpleNamespace(
+        role="custom", details={"notice": "计划还有 1 项没完成，提醒模型继续（1/2）"}, text=lambda: "…")))
+    tool("b2")
+    tool("b3")
+    plan_events(renderer, "u2", [(steps[0], "completed"), (steps[1], "completed")])
+    answer("都做完了。")
+    renderer.on_event(ev("agent_end", reason="stop"))
+    lines = out.getvalue().splitlines()
+    summaries = [i for i, line in enumerate(lines) if line.startswith("✻ ")]
+    check("分段: 提醒之后另起一段用时行", len(summaries) == 2, str(lines))
+    check("分段: 第二段只数自己的工具", "2 次工具 bash ×2" in lines[summaries[1]]
+          and "1 次工具 bash" in lines[summaries[0]], str([lines[i] for i in summaries]))
+    check("分段: 最终回答上面是最新的清单", lines[summaries[1] + 1] == "  ✓ 任务 2/2"
+          and lines.index("● 都做完了。") > summaries[1] + 2, str(lines))
 
 
 def test_running_status() -> None:
@@ -414,6 +477,7 @@ async def main() -> int:
     test_prune_and_notice()
     test_plan_display()
     test_plan_mode_display()
+    test_plan_guard_segment()
     print("展开")
     await case_expand()
     print("状态行与回显")

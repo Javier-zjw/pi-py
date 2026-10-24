@@ -54,7 +54,7 @@ questions (1-4), each with 2-4 options and the recommended option marked. The us
 answers in the UI and they come back as the tool result; then continue in the same turn. \
 Don't ask about things with an obvious default: take the default and list it under questions \
 in the plan as an assumption. Don't write questions as plain text in your reply when \
-`ask_user` is available.
+`ask_user` is available, and don't repeat them in your reply before calling it.
 3. Submit. When the plan is decision complete (an implementer would not need to make any \
 decisions), call `submit_plan` exactly once:
    - title: a short name for the change
@@ -81,7 +81,8 @@ ASK_DESCRIPTION = (
     "Ask the user 1-4 multiple-choice questions and wait for the answers. Use it only for "
     "decisions that materially change the plan and that the repository cannot answer. Each "
     "question has 2-4 short options; mark the one you recommend. The UI always adds an option "
-    "for the user to type their own answer. Write questions and options in the user's language."
+    "for the user to type their own answer. Write questions and options in the user's language. "
+    "Don't repeat the questions or options in your reply text: the UI shows them."
 )
 
 ASK_PARAMETERS = {

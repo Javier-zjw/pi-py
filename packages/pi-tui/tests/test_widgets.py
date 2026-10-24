@@ -20,6 +20,7 @@ from pi_tui import (
     PickerState,
     SlashCommand,
     Theme,
+    display_width,
     match_commands,
     strip_ansi,
 )
@@ -126,19 +127,39 @@ def test_picker_state() -> None:
 
 
 def test_picker_render() -> None:
+    plain = Theme(ColorMode.NONE)
     state = PickerState(items(), index=0, choice_label="思考")
-    lines = [strip_ansi(line) for line in state.render("选择模型", 100, Theme(ColorMode.NONE))]
-    check("渲染: 标题行带按键说明", "选择模型" in lines[0] and "←→ 思考" in lines[0], lines[0])
-    check("渲染: 每项一行", len(lines) == 4, str(lines))
-    check("渲染: 选中行有 ❯ 和 ◀ ▶", lines[1].startswith("❯") and "◀ low ▶" in lines[1], lines[1])
-    check("渲染: 当前项标 ✓", "✓ 当前" in lines[1])
-    check("渲染: 不支持的行显示说明", "不支持思考" in lines[2], lines[2])
-    check("渲染: 未选中行只显示档位", "思考 off" in lines[3] and "◀" not in lines[3], lines[3])
-    narrow = [strip_ansi(line) for line in state.render("选择模型", 40, Theme(ColorMode.NONE))]
-    check("渲染: 窄屏时省掉说明", "Anthropic" not in narrow[1], narrow[1])
+    lines = [strip_ansi(line) for line in state.render("选择模型", 100, plain)]
+    rows = [line for line in lines if line.startswith(("│ ❯", "│  "))]
+    check("面板: 和上面的内容空一行", lines[0] == "", str(lines))
+    check("面板: 上边框写标题", lines[1].startswith("╭─ 选择模型 ─"), lines[1])
+    check("面板: 下边框是按键说明（数字直接选、←→ 次要选项）", lines[-1].startswith("╰─ ↑↓ 选择")
+          and "1-3 直接选" in lines[-1] and "←→ 思考" in lines[-1], lines[-1])
+    check("面板: 每项一行、带编号", len(lines) == 6 and len(rows) == 3
+          and "1. claude" in rows[0] and "3. gpt" in rows[2], str(lines))
+    check("面板: 不超过屏宽", all(display_width(line) <= 100 for line in lines),
+          str([display_width(line) for line in lines]))
+    check("渲染: 选中行有 ❯ 和 ◀ ▶", rows[0].startswith("│ ❯") and "◀ low ▶" in rows[0], rows[0])
+    check("渲染: 当前项标 ✓", "✓ 当前" in rows[0])
+    check("渲染: 不支持的行显示说明", "不支持思考" in rows[1], rows[1])
+    check("渲染: 未选中行只显示档位", "思考 off" in rows[2] and "◀" not in rows[2], rows[2])
+    narrow = [strip_ansi(line) for line in state.render("选择模型", 40, plain)]
+    check("渲染: 窄屏时省掉说明", "Anthropic" not in narrow[2], narrow[2])
     no_choices = PickerState([PickerItem("a"), PickerItem("b")])
-    header = strip_ansi(no_choices.render("会话", 80, Theme(ColorMode.NONE))[0])
-    check("渲染: 没有次要选项时不提示 ←→", "←→" not in header, header)
+    footer = strip_ansi(no_choices.render("会话", 80, plain)[-1])
+    check("渲染: 没有次要选项时不提示 ←→", "←→" not in footer, footer)
+
+    question = PickerState([PickerItem("统一改（推荐）", "list 也显示 10.00"), PickerItem("其他")])
+    lines = [strip_ansi(line) for line in question.render(
+        "list 命令的金额也统一显示两位小数吗？这一句故意写得很长，窄屏时要折行显示", 40, plain,
+        header="需要你选择 · 1/2")]
+    check("提问面板: 上边框写明需要选择和进度", lines[1].startswith("╭─ 需要你选择 · 1/2 ─"), lines[1])
+    body = [line for line in lines[2:] if line.startswith("│ ") and "1." not in line and "2." not in line]
+    check("提问面板: 问题在面板里，长问题折行", len(body) >= 2 and body[0].startswith("│ list 命令")
+          and all(display_width(line) <= 40 for line in lines), str(lines))
+
+    check("数字键: 选中对应项", question.select(2) and question.index == 1)
+    check("数字键: 超出范围不动", not question.select(3) and not question.select(0) and question.index == 1)
 
 
 def main() -> int:

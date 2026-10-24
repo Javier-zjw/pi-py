@@ -196,6 +196,47 @@ def test_live_region_host() -> None:
     check("宿主: 自己不写终端", stream.getvalue() == "", repr(stream.getvalue()))
 
 
+def test_viewer_state() -> None:
+    """全屏查看器的状态：选段落、展开收起、翻页、搜索（命中正文时自动展开）、渲染正好占满屏"""
+    from pi_tui import Section, ViewerState
+
+    plain = Theme(ColorMode.NONE)
+    sections = [Section(f"第 {i} 段", [f"正文 {i}-{j}" for j in range(5)]) for i in range(8)]
+    sections.append(Section("没有正文的段"))
+    state = ViewerState(sections, "上一轮的过程")
+    lines = [strip_ansi(line) for line in state.render(60, 10, plain)]
+    check("查看器: 正好占满屏（标题 + 内容 + 状态栏）", len(lines) == 10 and lines[0].startswith("上一轮的过程  9 段")
+          and lines[-1].startswith("第 1/9 段"), str(lines))
+    check("查看器: 选中行有 ❯，收起的有 ▸", lines[1] == "❯ ▸ 第 0 段" and lines[2] == "  ▸ 第 1 段", str(lines))
+    state.down()
+    state.toggle()
+    lines = [strip_ansi(line) for line in state.render(60, 10, plain)]
+    check("查看器: 展开后正文缩进显示", "❯ ▾ 第 1 段" in lines and "    │ 正文 1-0" in lines, str(lines))
+    state.cursor = 8
+    state.toggle()
+    check("查看器: 没有正文的段不能展开", not sections[8].expanded)
+    lines = [strip_ansi(line) for line in state.render(60, 10, plain)]
+    check("查看器: 光标走到下面时跟着滚动", "❯   没有正文的段" in lines and "❯ ▸ 第 0 段" not in lines, str(lines))
+    state.home()
+    state.page(1, 10)
+    check("查看器: 翻页后光标跟到屏幕里", state.cursor > 0 and state.offset > 0, f"{state.cursor} {state.offset}")
+    state.expand_all(False)
+    state.search("正文 6-3")
+    check("查看器: 搜索命中正文时跳过去并展开", state.cursor == 6 and sections[6].expanded and state.matches == [6])
+    state.search("第")
+    first = state.cursor
+    state.next_match()
+    check("查看器: n 下一个、绕回", state.cursor == first + 1 and len(state.matches) == 8)
+    state.next_match(-1)
+    state.next_match(-1)
+    check("查看器: N 上一个、绕回", state.cursor == 7, str(state.cursor))
+    state.search("没有这个词")
+    footer = strip_ansi(state.render(60, 10, plain)[-1])
+    check("查看器: 搜不到时状态栏说明", "没找到" in footer, footer)
+    state.expand_all(True)
+    check("查看器: e 全部展开（没正文的不算）", all(s.expanded for s in sections[:8]) and not sections[8].expanded)
+
+
 def main() -> int:
     print("命令补全")
     test_match_commands()
@@ -204,6 +245,7 @@ def main() -> int:
     test_picker_state()
     test_picker_render()
     test_live_region_host()
+    test_viewer_state()
     print()
     if FAILURES:
         print(f"{len(FAILURES)} 处失败：")

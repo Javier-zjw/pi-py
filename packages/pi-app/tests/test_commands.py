@@ -568,6 +568,43 @@ async def case_live_input() -> None:
         check("屏幕交接: 同一次交互里可重入，不会自己卡死", await asyncio.wait_for(nested(), 1) == "ok")
 
 
+async def case_details_viewer() -> None:
+    """ctrl+o / /expand：没有过程时提示；没有 prompt_toolkit 时照旧打印；全屏期间后台输出先攒着"""
+    import contextlib
+    import io as _io
+
+    from pi_app.app import ReaderHost
+
+    with Sandbox() as cwd:
+        app, out = make_app(cwd, [[ToolCall(id="r1", name="read", arguments={"path": "a.txt"})],
+                                  [TextContent(text="好")]])
+        start = len(out.getvalue())
+        await app.dispatch("/expand")
+        check("详情: 还没有过程时提示", "还没有可以查看的过程" in tail(out, start), tail(out, start))
+        (cwd / "a.txt").write_text("内容", "utf-8")
+        await app.send("读一下")
+        start = len(out.getvalue())
+        await app.dispatch("/expand")
+        check("详情: 没有 prompt_toolkit 的输入框时照旧打印出来", "上一轮详情" in tail(out, start)
+              and "read" in tail(out, start), tail(out, start))
+
+    class FakeReader:
+        def invalidate(self) -> None:
+            pass
+
+    host = ReaderHost(FakeReader())
+    buffer = _io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        host.print_above("第一行")
+        host.hold()
+        host.print_above("全屏时写的")
+        held = buffer.getvalue()
+        host.release()
+        host.print_above("之后")
+    check("全屏期间: 输出先攒着，关掉后按顺序打印", held == "第一行\n"
+          and buffer.getvalue() == "第一行\n全屏时写的\n之后\n", repr(buffer.getvalue()))
+
+
 # -- 信息类 ------------------------------------------------------------------ #
 
 async def case_info() -> None:
@@ -640,6 +677,10 @@ def test_live_input() -> None:
     asyncio.run(case_live_input())
 
 
+def test_details_viewer() -> None:
+    asyncio.run(case_details_viewer())
+
+
 def test_info() -> None:
     asyncio.run(case_info())
 
@@ -662,6 +703,7 @@ async def main() -> int:
     await case_plan_ask_user()
     await case_permissions_ui()
     await case_live_input()
+    await case_details_viewer()
     print("信息类")
     await case_info()
 

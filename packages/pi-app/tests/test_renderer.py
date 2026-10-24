@@ -96,13 +96,13 @@ async def case_collapsed_turn() -> None:
         check("用时: 带工具次数（工具名在活动区和 ctrl+o 里看）", "4 次工具" in summary[0]
               and "bash" not in summary[0], summary[0])
         check("用时: 失败数醒目标出", "1 失败" in summary[0], summary[0])
-        check("用时: 提示怎么展开", "ctrl+o 展开" in summary[0])
+        check("用时: 提示怎么看详情", "ctrl+o 详情" in summary[0])
         check("用时: 不带文字标签", "用时" not in text and "上下文" not in text, text)
         answer = next((i for i, line in enumerate(lines) if line.startswith("● ")), None)
         check("回答: 以 ● 开头，紧跟在用时下面", answer == 1, str(lines))
         check("回答: 按 Markdown 排版，列表缩进两格", answer is not None
               and lines[answer + 1].startswith("  • README.md"), str(lines[answer:answer + 3]))
-        check("留白: 用时行和回答之间空一行", "ctrl+o 展开\n\n● " in text, repr(text))
+        check("留白: 用时行和回答之间空一行", "ctrl+o 详情\n\n● " in text, repr(text))
         check("统计: 最后一行只有 token", lines[-1] == "↑4.1k · ↓344", lines[-1])
         check("统计: 不再每次调模型都打一行", "↑4130" not in text)
 
@@ -490,6 +490,54 @@ def test_tool_lines() -> None:
     check("状态栏: 模型 · 上下文占用 · 费用", footer.endswith("glm-5.2 · 上下文 18% · ¥0.012"), footer)
 
 
+def test_turn_sections() -> None:
+    """查看器里的段落：按发生顺序，标题一行说清做了什么，正文是全文；失败的工具默认展开"""
+    renderer = SessionRenderer(theme=Theme(ColorMode.NONE), stream=io.StringIO())
+    renderer.cwd = "/work"
+    renderer.on_event(ev("agent_start"))
+    renderer.on_event(delta("thinking_delta", "先看看入口"))
+    renderer.on_event(ev("tool_execution_start", tool_call_id="b1", tool_name="bash",
+                         arguments={"command": "pytest -q"}))
+    renderer.on_event(ev("tool_execution_end", tool_call_id="b1", tool_name="bash", is_error=True,
+                         result=SimpleNamespace(content=[SimpleNamespace(text="1 failed\nE assert 1 == 2")],
+                                                details={"exit_code": 1})))
+    renderer.on_event(ev("tool_execution_start", tool_call_id="e1", tool_name="edit",
+                         arguments={"path": "/work/app.py"}))
+    renderer.on_event(ev("tool_execution_end", tool_call_id="e1", tool_name="edit", is_error=False,
+                         result=SimpleNamespace(content=[], details={
+                             "path": "/work/app.py", "patch": "--- a//work/app.py\n+++ b//work/app.py\n-x\n+y"})))
+    renderer.on_event(ev("tool_execution_start", tool_call_id="r1", tool_name="read",
+                         arguments={"path": "/work/big.txt"}))
+    sections = renderer.turn_sections(renderer.turn)
+    titles = [strip(s.title) for s in sections]
+    check("段落: 思考、工具按顺序", len(sections) == 4 and titles[0].startswith("✻ 思考")
+          and "先看看入口" in titles[0], str(titles))
+    check("段落: 失败的命令标题带错误、默认展开、正文有命令和输出", titles[1].startswith("✗ bash  pytest -q")
+          and sections[1].expanded and strip(sections[1].body[0]) == "$ pytest -q"
+          and "E assert 1 == 2" in strip("\n".join(sections[1].body)), str(sections[1]))
+    body = [strip(line) for line in sections[2].body]
+    check("段落: edit 正文是 diff，去掉带路径的文件头", body == ["-x", "+y"] and not sections[2].expanded, str(body))
+    check("段落: 还在跑的工具标 ⏺ 运行中", titles[3].startswith("⏺ read") and "运行中" in titles[3], titles[3])
+    check("段落: 没有过程时为空", renderer.turn_sections(None) == [])
+
+
+def test_welcome() -> None:
+    """启动欢迎框：目录（家目录缩写成 ~）、模型和思考档位、模式；框下一行常用操作"""
+    import os
+
+    out = io.StringIO()
+    renderer = SessionRenderer(theme=Theme(ColorMode.NONE), stream=out)
+    renderer.permission = "自动接受文件修改"
+    renderer.header(os.path.expanduser("~/proj"), "fake/glm-5.2", "high")
+    lines = out.getvalue().splitlines()
+    check("欢迎框: 有边框、每行等宽", lines[0].startswith("╭") and lines[6].startswith("╰")
+          and len({display_width(line) for line in lines[:7]}) == 1, str(lines))
+    text = "\n".join(lines)
+    check("欢迎框: 目录、模型、档位、模式、权限", "目录  ~/proj" in text and "fake/glm-5.2 · 思考 high" in text
+          and "执行模式 · 权限 自动接受文件修改" in text, text)
+    check("欢迎框: 下面一行常用操作", "ctrl+o 上一轮详情" in lines[7] and "Esc 中断" in lines[7], lines[7])
+
+
 def test_code_highlight() -> None:
     """代码块按语言着色；没写语言的不上色；表格可以比正文宽"""
     from pi_tui import highlight, render_markdown
@@ -613,6 +661,8 @@ async def main() -> int:
     await case_expand()
     print("状态行与回显")
     test_tool_lines()
+    test_turn_sections()
+    test_welcome()
     test_code_highlight()
     await case_steering_echo()
     test_user_echo_multiline()

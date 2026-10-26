@@ -15,6 +15,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+from pi_coding_agent.mentions import user_words
 from pi_coding_agent.session import list_sessions
 from pi_coding_agent.session.entries import entry_from_dict
 
@@ -273,7 +274,7 @@ def read_session_file(path: str | Path) -> dict[str, Any]:
         role = getattr(message, "role", "")
 
         if role == "user":
-            current = HistoryTurn(user=message.text(), tools=[], usage={})
+            current = HistoryTurn(user=user_words(message), tools=[], usage={})
             turns.append(current)
         elif role == "assistant":
             if current is None:

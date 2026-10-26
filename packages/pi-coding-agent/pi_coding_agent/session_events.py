@@ -25,6 +25,14 @@ class PlanProposedEvent:
 
 
 @dataclass
+class AttachmentsEvent:
+    """发送前 @ 附上了哪些文件 / 图片（items: [{label, kind, note}]），和没能附上的原因（warnings）"""
+    items: list[dict[str, Any]] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    type: Literal["attachments"] = "attachments"
+
+
+@dataclass
 class ProgressEvent:
     """耗时操作（扩展命令，如 /mcp add 连服务器）进行到哪一步：界面在转圈后面显示这句话"""
     text: str

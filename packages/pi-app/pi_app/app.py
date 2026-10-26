@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from pi_coding_agent import SessionManager, create_agent_session, create_agent_session_services
+from pi_coding_agent.mentions import user_words
 from pi_coding_agent.text import sanitize
 from pi_tui import (
     SUSPENDED,
@@ -118,6 +119,19 @@ class App:
                 self._last_input = time.monotonic()     # 刚在选择器里操作过
                 self._resumed.set()
 
+    def paste_image(self) -> str | None:
+        """剪贴板里的截图存到 ~/.pi/agent/images/，返回插进输入框的 @路径；不是图片返回 None。
+        在线程里调（osascript 等要几百毫秒），不碰界面"""
+        from pi_tui.clipboard import save_clipboard_image
+
+        folder = Path(self.agent_dir or Path.home() / ".pi" / "agent").expanduser() / "images"
+        path = save_clipboard_image(folder)
+        if path is None:
+            return None
+        home = Path.home()
+        shown = f"~/{path.relative_to(home).as_posix()}" if path.is_relative_to(home) else str(path)
+        return f'@"{shown}"'        # 家目录写成 ~，输入框里短一点；发送时 @ 会展开
+
     def attention(self, message: str) -> None:
         """需要用户时提醒（响铃 / 系统通知）：只在交互模式、且离用户上次输入超过 minSeconds 秒时——
         一直盯着屏幕的人不需要被响；两秒内不重复响（一轮结束紧接着弹「执行这个计划？」）"""
@@ -191,7 +205,7 @@ class App:
         """一轮结束了（中断、出错）还没送到的插话：从队列里拿出来放回输入框，别悄悄丢了"""
         left = self.session.agent.steering_queue.take()
         self.renderer.queued.clear()
-        texts = [m.text() for m in left if getattr(m, "role", "") == "user"]
+        texts = [user_words(m) for m in left if getattr(m, "role", "") == "user"]     # 不带 @ 附上的内容
         if not texts:
             return
         text = "\n".join(texts)
@@ -591,6 +605,8 @@ class App:
             on_escape=self.interrupt,
             on_interrupt=self._on_ctrl_c,
             background=self.theme.background,
+            files_root=lambda: self.session.cwd,     # 输入 @ 补全文件路径
+            on_paste_image=self.paste_image,         # ctrl+v / alt+v 粘贴截图
         )
         if self.reader.rich:
             # 输入框常驻：一轮在后台跑，活动区画在输入框上方（由 prompt_toolkit 重画）

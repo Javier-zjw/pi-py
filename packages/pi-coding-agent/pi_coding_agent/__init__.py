@@ -32,7 +32,13 @@ from .model_runtime import ModelRuntime
 from .prompt import BASE_SYSTEM_PROMPT, ContextFile, build_system_prompt, find_context_files
 from .resources import DefaultResourceLoader, ResourceLoader
 from .session import SessionManager
-from .session_events import ModeChangedEvent, PlanProposedEvent, ProgressEvent, TodoUpdatedEvent
+from .session_events import (
+    AttachmentsEvent,
+    ModeChangedEvent,
+    PlanProposedEvent,
+    ProgressEvent,
+    TodoUpdatedEvent,
+)
 from .settings import CONFIG_DIR_NAME, SettingsManager
 from .skills import PromptTemplate, Skill, discover_prompts, discover_skills, skills_block
 from .text import has_surrogates, read_text_lenient, sanitize, sanitize_deep, stream_decoder
@@ -49,6 +55,7 @@ __version__ = "0.1.0"
 __all__ = [
     "AgentSession",
     "AgentSessionServices",
+    "AttachmentsEvent",
     "BASE_SYSTEM_PROMPT",
     "CONFIG_DIR_NAME",
     "Command",

@@ -23,16 +23,14 @@ for _p in (HERE.parents[1], PACKAGES / "pi-tui", PACKAGES / "pi-coding-agent",
            PACKAGES / "pi-coding-agent" / "tests", PACKAGES / "pi-agent", PACKAGES / "pi-ai"):
     sys.path.insert(0, str(_p))
 
-from fakes import FAKE_MODEL, Sandbox, fake_models  # noqa: E402
-
+from fakes import FAKE_MODEL, Sandbox, fake_models
 from pi_agent import CustomMessage
-from pi_ai import TextContent, ThinkingContent, ToolCall, Usage, UserMessage  # noqa: E402
-from pi_tui import Theme, display_width, strip_ansi  # noqa: E402
-from pi_tui.theme import ColorMode  # noqa: E402
-
-from pi_app.renderer import SLOT_LINES, SessionRenderer  # noqa: E402
-from pi_coding_agent import ModelRuntime, SessionManager  # noqa: E402
-from pi_coding_agent.agent_session import AgentSession, create_agent_session_services  # noqa: E402
+from pi_ai import TextContent, ThinkingContent, ToolCall, Usage, UserMessage
+from pi_app.renderer import SLOT_LINES, SessionRenderer
+from pi_coding_agent import ModelRuntime, SessionManager
+from pi_coding_agent.agent_session import AgentSession, create_agent_session_services
+from pi_tui import Theme, display_width, strip_ansi
+from pi_tui.theme import ColorMode
 
 VERBOSE = "-v" in sys.argv
 FAILURES: list[str] = []
@@ -147,7 +145,7 @@ def delta(kind: str, text: str):
 def test_live_slot() -> None:
     """思考、过渡话、工具共用活动区的一块位置，后来的顶掉先来的；第一行是本轮用时"""
     renderer = SessionRenderer(theme=Theme(ColorMode.NONE), stream=io.StringIO())
-    live = lambda: "\n".join(renderer._live_lines())  # noqa: E731
+    live = lambda: "\n".join(renderer._live_lines())
     renderer.on_event(ev("agent_start"))
     renderer.state.turn_started = time.time() - 3.0
     renderer.on_event(ev("turn_start"))
@@ -749,8 +747,39 @@ def test_interim_text() -> None:
     asyncio.run(case_interim_text())
 
 
+def test_attachments() -> None:
+    asyncio.run(case_attachments())
+
+
 def test_steering_echo() -> None:
     asyncio.run(case_steering_echo())
+
+
+async def case_attachments() -> None:
+    """@文件：发送前一行列出附上了什么，附不上的（看不了图）单独提醒；回答照常"""
+    with Sandbox() as cwd:
+        (cwd / "README.md").write_text("# demo\n说明文档\n", "utf-8")
+        (cwd / "shot.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 20)
+        models, _ = fake_models([[TextContent(text="看过了")]])
+        services = create_agent_session_services(cwd=cwd, agent_dir=cwd / "agent",
+                                                 model_runtime=ModelRuntime(models, cwd / "agent"))
+        session = AgentSession(services, SessionManager.in_memory(cwd), model=FAKE_MODEL, tools=[])
+        out = io.StringIO()
+        renderer = SessionRenderer(theme=Theme(ColorMode.NONE), stream=out)
+        session.subscribe(renderer.on_event)
+        await session.prompt("看看 @README.md 和 @shot.png")
+        renderer.stop()
+        lines = out.getvalue().splitlines()
+        if VERBOSE:
+            print(out.getvalue())
+        attached = [i for i, line in enumerate(lines) if "附上：" in line]
+        check("附件: 列出附上的文件和行数", len(attached) == 1 and "README.md（2 行）" in lines[attached[0]]
+              and "shot.png" not in lines[attached[0]], "\n".join(lines))
+        check("附件: 看不了图的模型单独提醒", any("⚠" in line and "shot.png" in line and "models.json" in line
+                                             for line in lines), "\n".join(lines))
+        summary = next((i for i, line in enumerate(lines) if line.startswith("✻ ")), -1)
+        check("附件: 写在这一轮的用时行之前", attached and 0 <= attached[0] < summary, "\n".join(lines))
+        check("附件: 文件内容不出现在屏幕上", "说明文档" not in out.getvalue())
 
 
 async def main() -> int:
@@ -779,6 +808,7 @@ async def main() -> int:
     test_user_echo_multiline()
     test_user_echo_long()
     test_footer_narrow()
+    await case_attachments()
 
     print()
     if FAILURES:

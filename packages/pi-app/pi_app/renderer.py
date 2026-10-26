@@ -47,6 +47,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, TextIO
 
+from pi_coding_agent.mentions import user_words
 from pi_tui import (
     LiveRegion,
     MarkdownStream,
@@ -550,7 +551,8 @@ class SessionRenderer:
                 self._emit([f"{INDENT}{self.theme.warn('⚑')} {self.theme.muted(details['notice'])}"])
                 self._new_segment()
                 return
-            text = message.text()
+            # 用户消息只取原话：@ 附上的文件内容在后面的文本块里，不回显
+            text = user_words(message) if role == "user" else message.text()
             if text.strip() == self.state.own_prompt.strip():
                 self.state.own_prompt = ""
                 return
@@ -790,6 +792,18 @@ class SessionRenderer:
         self.ticker.stop()
         self.live.finalize()
 
+    def _on_attachments(self, event) -> None:
+        """发送前 @ 附上了什么：一行列出；附不上的（看不了图、太大、二进制）各一行提醒"""
+        t = self.theme
+        items = [f"{item['label']}（{item['note']}）" if item.get("note") else item["label"]
+                 for item in event.items if item.get("kind") != "skipped"]
+        lines = []
+        if items:
+            lines.append(t.muted(f"{INDENT}附上：" + "、".join(items)))
+        lines += [t.warn(f"{INDENT}⚠ {warning}") for warning in event.warnings]
+        if lines:
+            self._emit(lines)
+
     def _on_progress(self, event) -> None:
         """扩展报告进行到哪一步：只在有命令在跑、或一轮开始前的准备阶段显示（后台预连接等不打扰输入框）"""
         if self._busy_since is not None:
@@ -889,7 +903,7 @@ class SessionRenderer:
         for message in messages:
             role = getattr(message, "role", None)
             if role == "user":
-                text = _message_text(message)
+                text = user_words(message).strip()
                 if text:
                     pairs.append((text, ""))
             elif role == "assistant" and pairs:

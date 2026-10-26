@@ -30,7 +30,8 @@ def _text(content: object) -> str:
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        return "".join(b.get("text", "") for b in content if isinstance(b, dict))
+        # 第一个文本块是用户的原话；后面的是 @ 附上的文件内容，不进标题
+        return next((b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"), "")
     return ""
 
 

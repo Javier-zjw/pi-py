@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .paths import ProjectIndex, mention_token, path_candidates
 from .terminal import quiet_cpr
 from .width import terminal_height
 
@@ -104,6 +105,37 @@ class SlashCompleter(Completer):
                              display=f"/{command.name}", display_meta=command.description)
 
 
+class MentionCompleter(Completer):
+    """``@`` 后面补文件路径（见 paths.py）。root 可以是函数：会话换了目录时现取"""
+
+    def __init__(self, root: str | Callable[[], str]) -> None:
+        self.root = root
+        self.index = ProjectIndex()
+
+    def get_completions(self, document, complete_event):
+        token = mention_token(document.text_before_cursor)
+        if token is None:
+            return
+        partial, typed = token
+        root = self.root() if callable(self.root) else self.root
+        for candidate in path_candidates(root, partial, self.index):
+            yield Completion(candidate.insert, start_position=-typed, display=candidate.display,
+                             display_meta="目录" if candidate.is_dir else "")
+
+
+class _Completers(Completer):
+    """光标在 @词 里补路径，否则补命令"""
+
+    def __init__(self, slash: Completer | None, mentions: Completer | None) -> None:
+        self.slash, self.mentions = slash, mentions
+
+    def get_completions(self, document, complete_event):
+        if self.mentions is not None and mention_token(document.text_before_cursor) is not None:
+            yield from self.mentions.get_completions(document, complete_event)
+        elif self.slash is not None:
+            yield from self.slash.get_completions(document, complete_event)
+
+
 # 菜单不用 prompt_toolkit 默认的灰底白块：透明底；高亮行沿用默认的 reverse，配上主题青色成一条青色底条
 MENU_STYLE = {
     "completion-menu": "bg:default",
@@ -160,9 +192,12 @@ class LineReader:
             on_escape: Callable[[], Any] | None = None,
             on_interrupt: Callable[[str], bool] | None = None,
             background: str = "dark",
+            files_root: str | Callable[[], str] | None = None,
+            on_paste_image: Callable[[], str | None] | None = None,
     ) -> None:
         self.session: Any = None
         self.completer: SlashCompleter | None = None
+        self.mentions: MentionCompleter | None = None
         self._active = False
         self._done = asyncio.Event()
         self._done.set()
@@ -190,6 +225,39 @@ class LineReader:
             """补全命令名并留一个空格，接着输参数"""
             self._accept_command(event.current_buffer)
             event.current_buffer.insert_text(" ")
+
+        in_mention = Condition(self._in_mention)
+
+        @bindings.add("enter", filter=in_input & has_completions & in_mention)
+        @bindings.add("tab", filter=in_input & in_mention)
+        def _(event) -> None:
+            """@ 菜单里：回车 / Tab 选中路径而不是发送；目录接着往下补，文件后面留个空格"""
+            buffer = event.current_buffer
+            state = buffer.complete_state
+            if state is None or not state.completions:
+                buffer.start_completion(select_first=True)
+                return
+            completion = state.current_completion or state.completions[0]
+            buffer.apply_completion(completion)
+            if completion.text.rstrip('"').endswith("/"):
+                buffer.start_completion(select_first=False)
+            else:
+                buffer.insert_text(" ")
+
+        if on_paste_image is not None:
+            async def paste_image(event) -> None:
+                """剪贴板里的截图存成文件，在光标处插入 @路径（发送时作为图片附上）"""
+                buffer = event.current_buffer
+                text = await asyncio.get_running_loop().run_in_executor(None, on_paste_image)
+                if text:
+                    before = buffer.document.text_before_cursor
+                    buffer.insert_text(("" if not before or before[-1].isspace() else " ") + text + " ")
+                else:
+                    event.app.output.bell()     # 剪贴板里不是图片
+
+            # ctrl+v；Windows Terminal 等把 ctrl+v 留给自己粘贴文字，那里用 alt+v
+            bindings.add("c-v", filter=in_input)(paste_image)
+            bindings.add("escape", "v", filter=in_input)(paste_image)
 
         @bindings.add("c-c", filter=in_input)
         def _(event) -> None:
@@ -221,14 +289,17 @@ class LineReader:
 
         if commands is not None:
             self.completer = SlashCompleter(commands)
+        if files_root is not None:
+            self.mentions = MentionCompleter(files_root)
+        completer = _Completers(self.completer, self.mentions) if (self.completer or self.mentions) else None
         self.session = PromptSession(
             history=history,
             key_bindings=bindings,
             multiline=False,
-            completer=self.completer,
+            completer=completer,
             # 边打边补；和 ↑ 翻历史搜索冲突，二选一时保留补全（有补全器时才开）
-            complete_while_typing=self.completer is not None,
-            enable_history_search=self.completer is None,
+            complete_while_typing=completer is not None,
+            enable_history_search=completer is None,
             erase_when_done=erase_when_done,
             style=Style.from_dict(MENU_STYLE_LIGHT if background == "light" else MENU_STYLE),
             # 固定预留会让输入行下面一直空着一大块；菜单空间由 _input_height 按需撑开
@@ -261,7 +332,7 @@ class LineReader:
             input_window.dont_extend_height = to_filter(True)
         # 高度由 _input_height 决定：有命令候选时撑开放菜单；粘贴大段文字时不超过半屏，框内滚动
         input_window.height = self._input_height
-        if self.completer is not None:
+        if completer is not None:
             self.session.default_buffer.on_completions_changed += _highlight_first
 
     def _input_height(self) -> Dimension:
@@ -275,13 +346,21 @@ class LineReader:
         if get_app().is_done:
             return Dimension()
         cap = max(INPUT_MIN_ROWS, terminal_height() // 2)
+        state = buffer.complete_state
+        count = 0
         if self.completer is not None:
-            state = buffer.complete_state
             text = state.original_document.text if state is not None else buffer.text
             count = len(self.completer.matches(text))
-            if count:
-                return Dimension(min=min(buffer.document.line_count, cap) + min(count, MENU_ROWS))
+        if not count and self.mentions is not None and state is not None and state.completions \
+                and mention_token(state.original_document.text_before_cursor) is not None:
+            count = len(state.completions)      # @ 菜单：路径候选是异步算的，按算出来的撑开
+        if count:
+            return Dimension(min=min(buffer.document.line_count, cap) + min(count, MENU_ROWS))
         return Dimension(max=cap)
+
+    def _in_mention(self) -> bool:
+        return self.mentions is not None and \
+            mention_token(self.session.default_buffer.document.text_before_cursor) is not None
 
     def _typing_command(self) -> bool:
         text = self.session.default_buffer.document.text_before_cursor

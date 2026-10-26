@@ -42,6 +42,8 @@ def _model_from_json(d: dict[str, Any]) -> Model:
         context_window=d.get("contextWindow", 128_000),
         max_tokens=d.get("maxTokens", 8192),
         reasoning=d.get("reasoning", False),
+        # 能看图的模型写 "input": ["text", "image"]（同 TS 版 pi）；不写就只收文字，@ 的图片不会发给它
+        input_modalities=tuple(d.get("input") or ("text",)),
         base_url=d.get("baseUrl"),
         prompt_cache=d.get("promptCache"),
         reasoning_passback=d.get("reasoningPassback"),

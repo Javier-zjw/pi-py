@@ -24,7 +24,6 @@ for _p in (HERE.parents[1], PACKAGES / "pi-tui", PACKAGES / "pi-coding-agent",
     sys.path.insert(0, str(_p))
 
 from fakes import FAKE_MODEL, Sandbox, fake_models
-
 from pi_ai import TextContent, ToolCall
 from pi_app.app import App
 from pi_app.commands import ago, model_items, thinking_choices, usage_bar
@@ -747,6 +746,53 @@ async def case_info() -> None:
         check("/session 是 /status 的别名", "fake/thinker" in tail(out, start))
 
 
+async def case_mentions() -> None:
+    """粘贴截图存进 ~/.pi/agent/images 并插 @路径；@文件 发送后回显和恢复会话的回顾都只有原话"""
+    from pi_tui import clipboard
+
+    with Sandbox() as cwd:
+        (cwd / "README.md").write_text("# demo\n说明文档\n")
+        app, out = make_app(cwd, [[TextContent(text="看过了")]])
+        real = clipboard.save_clipboard_image
+        saved: list[Path] = []
+
+        def fake_save(folder):
+            Path(folder).mkdir(parents=True, exist_ok=True)
+            path = Path(folder) / "clipboard-1.png"
+            path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 20)
+            saved.append(path)
+            return path
+        try:
+            clipboard.save_clipboard_image = fake_save
+            inserted = app.paste_image()
+            clipboard.save_clipboard_image = lambda folder: None
+            nothing = app.paste_image()
+        finally:
+            clipboard.save_clipboard_image = real
+        check("粘贴截图: 存到 agent 目录下的 images、插入带引号的 @路径",
+              saved and saved[0].parent == cwd / "agent" / "images" and inserted == f'@"{saved[0]}"', inserted)
+        real_home = os.environ.get("HOME")
+        try:
+            os.environ["HOME"] = str(cwd)
+            clipboard.save_clipboard_image = fake_save
+            short = app.paste_image()
+        finally:
+            clipboard.save_clipboard_image = real
+            if real_home is not None:
+                os.environ["HOME"] = real_home
+        check("粘贴截图: 在家目录下的写成 ~/", short == '@"~/agent/images/clipboard-1.png"', short)
+        check("粘贴截图: 剪贴板里不是图片返回 None", nothing is None)
+
+        start = len(out.getvalue())
+        await app.send(f"看看 @README.md 和 {inserted}")
+        shown = tail(out, start)
+        check("@文件: 屏幕上列出附件、不出现文件内容", "附上：README.md（2 行）" in shown
+              and "说明文档" not in shown and "<attachments>" not in shown, shown)
+        check("@文件: 看不了图的模型提醒一行", "⚠ 当前模型不支持看图" in shown, shown)
+        recap = "\n".join(app.renderer.recap(app.session.messages))
+        check("@文件: 恢复会话的回顾只有原话", "看看 @README.md" in recap and "说明文档" not in recap, recap)
+
+
 def test_command_table() -> None:
     asyncio.run(case_command_table())
 
@@ -803,6 +849,10 @@ def test_slow_command() -> None:
     asyncio.run(case_slow_command())
 
 
+def test_mentions() -> None:
+    asyncio.run(case_mentions())
+
+
 def test_info() -> None:
     asyncio.run(case_info())
 
@@ -829,6 +879,7 @@ async def main() -> int:
     await case_attention()
     await case_mcp_warmup()
     await case_slow_command()
+    await case_mentions()
     print("信息类")
     await case_info()
 

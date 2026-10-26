@@ -14,6 +14,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from pi_coding_agent.mentions import user_words
+
 # 工具参数里最值得展示的字段，别把整个 JSON 甩给前端
 SUMMARY_KEYS = ("path", "command", "pattern", "url", "query", "old_text")
 
@@ -134,7 +136,7 @@ class EventTranslator:
                 if notice.get("quiet"):
                     return []
                 return [{"type": "injected", "text": notice["notice"], "notice": True}]
-            text = message.text()
+            text = user_words(message) if role == "user" else message.text()     # 不含 @ 附上的文件内容
             if text.strip() and text.strip() == self.own_prompt.strip():
                 # 用户自己提交的那条：前端在 send() 时就已经渲染了
                 self.own_prompt = ""
@@ -228,6 +230,13 @@ class EventTranslator:
         return [{"type": "injected", "notice": True,
                  "text": f"⟳ {event.error[:120]} · {event.delay:g}s 后第 "
                          f"{event.attempt}/{event.max_attempts} 次重试"}]
+
+    def _on_attachments(self, event) -> list[dict]:
+        # @文件附上了什么、附不上的提醒：同样复用说明帧
+        items = [f"{i['label']}（{i['note']}）" if i.get("note") else i["label"]
+                 for i in event.items if i.get("kind") != "skipped"]
+        frames = [{"type": "injected", "notice": True, "text": "附上：" + "、".join(items)}] if items else []
+        return frames + [{"type": "injected", "notice": True, "text": f"⚠ {w}"} for w in event.warnings]
 
     def _on_agent_end(self, event) -> list[dict]:
         return [{"type": "done", "reason": event.reason, "elapsed": self.elapsed}]

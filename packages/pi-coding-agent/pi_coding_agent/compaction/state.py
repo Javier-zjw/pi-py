@@ -27,6 +27,7 @@ from typing import Any
 from pi_agent import AgentMessage
 from pi_ai import ToolResultMessage, UserMessage
 
+from ..mentions import user_words
 from .budget import estimate_text_tokens
 
 STATE_VERSION = 1
@@ -81,7 +82,7 @@ def extract_facts(messages: Sequence[AgentMessage], cwd: str | None = None) -> d
 
     for m in messages:
         if isinstance(m, UserMessage):
-            text = m.text().strip()
+            text = user_words(m).strip()     # 只要原话，不要 @ 附上的文件内容
             if text:
                 facts["userMessages"].append(
                     {"at": m.timestamp, "text": _clip_middle(text, USER_MESSAGE_MAX_CHARS)}

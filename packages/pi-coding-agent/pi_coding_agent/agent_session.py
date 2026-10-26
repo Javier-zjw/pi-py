@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterable, Sequence
@@ -28,6 +29,7 @@ from pi_ai import (
     AssistantMessage,
     ImageContent,
     Model,
+    TextContent,
     ThinkingLevel,
     Tool,
     ToolResultMessage,
@@ -604,14 +606,42 @@ class AgentSession:
             self,
             text: str,
             images: Iterable[ImageContent] | None = None,
-            expand_prompt_templates: bool = True
+            expand_prompt_templates: bool = True,
+            expand_mentions: bool = True,
     ) -> list[AgentMessage]:
         if expand_prompt_templates:
             text = self.expand_prompt_template(text)
+        message: AgentMessage | str = text
+        extra = ""
+        if expand_mentions:
+            message, extra = self._attach_mentions(text, images)
+            images = None
         await self._compaction_idle.wait()
         # 先压缩、后执行：新请求本身不参与压缩，压缩完成后才追加
-        await self._prepare_run(extra_text=text)
-        return await self.agent.prompt(text, images)
+        await self._prepare_run(extra_text=text + extra)
+        return await self.agent.prompt(message, images)
+
+    def _attach_mentions(self, text: str, images: Iterable[ImageContent] | None):
+        """@文件 / 拖进来的图片 → 用户消息的附件块（见 mentions.py）。返回 (消息, 附件文字)。
+        原话、附件文字、图片分成几个块：原话还是原话，压缩时提取用户原话不会被文件内容撑大"""
+        from .mentions import expand_mentions
+        from .session_events import AttachmentsEvent
+
+        model = self.agent.state.model
+        vision = model is None or "image" in (model.input_modalities or ())
+        expanded = expand_mentions(text, self.cwd, vision=vision)
+        all_images = list(images or []) + expanded.images
+        if expanded.attachments or expanded.warnings:
+            self._emit(AttachmentsEvent(
+                items=[{"label": a.label, "kind": a.kind, "note": a.note} for a in expanded.attachments],
+                warnings=expanded.warnings))
+        if not expanded.context and not all_images:
+            return text, ""
+        content: list[Any] = [TextContent(text=text)]
+        if expanded.context:
+            content.append(TextContent(text=expanded.context))
+        content.extend(all_images)
+        return UserMessage(content=content, timestamp=time.time()), expanded.context
 
     async def _prepare_run(self, extra_text: str = "") -> None:
         """每次运行前（新请求或续跑）：模式、扩展钩子、按需压缩"""
@@ -651,11 +681,12 @@ class AgentSession:
         self._base_tools = list(tools)
         self.agent.set_tools(list(self._base_tools))
 
-    def steer(self, text: str) -> None:
-        self.agent.steer(text)
+    def steer(self, text: str | AgentMessage) -> None:
+        """运行中插话：用户打的字里的 @文件 同样附上内容（扩展插的消息对象原样送）"""
+        self.agent.steer(self._attach_mentions(text, None)[0] if isinstance(text, str) else text)
 
-    def follow_up(self, text: str) -> None:
-        self.agent.follow_up(text)
+    def follow_up(self, text: str | AgentMessage) -> None:
+        self.agent.follow_up(self._attach_mentions(text, None)[0] if isinstance(text, str) else text)
 
     def abort(self) -> None:
         if self._compaction_cancel is not None:

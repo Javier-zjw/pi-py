@@ -318,10 +318,125 @@ def test_background_and_notify() -> None:
         sys.__stdout__ = real
 
 
+def make_tree(root: Path) -> None:
+    (root / "src" / "pi_app").mkdir(parents=True)
+    (root / "src" / "pi_app" / "renderer.py").write_text("")
+    (root / "src" / "app.py").write_text("")
+    (root / "README.md").write_text("")
+    (root / "my notes.txt").write_text("")
+    (root / ".env").write_text("")
+    (root / "node_modules" / "left-pad").mkdir(parents=True)
+    (root / "node_modules" / "left-pad" / "index.js").write_text("")
+
+
+def test_mention_paths() -> None:
+    import tempfile
+
+    from pi_tui.paths import ProjectIndex, mention_token, path_candidates
+
+    check("@词: 行首和空白后才算", mention_token("看 @src/a") == ("src/a", 5)
+          and mention_token("@") == ("", 0) and mention_token("a@b") is None
+          and mention_token("@src/app.py 后面") is None)
+    check("@词: 引号和转义空格", mention_token('@"my no') == ("my no", 6)
+          and mention_token("@my\\ no") == ("my no", 6))
+    check("@词: 中文标点结束路径", mention_token("@app.py，") is None)
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        make_tree(root)
+        index = ProjectIndex()
+        found = [c.display for c in path_candidates(tmp, "", index)]
+        check("候选: 空 @ 列顶层，目录在前，跳过隐藏和 node_modules",
+              found == ["src/", "my notes.txt", "README.md"], str(found))
+        found = [c.display for c in path_candidates(tmp, "ren", index)]
+        check("候选: 一个词在整个项目里模糊找", found == ["src/pi_app/renderer.py"], str(found))
+        found = [c.display for c in path_candidates(tmp, "app", index)]
+        check("候选: 文件名开头的排前面", found[:2] == ["src/app.py", "src/pi_app/"], str(found))
+        found = [(c.insert, c.is_dir) for c in path_candidates(tmp, "src/", index)]
+        check("候选: 带 / 按目录逐级补", found == [("src/pi_app/", True), ("src/app.py", False)], str(found))
+        found = [c.insert for c in path_candidates(tmp, "my", index)]
+        check("候选: 带空格的路径加引号", found == ['"my notes.txt"'], str(found))
+        found = [c.display for c in path_candidates(tmp, "./.e", index)]
+        check("候选: 明确输 . 才列隐藏文件", found == ["./.env"], str(found))
+
+
+def test_mention_completer() -> None:
+    if not HAS_PROMPT_TOOLKIT:
+        print("  skip 没装 prompt_toolkit")
+        return
+    import tempfile
+
+    from pi_tui import SlashCompleter
+    from pi_tui.input import MentionCompleter, _Completers
+    from prompt_toolkit.document import Document
+
+    with tempfile.TemporaryDirectory() as tmp:
+        make_tree(Path(tmp))
+        both = _Completers(SlashCompleter(COMMANDS), MentionCompleter(lambda: tmp))
+        found = list(both.get_completions(Document("看看 @src/a"), None))
+        check("补全器: @ 里补路径、替换已输入的部分", [(c.text, c.start_position) for c in found]
+              == [("src/app.py", -5)], str([(c.text, c.start_position) for c in found]))
+        found = list(both.get_completions(Document("/co"), None))
+        check("补全器: 不在 @ 里照旧补命令", [c.text for c in found] == ["/compact", "/cost", "/context"])
+        check("补全器: 普通文字没有候选", not list(both.get_completions(Document("你好"), None)))
+
+
+def test_clipboard() -> None:
+    import subprocess
+    import tempfile
+
+    from pi_tui import clipboard
+
+    calls: list[list[str]] = []
+
+    def fake_run(args, png=b"\x89PNG fake", types="image/png\ntext/plain"):
+        def run(cmd, **kwargs):
+            calls.append(cmd)
+            if cmd[0] == "osascript":
+                target = cmd[2].split('POSIX file "')[1].split('"')[0]
+                if png:
+                    Path(target).write_bytes(png)
+                return subprocess.CompletedProcess(cmd, 0, b"", b"")
+            if "--list-types" in cmd or "TARGETS" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, types, "")
+            return subprocess.CompletedProcess(cmd, 0, png, b"")
+        return run
+
+    real_which = clipboard.shutil.which
+    with tempfile.TemporaryDirectory() as tmp:
+        saved = clipboard.save_clipboard_image(tmp, run=fake_run(None), platform="darwin")
+        check("剪贴板 mac: 有图存成 PNG", saved is not None and saved.read_bytes() == b"\x89PNG fake"
+              and saved.suffix == ".png", str(saved))
+        saved = clipboard.save_clipboard_image(tmp, run=fake_run(None, png=b""), platform="darwin")
+        check("剪贴板 mac: 不是图片返回 None、不留空文件", saved is None
+              and len(list(Path(tmp).iterdir())) == 1)
+        try:
+            clipboard.shutil.which = lambda name: "/usr/bin/xclip" if name == "xclip" else None
+            calls.clear()
+            saved = clipboard.save_clipboard_image(tmp, run=fake_run(None), platform="linux")
+            check("剪贴板 linux: xclip 取 image/png", saved is not None and calls[-1][-3:]
+                  == ["-t", "image/png", "-o"], str(calls))
+            saved = clipboard.save_clipboard_image(tmp, run=fake_run(None, types="text/plain"),
+                                                   platform="linux")
+            check("剪贴板 linux: 剪贴板里是文字返回 None", saved is None)
+            clipboard.shutil.which = lambda name: None
+            check("剪贴板 linux: 没装 xclip / wl-paste 返回 None",
+                  clipboard.save_clipboard_image(tmp, run=fake_run(None), platform="linux") is None)
+        finally:
+            clipboard.shutil.which = real_which
+
+        def broken(cmd, **kwargs):
+            raise subprocess.TimeoutExpired(cmd, 5)
+        check("剪贴板: 命令超时不抛错", clipboard.save_clipboard_image(tmp, run=broken, platform="darwin") is None)
+
+
 def main() -> int:
     print("命令补全")
     test_match_commands()
     test_completer()
+    print("@文件")
+    test_mention_paths()
+    test_mention_completer()
+    test_clipboard()
     print("选择器")
     test_picker_state()
     test_picker_render()

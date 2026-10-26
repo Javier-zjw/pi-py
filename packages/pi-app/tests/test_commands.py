@@ -652,6 +652,26 @@ async def case_attention() -> None:
         app_module.notify = real
 
 
+async def case_mcp_warmup() -> None:
+    """交互模式下打开会话就在后台连 MCP：连不上的提示一行；非交互模式（测试、管道）不预连接"""
+    with Sandbox() as cwd:
+        (cwd / ".pi").mkdir()
+        (cwd / ".pi" / "mcp.json").write_text(
+            '{"mcpServers": {"broken": {"command": "no-such-mcp-command-xyz"}}}')
+        app, out = make_app(cwd)
+        app._warm_mcp(app.session)
+        await asyncio.sleep(0.2)
+        check("MCP 预连接: 非交互模式不连", "broken" not in out.getvalue(), out.getvalue())
+        app.background = True
+        app._warm_mcp(app.session)
+        for _ in range(50):
+            await asyncio.sleep(0.05)
+            if "broken" in out.getvalue():
+                break
+        check("MCP 预连接: 连不上的提示一行、指向 /mcp", "⚠ MCP：broken 连接失败（/mcp 查看原因）" in out.getvalue(),
+              out.getvalue())
+
+
 # -- 信息类 ------------------------------------------------------------------ #
 
 async def case_info() -> None:
@@ -732,6 +752,10 @@ def test_attention() -> None:
     asyncio.run(case_attention())
 
 
+def test_mcp_warmup() -> None:
+    asyncio.run(case_mcp_warmup())
+
+
 def test_info() -> None:
     asyncio.run(case_info())
 
@@ -756,6 +780,7 @@ async def main() -> int:
     await case_live_input()
     await case_details_viewer()
     await case_attention()
+    await case_mcp_warmup()
     print("信息类")
     await case_info()
 

@@ -507,6 +507,15 @@ def test_web_tool_lines() -> None:
     check("上网: 读网页显示地址、标题、字数", "web_fetch  example.com/docs/install  安装指南 · 12034 字" in live, live)
     check("上网: 接着读时显示起点", "web_fetch  example.com/a @20000  40000 字" in live, live)
 
+    renderer.on_event(ev("tool_execution_start", tool_call_id="m1", tool_name="mcp__github__search_issues",
+                         arguments={"query": "bug"}))
+    renderer.on_event(ev("tool_execution_end", tool_call_id="m1", tool_name="mcp__github__search_issues",
+                         is_error=False, result=SimpleNamespace(content=[SimpleNamespace(text="")],
+                                                                details={"chars": 1234, "images": 1})))
+    live = "\n".join(renderer._live_lines())
+    check("MCP: 工具名显示成 服务器 · 工具，结果显示字数和图片", "github · search_issues" in live
+          and "mcp__" not in live and "1234 字 · 1 张图" in live, live)
+
 
 def test_turn_sections() -> None:
     """查看器里的段落：按发生顺序，标题一行说清做了什么，正文是全文；失败的工具默认展开"""

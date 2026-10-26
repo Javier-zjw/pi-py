@@ -194,8 +194,14 @@ def decide(session, name: str, args: dict) -> tuple[str, str]:
 
 
 def rule_matches(rule: str, name: str, args: dict, cwd: str) -> bool:
-    m = re.fullmatch(r"\s*([\w.-]+)\s*(?:\((.*)\))?\s*", rule)
-    if not m or m.group(1) != name:
+    m = re.fullmatch(r"\s*([\w.*-]+)\s*(?:\((.*)\))?\s*", rule)
+    if not m:
+        return False
+    target = m.group(1)
+    # 工具名可以带通配（mcp__github__*）；mcp__服务器 不带工具名时指这个服务器的全部工具（同 Claude Code）
+    if not (target == name or ("*" in target and fnmatch(name, target))
+            or (target.startswith("mcp__") and target.count("__") == 1
+                and name.startswith(target + "__"))):
         return False
     pattern = m.group(2)
     if pattern is None:
@@ -311,6 +317,13 @@ def build_request(session, name: str, args: dict) -> dict:
         return {"tool": name, "kind": name, "title": "修改文件", "question": question, "summary": path,
                 "detail": _clip(detail), "remember": remember}
     text = json.dumps(args, ensure_ascii=False)
+    if name.startswith("mcp__") and name.count("__") >= 2:
+        _, server, tool = name.split("__", 2)
+        pretty = json.dumps(args, ensure_ascii=False, indent=2).splitlines() if args else ["（没有参数）"]
+        return {"tool": name, "kind": "mcp", "title": f"调用 MCP 工具 · {server}",
+                "question": f"允许调用 {server} 的 {tool} 吗？", "summary": f"{server} · {tool}",
+                "detail": _clip(pretty),
+                "remember": {"label": f"本会话不再询问 {server} 的 {tool}", "keys": [f"tool:{name}"]}}
     return {"tool": name, "kind": "tool", "title": f"调用工具 {name}", "question": f"允许调用 {name} 吗？",
             "summary": text, "detail": _clip([text[:400]]),
             "remember": {"label": f"本会话不再询问 {name}", "keys": [f"tool:{name}"]}}

@@ -38,6 +38,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -257,6 +258,7 @@ class SessionRenderer:
         self.tool_errors = 0
         # 压缩可能发生在一轮开始之前（手动 / 先压后跑），那时转圈要自己启停
         self.agent_running = False
+        self._busy_since: float | None = None     # 一轮之外的耗时命令开始的时间（显示用时）
 
     # -- 对外 ---------------------------------------------------------- #
 
@@ -743,6 +745,41 @@ class SessionRenderer:
                     *[line if line else bar.rstrip() for line in body], t.info("╰", bold=True)])
         self.turn.steps.append(("text", f"提交计划：{title}"))
 
+    # -- 一轮之外的耗时命令（扩展命令，如 /mcp add 要等服务器下载、启动） --------- #
+
+    @contextlib.contextmanager
+    def direct(self):
+        """执行命令期间输入框是收起的：活动区自己画到终端上，结束后再交还给输入框。
+        常驻输入框模式下活动区平时画在输入框上方——输入框不在时那块根本不显示，
+        /mcp add 等十几秒、/compact 压缩几十秒，屏幕上什么都没有，像卡死了"""
+        host, self.live.host = self.live.host, None
+        try:
+            yield
+        finally:
+            self.live.finalize()
+            self.live.host = host
+
+    def begin_busy(self, label: str) -> None:
+        """命令开始：活动区转圈 + 命令名 + 用时，不然几十秒没动静像卡死了"""
+        if self.agent_running:
+            return
+        self._busy_since = time.time()
+        # 不马上画：一眨眼就完的命令（/permissions 之类）不闪一下转圈，第一次刷新在 0.1 秒后
+        self.state.label, self.state.detail = label, ""
+        self.ticker.start()
+
+    def end_busy(self) -> None:
+        if self._busy_since is None:
+            return
+        self._busy_since = None
+        self.ticker.stop()
+        self.live.finalize()
+
+    def _on_progress(self, event) -> None:
+        """扩展报告进行到哪一步：只在有命令在跑时显示（后台预连接等不打扰输入框）"""
+        if self._busy_since is not None:
+            self._set_status(self.state.label, event.text)
+
     # -- 向用户提问（ask_user） ------------------------------------------ #
 
     def pause(self) -> None:
@@ -988,8 +1025,11 @@ class SessionRenderer:
         frame = t.accent(self.spinner.frame())
         detail = f"  {t.muted(self.state.detail)}" if self.state.detail else ""
         if not self.agent_running:
-            # 一轮之外（手动压缩等），或刚提交、这一轮还没开始
-            return [f"{frame} {t.muted(self.state.label + '…')}{detail}", *self._queued_lines()]
+            # 一轮之外（手动压缩、扩展命令等），或刚提交、这一轮还没开始
+            took = (f" {t.highlight(_seconds(time.time() - self._busy_since))}"
+                    if self._busy_since is not None else "")
+            head = truncate(f"{frame} {t.muted(self.state.label + '…')}{took}{detail}", self.width - 1)
+            return [head, *self._queued_lines()]
         elapsed = t.highlight(_seconds(time.time() - (self.state.turn_started or time.time())))
         head = f"{frame} {elapsed} {t.muted('· ' + self.state.label)}"
         if self.state.tool_total:

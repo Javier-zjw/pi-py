@@ -211,6 +211,10 @@ class Ticker:
             self._task.cancel()
         self._task = None
 
+    @property
+    def running(self) -> bool:
+        return self._task is not None and not self._task.done()
+
 
 class TextStreamer:
     """匀速吐字缓冲。

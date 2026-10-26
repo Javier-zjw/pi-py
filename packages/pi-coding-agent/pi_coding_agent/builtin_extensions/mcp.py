@@ -137,6 +137,16 @@ def activate(pi) -> None:
     def short(path) -> str:
         return str(path).replace(str(Path.home()), "~")
 
+    def progress(session, text: str) -> None:
+        """耗时步骤告诉界面在干什么（npx / uvx 第一次要下载，可能几十秒）"""
+        from pi_coding_agent.session_events import ProgressEvent
+        session.notify(ProgressEvent(text))
+
+    def connecting(config) -> str:
+        first = ("；第一次用要先下载，可能要等一会儿" if config.transport == "stdio"
+                 and config.command.lower() in ("npx", "uvx", "bunx", "docker", "pnpm") else "")
+        return f"正在连接 {config.name}（{config.describe()[:60]}）{first}"
+
     async def add_servers(session, text: str) -> str:
         from pi_coding_agent.mcp.add import AddError, parse_add
         from pi_coding_agent.mcp.config import load_servers, target_path, write_server
@@ -164,6 +174,7 @@ def activate(pi) -> None:
                 continue
             if config.source != str(path):
                 lines.append(f"  注意：{short(config.source)} 里也有 {name}，那一份优先")
+            progress(session, connecting(config))
             state = await mgr.add(config)
             if state.status == "ready":
                 names = [str(t["name"]) for t in state.tools]
@@ -215,6 +226,7 @@ def activate(pi) -> None:
             done, skipped = import_servers(session.cwd, agent_dir(session))
             if not done:
                 return "没有可导入的服务器" + (f"（跳过：{'、'.join(skipped)}）" if skipped else "")
+            progress(session, f"已导入 {len(done)} 个，正在连接（npx / uvx 第一次要下载，可能要等一会儿）")
             await reload(session)
             text = "已导入：" + "、".join(done)
             if skipped:
@@ -224,10 +236,13 @@ def activate(pi) -> None:
             target = words[1] if len(words) > 1 else None
             if target and target not in manager(session).servers:
                 return f"没有叫 {target} 的服务器"
+            progress(session, f"正在重连 {target or '全部服务器'}")
             await reload(session, target)
             return status_text(session)
         if action == "tools":
             mgr = manager(session)
+            if any(s.status == "pending" for s in mgr.servers.values()):
+                progress(session, "正在连接 MCP 服务器")
             await mgr.ensure_started()
             from pi_coding_agent.mcp.manager import tool_name
             lines = []

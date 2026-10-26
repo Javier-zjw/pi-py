@@ -32,7 +32,7 @@ from .model_runtime import ModelRuntime
 from .prompt import BASE_SYSTEM_PROMPT, ContextFile, build_system_prompt, find_context_files
 from .resources import DefaultResourceLoader, ResourceLoader
 from .session import SessionManager
-from .session_events import ModeChangedEvent, PlanProposedEvent, TodoUpdatedEvent
+from .session_events import ModeChangedEvent, PlanProposedEvent, ProgressEvent, TodoUpdatedEvent
 from .settings import CONFIG_DIR_NAME, SettingsManager
 from .skills import PromptTemplate, Skill, discover_prompts, discover_skills, skills_block
 from .text import has_surrogates, read_text_lenient, sanitize, sanitize_deep, stream_decoder
@@ -67,6 +67,7 @@ __all__ = [
     "ResourceLoader",
     "SessionManager",
     "ModeChangedEvent",
+    "ProgressEvent",
     "PlanProposedEvent",
     "TodoUpdatedEvent",
     "SettingsManager",

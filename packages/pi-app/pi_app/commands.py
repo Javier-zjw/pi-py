@@ -238,11 +238,12 @@ async def cmd_continue(app: App, rest: str) -> None:
 
 
 async def cmd_compact(app: App, rest: str) -> None:
-    # 进度和结果由渲染器根据 compaction_* 事件显示
-    try:
-        await app.session.compact(rest or None)
-    except KeyboardInterrupt:
-        app.session.abort()
+    # 进度和结果由渲染器根据 compaction_* 事件显示；输入框收起着，活动区直接画
+    with app.renderer.direct():
+        try:
+            await app.session.compact(rest or None)
+        except KeyboardInterrupt:
+            app.session.abort()
 
 
 # -- 信息 ---------------------------------------------------------------- #

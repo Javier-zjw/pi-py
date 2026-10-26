@@ -562,7 +562,10 @@ async def case_add_command() -> None:
         try:
             help_text = await session.run_command("mcp", "add")
             check("/mcp add: 不带参数时给示例", "要添加什么" in help_text and "/mcp add npx" in help_text, help_text)
+            progress: list[str] = []
+            session.subscribe(lambda e: progress.append(e.text) if e.type == "progress" else None)
             reply = await session.run_command("mcp", f"add fake {launch}")
+            check("/mcp add: 连接前报进度给界面", any("正在连接 fake" in p for p in progress), str(progress))
             global_file = cwd / "agent" / "mcp.json"
             written = json.loads(global_file.read_text())["mcpServers"]
             check("/mcp add: 写进全局配置（原样，不展开变量）", written["fake"] == {

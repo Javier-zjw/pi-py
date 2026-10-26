@@ -494,6 +494,7 @@ class SessionRenderer:
 
     def _on_agent_start(self, event) -> None:
         self.agent_running = True
+        self._busy_since = None     # 准备阶段结束，活动区交给这一轮
         own = self.state.own_prompt
         self.state = RenderState(turn_started=time.time(), own_prompt=own,
                                  plan_touched=self._plan_open())
@@ -790,7 +791,7 @@ class SessionRenderer:
         self.live.finalize()
 
     def _on_progress(self, event) -> None:
-        """扩展报告进行到哪一步：只在有命令在跑时显示（后台预连接等不打扰输入框）"""
+        """扩展报告进行到哪一步：只在有命令在跑、或一轮开始前的准备阶段显示（后台预连接等不打扰输入框）"""
         if self._busy_since is not None:
             self._set_status(self.state.label, event.text)
 

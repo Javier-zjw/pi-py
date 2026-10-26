@@ -116,17 +116,36 @@ class McpManager:
                         for s in servers}
         self._started = False
         self._lock = asyncio.Lock()
+        self._tasks: set[asyncio.Task] = set()      # 后台连接中的服务器
 
     # -- 连接 ----------------------------------------------------------- #
 
+    def start(self) -> None:
+        """第一次用到时在后台并行连接所有服务器，不等（重连走 reconnect）"""
+        if self._started:
+            return
+        self._started = True
+        for state in self.servers.values():
+            if state.status == "pending":
+                task = asyncio.ensure_future(self._connect(state))
+                self._tasks.add(task)
+                task.add_done_callback(self._tasks.discard)
+
+    async def wait(self, timeout: float | None = None) -> list[str]:
+        """等后台连接做完，最多 timeout 秒（None 一直等）。返回还没连完的服务器名。
+
+        提问前只等一小会儿：npx / uvx 每次启动都要去源上查版本，网络慢时一个服务器能卡几十秒，
+        等它连完再把问题交给模型，屏幕上就什么动静都没有、像模型不回复了。没连完的这一轮先不用，
+        连上之后下一轮自动加进来"""
+        pending = [task for task in self._tasks if not task.done()]
+        if pending:
+            await asyncio.wait(pending, timeout=timeout)
+        return [s.name for s in self.servers.values() if s.status in ("pending", "connecting")]
+
     async def ensure_started(self) -> None:
-        """第一次用到时并行连接所有服务器；之后什么都不做（重连走 reconnect）"""
-        async with self._lock:
-            if self._started:
-                return
-            self._started = True
-            await asyncio.gather(*(self._connect(s) for s in self.servers.values()
-                                   if s.status == "pending"))
+        """开始连接并等全部连完（/mcp、/mcp tools、预连接用：要看到完整结果）"""
+        self.start()
+        await self.wait()
 
     async def reconnect(self, name: str | None = None) -> None:
         async with self._lock:
@@ -204,6 +223,8 @@ class McpManager:
             state.status = "pending"
 
     async def close(self) -> None:
+        for task in list(self._tasks):
+            task.cancel()
         for state in self.servers.values():
             await self._disconnect(state)
         self._started = False

@@ -6,6 +6,7 @@ tools/list 分两页返回，测翻页。启动时故意往 stdout 打一行非 
 """
 
 import json
+import os
 import sys
 import threading
 import time
@@ -91,6 +92,7 @@ def handle(message: dict) -> None:
         PENDING[request_id][0].set()
         return
     if method == "initialize":
+        time.sleep(float(os.environ.get("FAKE_MCP_SLOW_INIT", "0")))     # 模拟 npx 下载 / 启动慢
         reply(request_id, {"protocolVersion": "2025-03-26", "capabilities": {"tools": {"listChanged": True}},
                            "serverInfo": {"name": "fake", "version": "1.0"},
                            "instructions": "Use echo to repeat things."})

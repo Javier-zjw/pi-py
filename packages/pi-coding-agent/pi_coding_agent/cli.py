@@ -156,7 +156,7 @@ Anything else is sent to the agent."""
 
 async def handle_command(session: AgentSession, line: str) -> bool:
     """Returns False when the REPL should exit."""
-    name, _, rest = line[1:].partition(" ")
+    name, rest = (line[1:].split(None, 1) + ["", ""])[:2] if line[1:].strip() else ("", "")
     rest = rest.strip()
     api = session.resources.get_extension_api()
 
@@ -259,7 +259,7 @@ async def run_interactive(session: AgentSession, show_thinking: bool) -> None:
         if not line:
             continue
         if line.startswith("/"):
-            name = line[1:].partition(" ")[0]
+            name = (line[1:].split(None, 1) or [""])[0]
             builtin = name in {
                 "help", "model", "think", "tools", "skills", "commands",
                 "compact", "continue", "usage", "session", "exit", "quit",

@@ -539,7 +539,8 @@ class App:
 
     async def dispatch(self, line: str) -> bool:
         """执行一条 / 开头的输入。返回 False 表示退出"""
-        name, _, rest = line[1:].partition(" ")
+        # 按任意空白切：/mcp add 后面直接换行贴一大段 JSON 也认得出命令名
+        name, rest = (line[1:].split(None, 1) + ["", ""])[:2] if line[1:].strip() else ("", "")
         rest = rest.strip()
         if not name:
             self.print_help()

@@ -137,6 +137,24 @@ class McpManager:
                 await self._disconnect(state)
             await asyncio.gather(*(self._connect(s) for s in targets))
 
+    async def add(self, config: ServerConfig) -> ServerState:
+        """加一个（或替换同名的）服务器并马上连，别的服务器不动"""
+        async with self._lock:
+            old = self.servers.get(config.name)
+            if old is not None:
+                await self._disconnect(old)
+            state = ServerState(config, status="disabled" if config.disabled else "pending")
+            self.servers[config.name] = state
+            if not config.disabled:
+                await self._connect(state)
+            return state
+
+    async def remove(self, name: str) -> None:
+        async with self._lock:
+            state = self.servers.pop(name, None)
+            if state is not None:
+                await self._disconnect(state)
+
     async def _connect(self, state: ServerState) -> None:
         config = state.config
         state.status, state.error, state.tools = "connecting", "", []

@@ -671,6 +671,12 @@ async def case_mcp_warmup() -> None:
         check("MCP 预连接: 连不上的提示一行、指向 /mcp", "⚠ MCP：broken 连接失败（/mcp 查看原因）" in out.getvalue(),
               out.getvalue())
 
+        start = len(out.getvalue())
+        await app.submit('/mcp\nadd {"mcpServers": {"nope": {"command": "no-such-mcp-command-xyz"}}}')
+        added = tail(out, start)
+        check("/mcp add: 命令名后面直接换行贴 JSON 也认得出", "已写进" in added and "✗ nope 连接失败" in added
+              and "找不到命令" in added, added)
+
 
 # -- 信息类 ------------------------------------------------------------------ #
 

@@ -120,7 +120,7 @@ async def case_simple_turn() -> None:
               (ctx.system_prompt or "")[:40])
         # 内置扩展 todo 注册的 update_plan 总会加入工具基线
         check("单轮: 没配工具时只有扩展注册的 update_plan",
-              [t.name for t in ctx.tools] == ["update_plan"], str(ctx.tools))
+              [t.name for t in ctx.tools] == ["update_plan", "web_search", "web_fetch"], str(ctx.tools))
 
 
 async def case_tool_turn_with_real_tools() -> None:
@@ -142,7 +142,7 @@ async def case_tool_turn_with_real_tools() -> None:
         check("工具轮: 真的读了磁盘",
               "藏在文件里的内容" in session.messages[2].text(), session.messages[2].text()[:40])
         check("工具轮: 工具 schema 下发给模型",
-              [t.name for t in provider.calls[0]["context"].tools] == ["read", "update_plan"],
+              [t.name for t in provider.calls[0]["context"].tools] == ["read", "update_plan", "web_search", "web_fetch"],
               str(provider.calls[0]["context"].tools))
         check("工具轮: 第二次请求带上了工具结果",
               any(getattr(m, "role", "") == "toolResult"
@@ -304,18 +304,18 @@ def test_tool_selection() -> None:
         default = AgentSession(services, SessionManager.in_memory(cwd), model=FAKE_MODEL)
         names = {t.name for t in default.agent.state.tools}
         check("工具: 默认集合（含扩展注册的 update_plan）",
-              names == {"read", "bash", "edit", "write", "update_plan"}, str(names))
+              names == {"read", "bash", "edit", "write", "update_plan", "web_search", "web_fetch"}, str(names))
 
         limited = AgentSession(services, SessionManager.in_memory(cwd), model=FAKE_MODEL,
                                tools=["read", "grep"])
         check("工具: 显式指定",
-              {t.name for t in limited.agent.state.tools} == {"read", "grep", "update_plan"},
+              {t.name for t in limited.agent.state.tools} == {"read", "grep", "update_plan", "web_search", "web_fetch"},
               str([t.name for t in limited.agent.state.tools]))
 
         excluded = AgentSession(services, SessionManager.in_memory(cwd), model=FAKE_MODEL,
                                 exclude_tools=["bash", "write"])
         check("工具: 排除生效",
-              {t.name for t in excluded.agent.state.tools} == {"read", "edit", "update_plan"},
+              {t.name for t in excluded.agent.state.tools} == {"read", "edit", "update_plan", "web_search", "web_fetch"},
               str([t.name for t in excluded.agent.state.tools]))
 
         custom = define_tool("mine", "自定义", {"type": "object", "properties": {}},
@@ -323,7 +323,7 @@ def test_tool_selection() -> None:
         with_custom = AgentSession(services, SessionManager.in_memory(cwd), model=FAKE_MODEL,
                                    tools=["read"], custom_tools=[custom])
         check("工具: 自定义工具加入",
-              {t.name for t in with_custom.agent.state.tools} == {"read", "update_plan", "mine"},
+              {t.name for t in with_custom.agent.state.tools} == {"read", "update_plan", "web_search", "web_fetch", "mine"},
               str([t.name for t in with_custom.agent.state.tools]))
 
 
@@ -377,12 +377,12 @@ async def case_plan_mode_tools() -> None:
         await session.set_mode("plan")
         await session._apply_mode()
         check("计划模式: 全部只读工具 + ask_user + submit_plan（没有写文件、bash、update_plan）",
-              names() == {"read", "grep", "find", "ls", "ask_user", "submit_plan"}, str(names()))
+              names() == {"read", "grep", "find", "ls", "ask_user", "submit_plan", "web_search", "web_fetch"}, str(names()))
 
         await session.set_mode("chat")
         await session._apply_mode()
         check("计划模式: 切回聊天后恢复基线",
-              names() == {"read", "bash", "edit", "write", "update_plan"}, str(names()))
+              names() == {"read", "bash", "edit", "write", "update_plan", "web_search", "web_fetch"}, str(names()))
 
 
 def test_diagnostics_surface() -> None:
@@ -792,7 +792,7 @@ async def case_plan_execute_flow() -> None:
         check("计划: 切模式发 mode_changed", types[0] == "mode_changed" and events[0].mode == "plan")
         tools = {t.name for t in provider.calls[0]["context"].tools}
         check("计划: 计划模式只给只读工具、ask_user 和 submit_plan",
-              tools == {"read", "grep", "find", "ls", "ask_user", "submit_plan"}, str(tools))
+              tools == {"read", "grep", "find", "ls", "ask_user", "submit_plan", "web_search", "web_fetch"}, str(tools))
         check("计划: 系统提示带计划模式说明", "<plan_mode>" in provider.calls[0]["context"].system_prompt)
         check("计划: 提交即停（不再调模型）", len(provider.calls) == 2
               and types[-1] == "agent_end" and events[-1].reason == "terminated", str(len(provider.calls)))

@@ -490,6 +490,24 @@ def test_tool_lines() -> None:
     check("状态栏: 模型 · 上下文占用 · 费用", footer.endswith("glm-5.2 · 上下文 18% · ¥0.012"), footer)
 
 
+def test_web_tool_lines() -> None:
+    """上网工具的一行：搜索显示查询词和条数、来源；读网页显示去掉协议的地址、标题和字数"""
+    renderer = SessionRenderer(theme=Theme(ColorMode.NONE), stream=io.StringIO())
+    renderer.on_event(ev("agent_start"))
+    for call_id, name, args, details in (
+            ("s1", "web_search", {"query": "pi  coding agent"}, {"count": 5, "backend": "bing"}),
+            ("f1", "web_fetch", {"url": "https://www.example.com/docs/install"},
+             {"title": "安装指南", "chars": 12034}),
+            ("f2", "web_fetch", {"url": "https://example.com/a", "start": 20000}, {"title": "", "chars": 40000})):
+        renderer.on_event(ev("tool_execution_start", tool_call_id=call_id, tool_name=name, arguments=args))
+        renderer.on_event(ev("tool_execution_end", tool_call_id=call_id, tool_name=name, is_error=False,
+                             result=SimpleNamespace(content=[SimpleNamespace(text="")], details=details)))
+    live = "\n".join(renderer._live_lines())
+    check("上网: 搜索显示查询词、条数和来源", "web_search  pi coding agent  5 条 · bing" in live, live)
+    check("上网: 读网页显示地址、标题、字数", "web_fetch  example.com/docs/install  安装指南 · 12034 字" in live, live)
+    check("上网: 接着读时显示起点", "web_fetch  example.com/a @20000  40000 字" in live, live)
+
+
 def test_turn_sections() -> None:
     """查看器里的段落：按发生顺序，标题一行说清做了什么，正文是全文；失败的工具默认展开"""
     renderer = SessionRenderer(theme=Theme(ColorMode.NONE), stream=io.StringIO())
@@ -691,6 +709,7 @@ async def main() -> int:
     await case_expand()
     print("状态行与回显")
     test_tool_lines()
+    test_web_tool_lines()
     test_turn_sections()
     test_welcome()
     test_code_highlight()

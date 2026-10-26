@@ -6,7 +6,7 @@
 为什么稳：
 
 1. **工具层面强制只读** —— 不是靠提示词请求模型"别改文件"，而是计划模式下只挂 read / grep /
-   find / ls、ask_user 和 submit_plan。模型想改也调不到。update_plan（执行进度单）在计划模式下也不给，
+   find / ls（web 扩展在时加上 web_search / web_fetch，同样只读）、ask_user 和 submit_plan。模型想改也调不到。update_plan（执行进度单）在计划模式下也不给，
    避免和"计划"混淆（Codex 同样禁止）。
 2. **提交即停** —— submit_plan 的结果带 terminate，本轮立刻结束、不再调模型，
    等用户决定：执行 / 继续完善 / 放弃。
@@ -37,6 +37,7 @@ DESCRIPTION = "计划模式：只读调研、提交带任务清单的计划，�
 
 ENTRY_TYPE = "plan"
 READ_ONLY = ("read", "grep", "find", "ls")
+RESEARCH = ("web_search", "web_fetch")     # web 扩展注册的只读工具：调研时常要查文档
 ASK_TOOL = "ask_user"
 GUARD_TYPE = "plan_guard"   # 清单没做完就想收尾时的提醒（CustomMessage）
 MAX_NUDGES = 2              # 每次运行最多提醒几次：确实做不下去时让模型能停下来
@@ -50,7 +51,8 @@ You are in PLAN MODE. Your job is to produce a plan, not to do the work.
 Mode rules:
 - You stay in plan mode until the user switches modes. If the user asks you to implement \
 something while in plan mode, treat it as a request to plan the implementation.
-- Only read-only tools are available (read, grep, find, ls), plus `ask_user` and `submit_plan`. \
+- Only read-only tools are available (read, grep, find, ls, and web_search / web_fetch when \
+present), plus `ask_user` and `submit_plan`. \
 Do not try to edit files or run commands.
 
 Work in three phases:
@@ -169,6 +171,7 @@ def activate(pi) -> None:
         session.agent.state.system_prompt = (session.agent.state.system_prompt or "") + PLAN_PROMPT
         excluded = set(session.settings.get("excludeTools") or [])
         tools = create_tools([name for name in READ_ONLY if name not in excluded], session.cwd)
+        tools += [t for t in session.agent.state.tools if t.name in RESEARCH]
         tools += [ask_tool, submit_tool]
         session.agent.set_tools(tools)
 

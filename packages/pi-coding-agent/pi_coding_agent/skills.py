@@ -27,21 +27,52 @@ class PromptTemplate:
     source: str = "project"
 
 def parse_front_matter(text: str) -> tuple[dict[str, str], str]:
+    """解析 ``---`` 包住的头部。只认顶层的 ``键: 值``，够技能和提示词用，不引入 YAML 库：
 
+    - 值可以带引号；
+    - 多行写法：``description: >``（折叠成一行）/ ``|``（保留换行），以及缩进的续行——
+      别人写的技能（如 Agent-Reach）常这样写描述，只认单行会把描述读成 ``>``；
+    - 值为空、下面缩进的是嵌套键（``metadata:``）时，这个键记成空串。
+    """
     if not text.startswith("---"):
         return {}, text
     end = text.find("\n---", 3)
     if end == -1:
-        return {} ,text
+        return {}, text
 
     raw = text[3: end].strip("\n")
     body = text[end + 4:].lstrip("\n")
     meta: dict[str, str] = {}
-    for line in raw.split("\n"):
-        if ":" in line and not line.startswith(" "):
-            key, _, value = line.partition(":")
-            meta[key.strip()] = value.strip().strip("'\"")
+    key, style, block = None, "", []      # 正在收集的多行值
 
+    def flush() -> None:
+        if key is None or not block:
+            return
+        if style.startswith("|"):
+            meta[key] = "\n".join(block).strip()
+        elif style.startswith(">") or meta.get(key):
+            # 折叠：相邻行用空格连，空行变换行
+            lines = ([meta[key]] if meta.get(key) else []) + block
+            meta[key] = "\n".join(" ".join(part.split("\n")) for part in
+                                  "\n".join(lines).split("\n\n")).strip()
+
+    for line in raw.split("\n"):
+        if line.startswith((" ", "\t")) or not line.strip():
+            if key is not None:
+                block.append(line.strip())
+            continue
+        flush()
+        key, style, block = None, "", []
+        if ":" not in line:
+            continue
+        name, _, value = line.partition(":")
+        name, value = name.strip(), value.strip()
+        if value in (">", "|", ">-", "|-", ">+", "|+"):
+            key, style, meta[name] = name, value, ""
+        else:
+            meta[name] = value.strip("'\"")
+            key = name if value else None     # 空值下面是嵌套键，不收
+    flush()
     return meta, body
 
 def load_skill(skill_file: Path, source: str = "project") -> Skill | None:

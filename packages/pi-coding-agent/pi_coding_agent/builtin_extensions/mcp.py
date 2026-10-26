@@ -13,19 +13,28 @@ MCP：把 MCP 服务器的工具接进 pi（同 Claude Code / Cursor / Claude De
 权限：MCP 工具不在只读白名单里，默认每次都问（可选"本会话不再询问"）；
 settings 的 permissions.allow 写 ``mcp__github__*`` 或 ``mcp__github`` 放行整个服务器。
 
-命令：``/mcp``（状态）、``/mcp tools [服务器]``、``/mcp reconnect [服务器]``（重读配置并重连）、
-``/mcp import``。设置：``mcp.startupTimeout``（秒，默认 60：npx 第一次要下载）、
+命令：``/mcp``（状态）、``/mcp tools [服务器]``、``/mcp add <配置>``（网站给的 JSON、
+``claude mcp add`` / ``codex mcp add`` 命令、``npx ...`` 或地址，解析见 mcp/add.py；写进配置后只连这一个）、
+``/mcp remove <服务器>``、``/mcp reconnect [服务器]``（重读配置并重连）、``/mcp import``。设置：``mcp.startupTimeout``（秒，默认 60：npx 第一次要下载）、
 ``mcp.toolTimeout``（默认 120，服务器配置里的 timeout 优先）、``mcp.maxOutputChars``。
 """
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 NAME = "mcp"
 DESCRIPTION = "MCP：接入 MCP 服务器的工具（/mcp 查看状态、/mcp import 导入别的客户端的配置）"
 
 INSTRUCTION_CHARS = 2000
+USAGE = "用法：/mcp [tools [服务器] | add <配置> | remove <服务器> | reconnect [服务器] | import]"
+ADD_HELP = """把网站上复制的东西贴在 /mcp add 后面，例如：
+  /mcp add {"mcpServers": {"fetch": {"command": "uvx", "args": ["mcp-server-fetch"]}}}
+  /mcp add claude mcp add github -e GITHUB_TOKEN=xxx -- npx -y @modelcontextprotocol/server-github
+  /mcp add npx -y @modelcontextprotocol/server-memory
+  /mcp add amap https://mcp.amap.com/sse
+默认写进全局配置；加 --project 只给这个项目用，--force 覆盖同名的"""
 MARKS = {"ready": "✓", "failed": "✗", "disabled": "○", "connecting": "…", "pending": "·"}
 
 
@@ -89,7 +98,8 @@ def activate(pi) -> None:
                       (f"配置文件：{paths[0]}（全局）或 {paths[1]}（项目），格式同 "
                        "Claude Desktop / Cursor 的 mcpServers，例如："),
                       ('  {"mcpServers": {"fs": {"command": "npx", "args": '
-                       '["-y", "@modelcontextprotocol/server-filesystem", "."]}}}')]
+                       '["-y", "@modelcontextprotocol/server-filesystem", "."]}}}'),
+                      "也可以直接 /mcp add 加上网站给的配置（不带参数看示例）"]
         else:
             lines.append("MCP 服务器：")
             width = max(len(name) for name in mgr.servers)
@@ -106,7 +116,8 @@ def activate(pi) -> None:
                 else:
                     lines.append(f"{head}  {'连接中…' if state.status == 'connecting' else '下次提问时连接'}"
                                  f"  {config.describe()}")
-            lines.append("配置：" + "、".join(paths) + " · /mcp tools 看工具 · /mcp reconnect 重连")
+            lines.append("配置：" + "、".join(paths) + " · /mcp tools 看工具 · /mcp add 添加 · "
+                         "/mcp remove 删除 · /mcp reconnect 重连")
         found = importable(session.cwd, agent_dir(session))
         if found:
             lines.append(f"别的客户端里还有 {len(found)} 个可导入：{'、'.join(found[:8])}"
@@ -123,6 +134,66 @@ def activate(pi) -> None:
         else:
             await old.reconnect(name)
 
+    def short(path) -> str:
+        return str(path).replace(str(Path.home()), "~")
+
+    async def add_servers(session, text: str) -> str:
+        from pi_coding_agent.mcp.add import AddError, parse_add
+        from pi_coding_agent.mcp.config import load_servers, target_path, write_server
+
+        try:
+            request = parse_add(text)
+        except AddError as exc:
+            return f"添加失败：{exc}\n\n{ADD_HELP}"
+        mgr = manager(session)
+        clashes = [name for name in request.servers if name in mgr.servers]
+        if clashes and not request.force:
+            return (f"已经有叫 {'、'.join(clashes)} 的服务器了：换个名字"
+                    "（例如 /mcp add 新名字 npx …），或者加 --force 覆盖")
+        path = target_path(session.cwd, agent_dir(session), request.scope)
+        try:
+            for name, raw in request.servers.items():
+                write_server(path, name, raw)
+        except (OSError, ValueError) as exc:
+            return f"添加失败：{exc}"
+        lines = [f"已写进 {short(path)}：{'、'.join(request.servers)}"]
+        effective = {s.name: s for s in load_servers(session.cwd, agent_dir(session))[0]}
+        for name in request.servers:
+            config = effective.get(name)
+            if config is None:
+                continue
+            if config.source != str(path):
+                lines.append(f"  注意：{short(config.source)} 里也有 {name}，那一份优先")
+            state = await mgr.add(config)
+            if state.status == "ready":
+                names = [str(t["name"]) for t in state.tools]
+                more = f" …（共 {len(names)} 个）" if len(names) > 6 else ""
+                lines.append(f"  ✓ {name} 连上了，工具：{'、'.join(names[:6])}{more}")
+            elif state.status == "disabled":
+                lines.append(f"  ○ {name} 配置里写了 disabled，没有启动")
+            else:
+                lines.append(f"  ✗ {name} 连接失败：{state.error}")
+                if config.missing_vars:
+                    var = config.missing_vars[0]
+                    lines.append(f"    在 ~/.zshrc 里加 export {var}=… 后重开终端，或把值直接写进 "
+                                 f"{short(path)}，然后 /mcp reconnect {name}")
+        lines.append("下一次提问时模型就能用它的工具（/mcp tools 查看）")
+        return "\n".join(lines)
+
+    async def remove_servers(session, name: str) -> str:
+        from pi_coding_agent.mcp.config import remove_server
+
+        if not name:
+            return "用法：/mcp remove <服务器名>（/mcp 查看有哪些）"
+        try:
+            changed = remove_server(session.cwd, agent_dir(session), name)
+        except ValueError as exc:
+            return f"删除失败：{exc}"
+        await manager(session).remove(name)
+        if not changed:
+            return f"pi 的配置里没有叫 {name} 的服务器"
+        return f"已删除 {name}（{'、'.join(short(p) for p in changed)}），进程已关闭"
+
     async def cmd_mcp(rest: str) -> str:
         from pi_coding_agent.mcp.config import import_servers
 
@@ -136,6 +207,10 @@ def activate(pi) -> None:
             await mgr.ensure_started()
             failed = [s.name for s in mgr.servers.values() if s.status == "failed"]
             return f"MCP：{'、'.join(failed)} 连接失败（/mcp 查看原因）" if failed else ""
+        if action == "add":
+            return await add_servers(session, re.sub(r"^\s*add(?=\s|$)", "", rest, count=1))
+        if action in ("remove", "rm"):
+            return await remove_servers(session, words[1] if len(words) > 1 else "")
         if action == "import":
             done, skipped = import_servers(session.cwd, agent_dir(session))
             if not done:
@@ -166,8 +241,8 @@ def activate(pi) -> None:
                     lines.append(f"  {tool_name(state.name, spec['name'])}{ro}  {desc}")
             return "\n".join(lines) or "没有已连上的服务器（/mcp 查看状态）"
         if action:
-            return "用法：/mcp [tools [服务器] | reconnect [服务器] | import]"
+            return USAGE
         return status_text(session)
 
-    pi.register_command("mcp", "MCP 服务器：状态、工具、重连、从别的客户端导入", cmd_mcp,
-                        usage="/mcp [tools|reconnect|import]")
+    pi.register_command("mcp", "MCP 服务器：状态、添加 / 删除、工具、重连、从别的客户端导入", cmd_mcp,
+                        usage="/mcp [tools|add|remove|reconnect|import]")

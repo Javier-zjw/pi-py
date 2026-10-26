@@ -227,3 +227,48 @@ def importable(cwd: str | Path, agent_dir: str | Path) -> list[str]:
     for _, path, _ in import_sources(cwd):
         names += [n for n in read_source(path, cwd) if n not in known and n not in names]
     return names
+
+
+# -- /mcp add、/mcp remove ----------------------------------------------- #
+
+def target_path(cwd: str | Path, agent_dir: str | Path, scope: str) -> Path:
+    return Path(cwd) / ".pi" / CONFIG_NAME if scope == "project" else Path(agent_dir).expanduser() / CONFIG_NAME
+
+
+def _load_for_write(path: Path) -> dict:
+    """要写的配置文件：不存在当空的；坏了不覆盖（里面可能有用户手写的东西）"""
+    if not path.exists():
+        return {}
+    data = read_json(path)
+    if not isinstance(data, dict):
+        raise ValueError(f"{path} 不是合法的 JSON，先手动修好再添加（不覆盖它，免得丢掉你写的内容）")  # noqa: TRY004 —— 调用方统一按 ValueError 报给用户
+    return data
+
+
+def _save(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", "utf-8")
+
+
+def write_server(path: Path, name: str, raw: dict) -> None:
+    data = _load_for_write(path)
+    table = data.get("mcpServers")
+    if not isinstance(table, dict):
+        table = data["mcpServers"] = {}
+    table[name] = raw
+    _save(path, data)
+
+
+def remove_server(cwd: str | Path, agent_dir: str | Path, name: str) -> list[Path]:
+    """从 pi 的两个配置里删掉这一项，返回改了哪些文件"""
+    changed = []
+    for path in config_paths(cwd, agent_dir):
+        if not path.exists():
+            continue
+        data = _load_for_write(path)
+        table = data.get("mcpServers")
+        if isinstance(table, dict) and name in table:
+            del table[name]
+            _save(path, data)
+            changed.append(path)
+    return changed

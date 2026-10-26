@@ -498,6 +498,113 @@ async def case_extension() -> None:
                         await value["manager"].close()
 
 
+def test_parse_add() -> None:
+    from pi_coding_agent.mcp.add import AddError, parse_add
+
+    def servers(text):
+        return parse_add(text).servers
+
+    fetch = {"fetch": {"command": "uvx", "args": ["mcp-server-fetch"]}}
+    check("add: 网站给的整段 mcpServers",
+          servers('{"mcpServers": {"fetch": {"command": "uvx", "args": ["mcp-server-fetch"]}}}') == fetch)
+    check("add: 只复制了其中一项（没有外层括号、末尾多逗号）",
+          servers('"fetch": {"command": "uvx", "args": ["mcp-server-fetch"],},') == fetch)
+    check("add: 只有配置时按包名取名（去 scope、版本、-mcp）",
+          list(servers('{"command": "npx", "args": ["-y", "@upstash/context7-mcp@latest"]}')) == ["context7"])
+    check("add: VS Code 的 name 字段 / mcp.servers",
+          list(servers('{"name": "x", "command": "node", "args": ["a.js"]}')) == ["x"]
+          and list(servers('{"mcp": {"servers": {"gh": {"type": "http", "url": "https://g/mcp"}}}}')) == ["gh"])
+    r = parse_add("claude mcp add github -e GITHUB_TOKEN=abc -- npx -y @modelcontextprotocol/server-github")
+    check("add: claude mcp add 的 -e 和 -- 命令", r.servers == {"github": {
+        "command": "npx", "args": ["-y", "@modelcontextprotocol/server-github"], "env": {"GITHUB_TOKEN": "abc"}}},
+          str(r.servers))
+    r = parse_add('claude mcp add --transport http docs https://e.com/mcp -H "Authorization: Bearer x" -s project')
+    check("add: claude 的远程写法，地址后面的 -H、-s project", r.servers == {"docs": {
+        "url": "https://e.com/mcp", "type": "http", "headers": {"Authorization": "Bearer x"}}}
+          and r.scope == "project", f"{r.servers} {r.scope}")
+    check("add: claude mcp add-json", servers(
+        "claude mcp add-json fetch '{\"command\": \"uvx\", \"args\": [\"mcp-server-fetch\"]}'") == fetch)
+    check("add: codex mcp add", servers("codex mcp add fetch -- uvx mcp-server-fetch") == fetch)
+    check("add: 直接写命令，按包名取名", list(servers("npx -y @modelcontextprotocol/server-memory")) == ["memory"])
+    check("add: 名字 + 地址", servers("amap https://mcp.amap.com/sse") == {"amap": {"url": "https://mcp.amap.com/sse"}})
+    check("add: 只有地址时从路径取名", list(servers("https://server.smithery.ai/@upstash/context7-mcp/mcp"))
+          == ["context7"])
+    docker = servers("docker run -i --rm -e GITHUB_PERSONAL_ACCESS_TOKEN ghcr.io/github/github-mcp-server")
+    check("add: docker 的 -e 留给 docker、按镜像名取名", list(docker) == ["github"]
+          and docker["github"]["args"][3] == "-e" and "env" not in docker["github"], str(docker))
+    check("add: 开头的 KEY=值 变成 env", servers("GITHUB_TOKEN=abc npx -y @modelcontextprotocol/server-github")
+          ["github"]["env"] == {"GITHUB_TOKEN": "abc"})
+    check("add: python -m 取模块名", list(servers("python -m mcp_server_time --local-timezone Asia/Shanghai"))
+          == ["time"])
+    check("add: uvx --from 跳过来源", list(servers("uvx --from git+https://x/y mcp-server-git")) == ["git"])
+    r = parse_add("--project --force fetch uvx mcp-server-fetch")
+    check("add: 开头的 --project / --force", r.scope == "project" and r.force and r.servers == fetch)
+    for bad, word in (("", "要添加什么"), ("npx -y @smithery/cli install @x/y --client claude", "Smithery"),
+                      ('{"mcpServers": {"a": {"command": ', "解析不了"), ('{"foo": 1}', "没在 JSON 里找到"),
+                      ('{"mcpServers": {"a": {"env": {}}}}', "没有 command 也没有 url")):
+        try:
+            parse_add(bad)
+            msg = ""
+        except AddError as exc:
+            msg = str(exc)
+        check(f"add: 说清楚错在哪（{word}）", word in msg, msg)
+
+
+async def case_add_command() -> None:
+    import shlex
+
+    with Sandbox() as cwd:
+        models, _ = fake_models([[TextContent(text="好")]])
+        runtime = ModelRuntime(models, cwd / "agent")
+        services = create_agent_session_services(cwd=cwd, agent_dir=cwd / "agent", model_runtime=runtime)
+        session = AgentSession(services, SessionManager.in_memory(cwd), model=FAKE_MODEL, tools=["read"])
+        launch = f"{shlex.quote(sys.executable)} {shlex.quote(SERVER)}"
+        try:
+            help_text = await session.run_command("mcp", "add")
+            check("/mcp add: 不带参数时给示例", "要添加什么" in help_text and "/mcp add npx" in help_text, help_text)
+            reply = await session.run_command("mcp", f"add fake {launch}")
+            global_file = cwd / "agent" / "mcp.json"
+            written = json.loads(global_file.read_text())["mcpServers"]
+            check("/mcp add: 写进全局配置（原样，不展开变量）", written["fake"] == {
+                "command": sys.executable, "args": [SERVER]}, str(written))
+            check("/mcp add: 马上连上并列出工具", "✓ fake 连上了" in reply and "echo" in reply, reply)
+            await session._prepare_run()
+            check("/mcp add: 下一轮工具集里就有", "mcp__fake__echo" in {t.name for t in session.agent.state.tools})
+
+            again = await session.run_command("mcp", f"add fake {launch}")
+            check("/mcp add: 同名的不覆盖、提示 --force", "已经有叫 fake" in again and "--force" in again, again)
+            forced = await session.run_command("mcp", f"add --force fake {launch}")
+            check("/mcp add: --force 覆盖", "✓ fake 连上了" in forced, forced)
+
+            missing = await session.run_command(
+                "mcp", 'add --project {"needkey": {"command": "x", "env": {"K": "${PI_TEST_ADD_MISSING}"}}}')
+            project = json.loads((cwd / ".pi" / "mcp.json").read_text())["mcpServers"]
+            check("/mcp add: --project 写进项目配置、保留 ${VAR}", project["needkey"]["env"]["K"]
+                  == "${PI_TEST_ADD_MISSING}", str(project))
+            check("/mcp add: 缺环境变量时告诉怎么设", "✗ needkey" in missing and "export PI_TEST_ADD_MISSING" in missing,
+                  missing)
+            check("/mcp add: 坏输入说明并给示例", "添加失败" in await session.run_command("mcp", "add {坏的"))
+
+            removed = await session.run_command("mcp", "remove fake")
+            check("/mcp remove: 从配置删掉并关闭", "已删除 fake" in removed
+                  and "fake" not in json.loads(global_file.read_text())["mcpServers"], removed)
+            await session._prepare_run()
+            check("/mcp remove: 下一轮没有它的工具", not any(t.name.startswith("mcp__fake__")
+                                                         for t in session.agent.state.tools))
+            check("/mcp remove: 没有这个名字时说清楚", "没有叫 nope" in await session.run_command("mcp", "remove nope"))
+
+            global_file.write_text("{坏的")
+            broken = await session.run_command("mcp", f"add other {launch}")
+            check("/mcp add: 配置文件坏了不覆盖", "不是合法的 JSON" in broken and global_file.read_text() == "{坏的",
+                  broken)
+        finally:
+            for hook in session.resources.get_extension_api().before_start_hooks:
+                for cell in getattr(hook, "__closure__", None) or ():
+                    value = cell.cell_contents
+                    if isinstance(value, dict) and value.get("manager") is not None:
+                        await value["manager"].close()
+
+
 # --------------------------------------------------------------------------- #
 # pytest 兼容层
 # --------------------------------------------------------------------------- #
@@ -514,12 +621,17 @@ def test_extension() -> None:
     asyncio.run(case_extension())
 
 
+def test_add_command() -> None:
+    asyncio.run(case_add_command())
+
+
 async def main() -> int:
     print("配置");        test_config(); test_import()
     print("stdio");       await case_stdio()
     print("HTTP / SSE");  await case_http()
     print("小函数");      test_helpers(); test_permissions()
     print("扩展");        await case_extension()
+    print("/mcp add");    test_parse_add(); await case_add_command()
     print()
     if FAILURES:
         print(f"{len(FAILURES)} 处失败：")

@@ -26,7 +26,7 @@ from .width import terminal_height
 try:  # 可选依赖，缺了也能跑
     from prompt_toolkit import PromptSession
     from prompt_toolkit.application import get_app, run_in_terminal
-    from prompt_toolkit.completion import Completer, Completion
+    from prompt_toolkit.completion import Completer, Completion, ThreadedCompleter
     from prompt_toolkit.document import Document
     from prompt_toolkit.enums import DEFAULT_BUFFER
     from prompt_toolkit.filters import Condition, has_completions, has_focus, is_done, to_filter
@@ -134,6 +134,16 @@ class _Completers(Completer):
             yield from self.mentions.get_completions(document, complete_event)
         elif self.slash is not None:
             yield from self.slash.get_completions(document, complete_event)
+
+    async def get_completions_async(self, document, complete_event):
+        # 路径补全要遍历项目目录（在家目录这种大目录下能有几百毫秒），放到线程里，不卡打字
+        if self.mentions is not None and mention_token(document.text_before_cursor) is not None:
+            async for completion in ThreadedCompleter(self.mentions).get_completions_async(
+                    document, complete_event):
+                yield completion
+        elif self.slash is not None:
+            async for completion in self.slash.get_completions_async(document, complete_event):
+                yield completion
 
 
 # 菜单不用 prompt_toolkit 默认的灰底白块：透明底；高亮行沿用默认的 reverse，配上主题青色成一条青色底条

@@ -104,6 +104,12 @@ def test_expand() -> None:
         r = expand_mentions("看 @src/app.py，还有 @src/util.py。", cwd)
         check("句末标点不算路径", [a.label for a in r.attachments] == ["src/app.py", "src/util.py"],
               str(r.attachments))
+        r = expand_mentions("看看@src/app.py帮我改一下，还有＠src/util.py", cwd)
+        check("紧挨中文的 @、后面直接接中文、全角 ＠", [a.label for a in r.attachments]
+              == ["src/app.py", "src/util.py"], str(r.attachments))
+        (root / "笔记.md").write_text("中文名\n")
+        r = expand_mentions("看看@笔记.md里写了什么", cwd)
+        check("中文文件名后面接中文", [a.label for a in r.attachments] == ["笔记.md"], str(r.attachments))
         r = expand_mentions('@"my notes.txt" 和 @my\\ notes.txt', cwd)
         check("带空格的路径（引号 / 转义）、同一个只附一次", [a.label for a in r.attachments] == ["my notes.txt"],
               str(r.attachments))

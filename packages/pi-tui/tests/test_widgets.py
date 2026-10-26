@@ -340,6 +340,10 @@ def test_mention_paths() -> None:
     check("@词: 引号和转义空格", mention_token('@"my no') == ("my no", 6)
           and mention_token("@my\\ no") == ("my no", 6))
     check("@词: 中文标点结束路径", mention_token("@app.py，") is None)
+    check("@词: 紧挨中文也算（中文句子里 @ 前面不打空格）", mention_token("看看@") == ("", 0)
+          and mention_token("帮我看下@src") == ("src", 3) and mention_token("（@a") == ("a", 1))
+    check("@词: 全角 ＠ 也算", mention_token("＠") == ("", 0) and mention_token("看看＠src") == ("src", 3))
+    check("@词: 紧挨英文字母数字的不算（邮箱）", mention_token("me@ex") is None and mention_token("x1@") is None)
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         make_tree(root)
@@ -375,6 +379,15 @@ def test_mention_completer() -> None:
         found = list(both.get_completions(Document("看看 @src/a"), None))
         check("补全器: @ 里补路径、替换已输入的部分", [(c.text, c.start_position) for c in found]
               == [("src/app.py", -5)], str([(c.text, c.start_position) for c in found]))
+        found = list(both.get_completions(Document("看看@ap"), None))
+        check("补全器: 紧挨中文的 @ 也补", [c.text for c in found][:1] == ["src/app.py"]
+              and found[0].start_position == -2, str(found))
+
+        async def collect(text):
+            return [c.text async for c in both.get_completions_async(Document(text), None)]
+        import asyncio
+        check("补全器: 异步取（路径在线程里找）", asyncio.run(collect("看看@src/a")) == ["src/app.py"]
+              and asyncio.run(collect("/cos")) == ["/cost"])
         found = list(both.get_completions(Document("/co"), None))
         check("补全器: 不在 @ 里照旧补命令", [c.text for c in found] == ["/compact", "/cost", "/context"])
         check("补全器: 普通文字没有候选", not list(both.get_completions(Document("你好"), None)))

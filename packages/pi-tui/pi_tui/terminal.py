@@ -38,3 +38,20 @@ def notify(message: str = "", *, bell: bool = True, desktop: bool = False) -> No
     if out:
         stream.write(out)
         stream.flush()
+
+
+
+def quiet_cpr(app) -> None:
+    """不打印 prompt_toolkit 的 CPR 警告。
+
+    prompt_toolkit 每次打开输入框都会问终端光标在哪（CPR），等 2 秒没收到回答就判定"不支持"，
+    打印 "WARNING: your terminal doesn't support cursor position requests (CPR)."。终端其实支持、
+    只是那一下回答慢了（刚开窗口、机器忙、回答到的时候输入正好被摘开——后台往屏幕上打印时会这样）
+    也会误报。判定为不支持也不影响使用（只是少知道光标下面还剩几行），迟到的回答一来它会自己
+    改回"支持"，所以只去掉这句提示。
+
+    不放宽 2 秒的判定时间：没判定之前，每次关掉输入框它都要为没回来的查询再等最多 1 秒，
+    放宽了反而让真不支持 CPR 的终端在开头那段时间里每次回车都卡一下。"""
+    renderer = getattr(app, "renderer", None)
+    if renderer is not None:
+        renderer.cpr_not_supported_callback = None

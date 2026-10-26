@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .terminal import quiet_cpr
 from .width import terminal_height
 
 try:  # 可选依赖，缺了也能跑
@@ -233,6 +234,7 @@ class LineReader:
             # 固定预留会让输入行下面一直空着一大块；菜单空间由 _input_height 按需撑开
             reserve_space_for_menu=0,
         )
+        quiet_cpr(self.session.app)
         if on_escape is not None:
             self.session.app.ttimeoutlen = 0.05
         if above is not None:

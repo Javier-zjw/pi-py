@@ -295,6 +295,23 @@ class App:
         self.renderer.status.hint = "/help"
         self.renderer.cwd = session.cwd
         self.renderer.context_window = session.model.context_window if session.model else 0
+        self._warm_mcp(session)
+
+    def _warm_mcp(self, session: Any) -> None:
+        """交互模式下打开会话就在后台连 MCP 服务器：npx 第一次要下载，别让第一次提问干等。
+        有连不上的就提示一行；没配置的话什么都不做"""
+        if not self.background or "mcp" not in session.resources.get_extension_api().commands:
+            return
+
+        async def warm() -> None:
+            try:
+                note = await session.run_command("mcp", "warmup")
+            except Exception as exc:  # noqa: BLE001 —— 预连接失败不该影响别的，/mcp 里看得到
+                note = f"MCP 预连接出错：{type(exc).__name__}: {exc}"
+            if note and session is self.session:
+                self.note(f"⚠ {note}")
+
+        asyncio.ensure_future(warm())
 
     def greet(self) -> None:
         session = self.session
@@ -569,6 +586,7 @@ class App:
             # 输入框常驻：一轮在后台跑，活动区画在输入框上方（由 prompt_toolkit 重画）
             self.background = True
             self.renderer.live.host = ReaderHost(self.reader)
+            self._warm_mcp(self.session)
         hint = missing_dependency_hint(self.theme)
         if hint:
             print(hint)

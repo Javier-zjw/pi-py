@@ -111,6 +111,14 @@ def file_change(record: ToolRecord) -> tuple[str, int, int, str] | None:
     return path, lines, 0, "新建" if record.details.get("created") else "覆盖"
 
 
+def tool_label(name: str) -> str:
+    """显示用的工具名：MCP 工具 mcp__github__search_issues → github · search_issues"""
+    if name.startswith("mcp__") and name.count("__") >= 2:
+        _, server, tool = name.split("__", 2)
+        return f"{server} · {tool}"
+    return name
+
+
 def summarize_arguments(arguments: Any) -> str:
     if not isinstance(arguments, dict):
         return ""
@@ -415,7 +423,7 @@ class SessionRenderer:
                 else:
                     mark = t.error("✗") if record.is_error else t.success("✓")
                     result = self._tool_result(record)
-                title = (f"{mark} {t.accent(record.name, bold=True)}  "
+                title = (f"{mark} {t.accent(tool_label(record.name), bold=True)}  "
                          f"{truncate(self._tool_target(record), max(width - 30, 20))}  {result}")
                 body: list[str] = []
                 if record.name == "bash":
@@ -462,7 +470,7 @@ class SessionRenderer:
                 mark = t.error("✗") if record.is_error else t.success("✓")
                 took = f"  {t.muted(_seconds(record.took))}" if record.took is not None else ""
                 args = summarize_arguments(record.arguments)
-                lines.append(f"{mark} {t.accent(record.name, bold=True)} "
+                lines.append(f"{mark} {t.accent(tool_label(record.name), bold=True)} "
                              f"{t.muted(truncate(args, width - 20))}{took}")
                 if record.patch and self.show_diff:
                     lines += diff_block(record.patch, width, t, max_lines=EXPAND_RESULT_LINES)
@@ -1055,9 +1063,10 @@ class SessionRenderer:
             else:
                 mark = t.error("✗") if record.is_error else t.success("✓")
                 result = self._tool_result(record)
-            name = t.accent(record.name, bold=True) if running else t.muted(record.name)
+            label = tool_label(record.name)
+            name = t.accent(label, bold=True) if running else t.muted(label)
             target = self._tool_target(record)
-            room = max(self.width - display_width(record.name) - display_width(strip_ansi(result)) - 10, 12)
+            room = max(self.width - display_width(label) - display_width(strip_ansi(result)) - 10, 12)
             line = f"{INDENT}{mark} {name}  {truncate(target, room)}"
             lines.append(f"{line}  {result}" if result else line)
         return lines
@@ -1113,6 +1122,9 @@ class SessionRenderer:
             return t.muted(f"{details['count']} 个")
         if record.name == "web_search" and details.get("count") is not None:
             return t.muted(f"{details['count']} 条 · {details.get('backend', '')}")
+        if record.name.startswith("mcp__") and details.get("chars") is not None:
+            images = f" · {details['images']} 张图" if details.get("images") else ""
+            return t.muted(f"{details['chars']} 字{images}")
         if record.name == "web_fetch" and details.get("chars") is not None:
             title = truncate(str(details.get("title") or ""), 24)
             return t.muted(" · ".join(p for p in (title, f"{details['chars']} 字") if p))

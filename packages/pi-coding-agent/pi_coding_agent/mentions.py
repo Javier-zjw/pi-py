@@ -37,9 +37,12 @@ DIR_ENTRIES = 200
 IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".webp")
 TRAILING = ",.;!?)]}，。；！？）】」、"
 
-# @"带空格的路径" / @路径（空格可以用 \ 转义）；前面不能紧挨字母数字（邮箱 a@b.com 不算）；
-# 中文标点直接结束路径——中文句子里 @文件 后面常常紧跟逗号、句号，没有空格
-MENTION = re.compile(r'(?<![\w@])@(?:"([^"\n]+)"|((?:\\ |[^\s"，。；！？、）】」])+))')
+# @"带空格的路径" / @路径（空格可以用 \ 转义）；前面不能紧挨英文字母数字（邮箱 a@b.com 不算），
+# 紧挨中文可以（看看@app.py）；全角 ＠ 也认。中文标点直接结束路径——中文句子里 @文件 后面常常紧跟
+# 逗号、句号，没有空格
+MENTION = re.compile(r'(?<![A-Za-z0-9_@＠])[@＠](?:"([^"\n]+)"|((?:\\ |[^\s"，。；！？、）】」])+))')
+# 路径后面直接接着中文（@app.py帮我看看）：最后一个英文字符之后的中文不算路径
+CJK_TAIL = re.compile(r"^(.*?[\x21-\x7e])[^\x00-\x7f]+$")
 # 拖进终端的图片：绝对路径或 ~/，可能带引号或 \ 转义的空格
 DROPPED = re.compile(
     r"""(?:(?<=\s)|^)(?:'((?:/|~/)[^'\n]+?\.(?:png|jpe?g|gif|webp))'|"((?:/|~/)[^"\n]+?\.(?:png|jpe?g|gif|webp))"|"""
@@ -85,6 +88,9 @@ def _locate(cwd: str, token: str) -> tuple[Path, int | None, int | None] | None:
     stripped = token.rstrip(TRAILING)
     if stripped != token:
         candidates.append(stripped)
+    tail = CJK_TAIL.match(stripped)
+    if tail:
+        candidates.append(tail.group(1).rstrip(TRAILING))
     for text in candidates:
         path = _resolve(cwd, text)
         if path.exists():

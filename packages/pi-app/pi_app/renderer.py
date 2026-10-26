@@ -117,6 +117,8 @@ def tool_label(name: str) -> str:
     if name.startswith("mcp__") and name.count("__") >= 2:
         _, server, tool = name.split("__", 2)
         return f"{server} · {tool}"
+    if name == "task":
+        return "子智能体"
     return name
 
 
@@ -438,6 +440,9 @@ class SessionRenderer:
                     body += [line[2:] for line in diff_block(patch, width + 2, t,
                                                              max_lines=VIEWER_BODY_LINES)]
                 elif record.output.strip():
+                    if record.name == "task" and record.details.get("steps"):
+                        # 子智能体：先列它做过的每一步，再是交回的报告
+                        body += [t.muted(f"⏺ {step}") for step in record.details["steps"]] + [""]
                     body += wrapped(record.output, t.muted if not record.is_error else t.error)
                 sections.append(Section(title, clip(body), expanded=record.is_error))
         return sections
@@ -603,6 +608,11 @@ class SessionRenderer:
         self._set_status("执行工具")
 
     def _on_tool_execution_update(self, event) -> None:
+        # 子智能体等长时间工具报告进度：存进记录，工具行显示"正在做什么"
+        record = self.state.running.get(event.tool_call_id)
+        details = getattr(event.partial, "details", None)
+        if record is not None and isinstance(details, dict):
+            record.details = details
         self._repaint()
 
     def _on_tool_execution_end(self, event) -> None:
@@ -620,6 +630,10 @@ class SessionRenderer:
         details = result.details if isinstance(result.details, dict) else {}
         record.patch = details.get("patch")
         record.details = details
+        if event.tool_name == "task" and details.get("cost"):
+            # 子智能体自己调模型的费用不经过主会话的 message_end，这里补进状态栏和本轮统计
+            self.status.cost += float(details["cost"])
+            self.state.cost += float(details["cost"])
         if record.is_error:
             self.tool_errors += 1
         if not self.state.running:
@@ -1100,6 +1114,10 @@ class SessionRenderer:
             if running:
                 mark = t.accent("⏺", bold=True) if on else t.accent("⏺", dim=True)
                 result = t.muted(_seconds(time.time() - record.started))
+                activity = record.details.get("activity") if record.name == "task" else None
+                if activity:    # 子智能体：正在做什么、做了几次工具
+                    count = record.details.get("tools") or 0
+                    result = t.muted(f"{activity} · {count} 次工具 · ") + result
             else:
                 mark = t.error("✗") if record.is_error else t.success("✓")
                 result = self._tool_result(record)
@@ -1135,6 +1153,9 @@ class SessionRenderer:
             return f"{args.get('pattern', '')}" + (f"  {where}" if where and where != "." else "")
         if record.name == "web_search":
             return " ".join(str(args.get("query") or "").split())
+        if record.name == "task":
+            kind = "" if args.get("agent", "explore") == "explore" else f" [{args.get('agent')}]"
+            return " ".join(str(args.get("description") or "").split()) + kind
         if record.name == "web_fetch":
             url = re.sub(r"^https?://(www\.)?", "", str(args.get("url") or "").strip())
             return url + (f" @{args['start']}" if args.get("start") else "")
@@ -1162,6 +1183,8 @@ class SessionRenderer:
             return t.muted(f"{details['count']} 个")
         if record.name == "web_search" and details.get("count") is not None:
             return t.muted(f"{details['count']} 条 · {details.get('backend', '')}")
+        if record.name == "task" and details.get("tools") is not None:
+            return t.muted(f"{details['tools']} 次工具 · {_seconds(details.get('seconds') or 0)}")
         if record.name.startswith("mcp__") and details.get("chars") is not None:
             images = f" · {details['images']} 张图" if details.get("images") else ""
             return t.muted(f"{details['chars']} 字{images}")

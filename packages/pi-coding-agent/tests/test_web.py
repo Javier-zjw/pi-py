@@ -402,7 +402,7 @@ async def case_extension() -> None:
 def test_permissions_and_plan() -> None:
     from pi_coding_agent.builtin_extensions import permissions, plan_mode
     check("权限: 两个工具都直接放行", {"web_search", "web_fetch"} <= permissions.SAFE_TOOLS)
-    check("计划模式: 调研可以上网", set(plan_mode.RESEARCH) == {"web_search", "web_fetch"})
+    check("计划模式: 调研可以上网", {"web_search", "web_fetch"} <= set(plan_mode.RESEARCH))
 
 
 # --------------------------------------------------------------------------- #

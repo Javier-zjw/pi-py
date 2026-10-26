@@ -37,7 +37,8 @@ DESCRIPTION = "计划模式：只读调研、提交带任务清单的计划，�
 
 ENTRY_TYPE = "plan"
 READ_ONLY = ("read", "grep", "find", "ls")
-RESEARCH = ("web_search", "web_fetch")     # web 扩展注册的只读工具：调研时常要查文档
+# 调研用的只读工具：web 扩展的上网工具；task 在计划模式里只能派只读的 explore 子智能体
+RESEARCH = ("web_search", "web_fetch", "task")
 ASK_TOOL = "ask_user"
 GUARD_TYPE = "plan_guard"   # 清单没做完就想收尾时的提醒（CustomMessage）
 MAX_NUDGES = 2              # 每次运行最多提醒几次：确实做不下去时让模型能停下来
@@ -51,8 +52,8 @@ You are in PLAN MODE. Your job is to produce a plan, not to do the work.
 Mode rules:
 - You stay in plan mode until the user switches modes. If the user asks you to implement \
 something while in plan mode, treat it as a request to plan the implementation.
-- Only read-only tools are available (read, grep, find, ls, and web_search / web_fetch when \
-present), plus `ask_user` and `submit_plan`. \
+- Only read-only tools are available (read, grep, find, ls, and web_search / web_fetch / task \
+(read-only sub-agents for broad research) when present), plus `ask_user` and `submit_plan`. \
 Do not try to edit files or run commands.
 
 Work in three phases:

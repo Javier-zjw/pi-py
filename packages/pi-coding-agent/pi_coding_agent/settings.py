@@ -45,6 +45,8 @@ DEFAULT_SETTINGS : dict[str, Any] = {
     "notifications": {"bell": True, "desktop": False, "minSeconds": 15},
     # 上网（builtin_extensions/web.py）：fetch 每次最多给模型多少字；search 的后端顺序
     # （"auto" = 配了 key 的 API 在前、再试免 key 的；也可以写后端名列表）、是否用免 key 兜底
+    # 子智能体（builtin_extensions/subagents.py）：model 留空用当前模型，可写 provider/model 换便宜的
+    "subagents": {"model": "", "maxTurns": 30, "maxParallel": 4, "maxOutputChars": 20000},
     "web": {
         "fetch": {"maxChars": 20000, "timeout": 20},
         "search": {"backends": "auto", "keyless": True, "limit": 5, "timeout": 12},

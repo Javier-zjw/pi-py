@@ -25,6 +25,13 @@ class PlanProposedEvent:
 
 
 @dataclass
+class ProgressEvent:
+    """耗时操作（扩展命令，如 /mcp add 连服务器）进行到哪一步：界面在转圈后面显示这句话"""
+    text: str
+    type: Literal["progress"] = "progress"
+
+
+@dataclass
 class RetryEvent:
     """模型调用临时失败（限流、过载、断网），等 delay 秒后重试第 attempt 次（共 max_attempts 次）"""
     attempt: int

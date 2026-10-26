@@ -15,6 +15,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 HERE = Path(__file__).resolve()
 PACKAGES = HERE.parents[2]
@@ -678,6 +679,42 @@ async def case_mcp_warmup() -> None:
               and "找不到命令" in added, added)
 
 
+async def case_slow_command() -> None:
+    """扩展命令跑得久：期间活动区显示命令名和扩展报的进度，结束后收起再打印结果"""
+    from pi_coding_agent import ProgressEvent
+
+    with Sandbox() as cwd:
+        app, out = make_app(cwd)
+        seen: list[str] = []
+
+        async def slow(rest: str) -> str:
+            app.session.notify(ProgressEvent("第一步：下载中"))
+            await asyncio.sleep(0.25)       # 让转圈刷新几次
+            seen.append("\n".join(app.renderer._live_lines()))
+            return f"做完了 {rest}"
+
+        app.session.resources.get_extension_api().register_command("slow", "慢命令", slow)
+        # 交互模式下活动区平时交给输入框画；命令期间输入框收起，必须改成直接画，否则什么都看不到
+        printed: list[str] = []
+        host = SimpleNamespace(set_live=lambda lines: None, print_above=printed.append)
+        app.renderer.live.host = host
+        hosts: list = []
+
+        async def watch(rest: str) -> str:
+            hosts.append(app.renderer.live.host)
+            return await slow(rest)
+
+        app.session.resources.get_extension_api().register_command("slow", "慢命令", watch)
+        await app.submit("/slow 参数")
+        check("慢命令: 命令期间活动区直接画、结束后交还输入框", hosts == [None] and app.renderer.live.host is host,
+              str(hosts))
+        app.renderer.live.host = None
+        check("慢命令: 运行中显示命令名和进度", seen and "/slow 参数…" in seen[0] and "第一步：下载中" in seen[0],
+              str(seen))
+        check("慢命令: 结束后经输入框打印结果、不再转圈", "做完了 参数" in "\n".join(printed)
+              and app.renderer._busy_since is None and not app.renderer.ticker.running, str(printed))
+
+
 # -- 信息类 ------------------------------------------------------------------ #
 
 async def case_info() -> None:
@@ -762,6 +799,10 @@ def test_mcp_warmup() -> None:
     asyncio.run(case_mcp_warmup())
 
 
+def test_slow_command() -> None:
+    asyncio.run(case_slow_command())
+
+
 def test_info() -> None:
     asyncio.run(case_info())
 
@@ -787,6 +828,7 @@ async def main() -> int:
     await case_details_viewer()
     await case_attention()
     await case_mcp_warmup()
+    await case_slow_command()
     print("信息类")
     await case_info()
 

@@ -517,6 +517,27 @@ def test_web_tool_lines() -> None:
           and "mcp__" not in live and "1234 字 · 1 张图" in live, live)
 
 
+def test_busy_command() -> None:
+    """一轮之外的耗时命令：转圈 + 命令名 + 用时，扩展报的进度跟在后面；结束后收起"""
+    renderer = SessionRenderer(theme=Theme(ColorMode.NONE), stream=io.StringIO())
+    renderer.on_event(ev("progress", text="不在跑命令时不显示"))
+    check("忙: 没有命令在跑时进度不显示", renderer.state.detail == "")
+    renderer.begin_busy("/mcp add")
+    renderer._busy_since -= 3.2
+    renderer.on_event(ev("progress", text="正在连接 bing-search（npx -y bing-cn-mcp）"))
+    live = "\n".join(renderer._live_lines())
+    check("忙: 显示命令、用时和进度", "/mcp add…" in live and "3.2s" in live
+          and "正在连接 bing-search" in live, live)
+    renderer.on_event(ev("progress", text="很长" * 200))
+    check("忙: 长进度截到一行宽", all(display_width(line) <= renderer.width
+                                    for line in renderer._live_lines()), str(renderer._live_lines()))
+    renderer.end_busy()
+    check("忙: 结束后收起", renderer._busy_since is None and not renderer.ticker.running, str(renderer._busy_since))
+    renderer.agent_running = True
+    renderer.begin_busy("/x")
+    check("忙: 一轮运行中不接管活动区", renderer._busy_since is None)
+
+
 def test_turn_sections() -> None:
     """查看器里的段落：按发生顺序，标题一行说清做了什么，正文是全文；失败的工具默认展开"""
     renderer = SessionRenderer(theme=Theme(ColorMode.NONE), stream=io.StringIO())
@@ -719,6 +740,7 @@ async def main() -> int:
     print("状态行与回显")
     test_tool_lines()
     test_web_tool_lines()
+    test_busy_command()
     test_turn_sections()
     test_welcome()
     test_code_highlight()

@@ -553,11 +553,16 @@ class App:
                 self.error(f"/{name} 失败：{type(exc).__name__}: {exc}")
                 return True
         if name in self._extension_commands():
-            try:
-                output = await self.session.run_command(name, rest)
-            except Exception as exc:
-                self.error(f"/{name} 失败：{type(exc).__name__}: {exc}")
-                return True
+            action = rest.split()[0][:20] if rest.split() else ""
+            with self.renderer.direct():
+                self.renderer.begin_busy(f"/{name} {action}".strip())
+                try:
+                    output = await self.session.run_command(name, rest)
+                except Exception as exc:
+                    self.renderer.end_busy()
+                    self.error(f"/{name} 失败：{type(exc).__name__}: {exc}")
+                    return True
+                self.renderer.end_busy()
             if output:
                 self.out([f"  {text}" for text in str(output).splitlines()])
             return True

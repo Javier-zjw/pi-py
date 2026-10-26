@@ -362,6 +362,22 @@ def test_mention_paths() -> None:
         found = [c.display for c in path_candidates(tmp, "./.e", index)]
         check("候选: 明确输 . 才列隐藏文件", found == ["./.env"], str(found))
 
+    from unittest import mock
+
+    from pi_tui.paths import empty_reason
+    with tempfile.TemporaryDirectory() as tmp:
+        check("没有候选: 空目录说明一句", "还没有文件" in empty_reason(tmp, ""))
+        make_tree(Path(tmp))
+        check("没有候选: 没匹配 / 目录里没有 / 没这个目录", empty_reason(tmp, "zzz") == "没有匹配「zzz」的文件"
+              and empty_reason(tmp, "src/zz") == "src/ 里没有以「zz」开头的文件"
+              and "这个目录" in empty_reason(tmp, "nope/x"))
+        index = ProjectIndex()
+        with mock.patch("os.scandir", side_effect=PermissionError(1, "Operation not permitted")), \
+                mock.patch("sys.platform", "darwin"):
+            reason = (path_candidates(tmp, "", index), empty_reason(tmp, "", index))
+        check("没有候选: 读不了项目目录说清楚（macOS 指到隐私设置）", reason[0] == []
+              and "没有权限" in reason[1] and "隐私与安全性" in reason[1], str(reason))
+
 
 def test_mention_completer() -> None:
     if not HAS_PROMPT_TOOLKIT:
@@ -388,6 +404,9 @@ def test_mention_completer() -> None:
         import asyncio
         check("补全器: 异步取（路径在线程里找）", asyncio.run(collect("看看@src/a")) == ["src/app.py"]
               and asyncio.run(collect("/cos")) == ["/cost"])
+        hint = list(both.get_completions(Document("看看@zzz"), None))
+        check("补全器: 没有候选时一行说明、选它不改输入", len(hint) == 1 and hint[0].text == "zzz "
+              and hint[0].start_position == -3 and "没有匹配" in hint[0].display_text, str(hint))
         found = list(both.get_completions(Document("/co"), None))
         check("补全器: 不在 @ 里照旧补命令", [c.text for c in found] == ["/compact", "/cost", "/context"])
         check("补全器: 普通文字没有候选", not list(both.get_completions(Document("你好"), None)))

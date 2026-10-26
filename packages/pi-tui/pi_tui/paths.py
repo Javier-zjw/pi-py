@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -60,17 +61,22 @@ class ProjectIndex:
         self._root = ""
         self._at = 0.0
         self._paths: list[tuple[str, bool]] = []
+        self.error: OSError | None = None      # 项目目录本身读不了（macOS 没给终端"桌面"权限等）
 
     def paths(self, root: str) -> list[tuple[str, bool]]:
         now = time.monotonic()
         if root != self._root or now - self._at > CACHE_SECONDS:
-            self._root, self._at, self._paths = root, now, _walk(root)
+            errors: list[OSError] = []
+            self._root, self._at, self._paths = root, now, _walk(root, errors)
+            self.error = errors[0] if errors and not self._paths else None
         return self._paths
 
 
-def _walk(root: str) -> list[tuple[str, bool]]:
+def _walk(root: str, errors: list[OSError] | None = None) -> list[tuple[str, bool]]:
     found: list[tuple[str, bool]] = []
-    for current, dirs, files in os.walk(root):
+    # os.walk 默认把读不了的目录悄悄跳过：根目录读不了时菜单就什么都没有，得知道为什么
+    on_error = errors.append if errors is not None else None
+    for current, dirs, files in os.walk(root, onerror=on_error):
         dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS and not d.startswith("."))
         rel = os.path.relpath(current, root)
         prefix = "" if rel == "." else rel.replace(os.sep, "/") + "/"
@@ -134,3 +140,35 @@ def path_candidates(root: str, partial: str, index: ProjectIndex | None = None,
         scored.append((rank, len(path), path, is_dir))
     scored.sort()
     return [PathCandidate(quote(p), p, d) for _, _, p, d in scored[:limit]]
+
+
+def explain_error(path: str, error: OSError) -> str:
+    if isinstance(error, PermissionError):
+        hint = "（macOS：系统设置 → 隐私与安全性 → 文件和文件夹，允许终端访问）" \
+            if sys.platform == "darwin" else ""
+        return f"没有权限读取 {path}{hint}"
+    if isinstance(error, (FileNotFoundError, NotADirectoryError)):
+        return f"没有 {path} 这个目录"
+    return f"读不了 {path}：{error.strerror or error}"
+
+
+def empty_reason(root: str, partial: str, index: ProjectIndex | None = None) -> str:
+    """没有候选时菜单里显示的一行说明——什么都不弹，看起来像 @ 补全坏了"""
+    if "/" in partial or partial.startswith(("~", ".")):
+        head, sep, tail = partial.rpartition("/")
+        base = Path((head or "/") if sep else ".").expanduser()
+        if not base.is_absolute():
+            base = Path(root) / base
+        try:
+            os.listdir(base)
+        except OSError as exc:
+            return explain_error(str(base), exc)
+        where = f"{head}/ 里" if sep else ""
+        return f"{where}没有以「{tail}」开头的文件" if tail else f"{where}没有文件"
+    index = index or ProjectIndex()
+    paths = index.paths(root)
+    if index.error is not None:
+        return explain_error(str(root), index.error)
+    if not paths:
+        return "这个目录里还没有文件（隐藏文件输 @. 开头）"
+    return f"没有匹配「{partial}」的文件"

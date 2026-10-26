@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .paths import ProjectIndex, mention_token, path_candidates
+from .paths import ProjectIndex, empty_reason, mention_token, path_candidates
 from .terminal import quiet_cpr
 from .width import terminal_height
 
@@ -41,7 +41,7 @@ try:  # 可选依赖，缺了也能跑
     HAS_PROMPT_TOOLKIT = True
 except ImportError:  # pragma: no cover
     HAS_PROMPT_TOOLKIT = False
-    Completer = object  # type: ignore[assignment,misc]
+    Completer = Completion = object  # type: ignore[assignment,misc]
 
 MENU_ROWS = 10      # 命令菜单最多同时显示几行，更多的滚动
 SUSPENDED = object()    # read() 被 suspend() 收起时的返回值
@@ -118,9 +118,20 @@ class MentionCompleter(Completer):
             return
         partial, typed = token
         root = self.root() if callable(self.root) else self.root
-        for candidate in path_candidates(root, partial, self.index):
+        candidates = path_candidates(root, partial, self.index)
+        for candidate in candidates:
             yield Completion(candidate.insert, start_position=-typed, display=candidate.display,
                              display_meta="目录" if candidate.is_dir else "")
+        if not candidates:
+            # 一个都没有也弹一行说明为什么（空目录、没权限、没匹配）。文字是已输入的加一个空格：
+            # 只有一个候选且选了不改输入时 prompt_toolkit 会把它丢掉；回车 / Tab 选到它都不会应用
+            typed_text = document.text_before_cursor[len(document.text_before_cursor) - typed:]
+            yield _Hint(typed_text + " ", start_position=-typed, display=empty_reason(root, partial, self.index),
+                        style="class:completion-menu.meta.completion")
+
+
+class _Hint(Completion):
+    """菜单里的说明行：不是候选，回车照常发送、Tab 什么都不做"""
 
 
 class _Completers(Completer):
@@ -248,6 +259,11 @@ class LineReader:
                 buffer.start_completion(select_first=True)
                 return
             completion = state.current_completion or state.completions[0]
+            if isinstance(completion, _Hint):
+                buffer.cancel_completion()
+                if event.key_sequence[0].key == "c-m":        # 回车：照常发送
+                    buffer.validate_and_handle()
+                return
             buffer.apply_completion(completion)
             if completion.text.rstrip('"').endswith("/"):
                 buffer.start_completion(select_first=False)

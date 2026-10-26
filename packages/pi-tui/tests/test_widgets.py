@@ -237,6 +237,25 @@ def test_viewer_state() -> None:
     check("查看器: e 全部展开（没正文的不算）", all(s.expanded for s in sections[:8]) and not sections[8].expanded)
 
 
+def test_quiet_cpr() -> None:
+    """终端回答光标位置慢了一下时，prompt_toolkit 会误报 "your terminal doesn't support ... (CPR)"：
+    去掉这句提示，但不改 2 秒的判定时间（改长了真不支持的终端每次回车都要多等）"""
+    from types import SimpleNamespace
+
+    from pi_tui.terminal import quiet_cpr
+
+    renderer = SimpleNamespace(cpr_not_supported_callback=print, CPR_TIMEOUT=2)
+    quiet_cpr(SimpleNamespace(renderer=renderer))
+    check("CPR: 不再打印不支持的警告", renderer.cpr_not_supported_callback is None)
+    check("CPR: 判定时间不动", renderer.CPR_TIMEOUT == 2)
+    quiet_cpr(SimpleNamespace())
+    check("CPR: 没有 renderer 的对象不报错", True)
+    if HAS_PROMPT_TOOLKIT:
+        from pi_tui.input import LineReader
+        reader = LineReader(commands=[])
+        check("CPR: 输入框装上了", reader.session.app.renderer.cpr_not_supported_callback is None)
+
+
 def test_background_and_notify() -> None:
     """浅色背景换一套压暗的颜色；背景深浅的探测顺序；提醒只写真正的终端"""
     import io
@@ -309,6 +328,7 @@ def main() -> int:
     test_live_region_host()
     test_viewer_state()
     test_background_and_notify()
+    test_quiet_cpr()
     print()
     if FAILURES:
         print(f"{len(FAILURES)} 处失败：")

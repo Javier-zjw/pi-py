@@ -557,9 +557,15 @@ def test_busy_command() -> None:
                                     for line in renderer._live_lines()), str(renderer._live_lines()))
     renderer.end_busy()
     check("忙: 结束后收起", renderer._busy_since is None and not renderer.ticker.running, str(renderer._busy_since))
-    renderer.agent_running = True
+    renderer.begin_busy("准备中")
+    renderer.on_event(ev("progress", text="等待 MCP 服务器连接：slow（最多 3 秒）"))
+    check("准备: 一轮开始前的进度也显示", "等待 MCP 服务器连接" in "\n".join(renderer._live_lines()))
+    renderer.on_event(ev("agent_start"))
+    check("准备: 一轮开始后活动区交给这一轮", renderer._busy_since is None
+          and "思考中" in "\n".join(renderer._live_lines()), "\n".join(renderer._live_lines()))
     renderer.begin_busy("/x")
     check("忙: 一轮运行中不接管活动区", renderer._busy_since is None)
+    renderer.ticker.stop()
 
 
 def test_turn_sections() -> None:

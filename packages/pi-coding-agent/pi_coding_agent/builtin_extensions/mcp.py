@@ -16,7 +16,8 @@ settings 的 permissions.allow 写 ``mcp__github__*`` 或 ``mcp__github`` 放行
 命令：``/mcp``（状态）、``/mcp tools [服务器]``、``/mcp add <配置>``（网站给的 JSON、
 ``claude mcp add`` / ``codex mcp add`` 命令、``npx ...`` 或地址，解析见 mcp/add.py；写进配置后只连这一个）、
 ``/mcp remove <服务器>``、``/mcp reconnect [服务器]``（重读配置并重连）、``/mcp import``。设置：``mcp.startupTimeout``（秒，默认 60：npx 第一次要下载）、
-``mcp.toolTimeout``（默认 120，服务器配置里的 timeout 优先）、``mcp.maxOutputChars``。
+``mcp.toolTimeout``（默认 120，服务器配置里的 timeout 优先）、``mcp.maxOutputChars``、
+``mcp.promptWait``（提问前最多等还没连上的服务器几秒，默认 3；没连上的这一轮先不用）。
 """
 
 from __future__ import annotations
@@ -65,7 +66,15 @@ def activate(pi) -> None:
         mgr = manager(session)
         if not mgr.servers:
             return
-        await mgr.ensure_started()
+        mgr.start()
+        pending = await mgr.wait(0)
+        if pending:
+            # 只等一小会儿：没连完的这一轮先不用（连上后下一轮自动加进来），别让提问干等
+            limit = float(session.settings.get("mcp.promptWait") or 3)
+            progress(session, f"等待 MCP 服务器连接：{'、'.join(pending)}（最多 {limit:g} 秒）")
+            pending = await mgr.wait(limit)
+            if pending:
+                progress(session, f"{'、'.join(pending)} 还在启动，这一轮先不用（/mcp 查看）")
         await mgr.refresh_changed()
         present = {t.name for t in session.agent.state.tools}
         extra = [t for t in mgr.agent_tools(read_only=session.mode == "plan") if t.name not in present]

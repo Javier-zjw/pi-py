@@ -15,6 +15,7 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import Any
 
+from .terminal import quiet_cpr
 from .theme import DEFAULT_THEME, Theme
 from .width import display_width, pad, truncate, wrap
 
@@ -215,6 +216,7 @@ async def _pick_rich(state: PickerState, title: str, theme: Theme, width: int,
         full_screen=False,
         erase_when_done=True,     # 选完整块擦掉，由调用方打一行结论
     )
+    quiet_cpr(app)
     return await app.run_async()
 
 

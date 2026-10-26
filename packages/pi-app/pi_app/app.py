@@ -515,6 +515,9 @@ class App:
 
     async def run_agent(self, run: Awaitable[Any]) -> None:
         self.turns += 1
+        if self.background:
+            # 交给模型之前还有准备（等 MCP 服务器、先压缩上下文）：先转起来，别让屏幕空着像没反应
+            self.renderer.begin_busy("准备中")
         try:
             await run
         except KeyboardInterrupt:
@@ -522,6 +525,7 @@ class App:
         except Exception as exc:
             self.error(f"{type(exc).__name__}: {exc}")
         finally:
+            self.renderer.end_busy()
             self._restore_undelivered()
         self.attention("这一轮做完了")
 

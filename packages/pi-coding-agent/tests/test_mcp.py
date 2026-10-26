@@ -608,6 +608,42 @@ async def case_add_command() -> None:
                         await value["manager"].close()
 
 
+async def case_slow_server() -> None:
+    """启动慢的服务器（npx 每次都要查源）不能挡住提问：最多等 mcp.promptWait 秒，没连上的这一轮先不用，
+    连上之后下一轮自动加进来"""
+    import time
+
+    with Sandbox() as cwd:
+        (cwd / ".pi").mkdir()
+        (cwd / ".pi" / "mcp.json").write_text(json.dumps({"mcpServers": {
+            "slow": {"command": sys.executable, "args": [SERVER], "env": {"FAKE_MCP_SLOW_INIT": "1.5"}}}}))
+        (cwd / ".pi" / "settings.json").write_text(json.dumps({"mcp": {"promptWait": 0.3}}))
+        models, _ = fake_models([[TextContent(text="好")], [TextContent(text="好")]])
+        runtime = ModelRuntime(models, cwd / "agent")
+        services = create_agent_session_services(cwd=cwd, agent_dir=cwd / "agent", model_runtime=runtime)
+        session = AgentSession(services, SessionManager.in_memory(cwd), model=FAKE_MODEL, tools=["read"])
+        notes: list[str] = []
+        session.subscribe(lambda e: notes.append(e.text) if e.type == "progress" else None)
+        try:
+            started = time.monotonic()
+            await session._prepare_run()
+            took = time.monotonic() - started
+            check("慢服务器: 提问只等 promptWait 秒", took < 1.2, f"{took:.2f}s")
+            check("慢服务器: 没连上的这一轮先不用", not any(t.name.startswith("mcp__slow__")
+                                                         for t in session.agent.state.tools))
+            check("慢服务器: 告诉界面在等、为什么这一轮没有它", any("等待 MCP 服务器连接：slow" in n for n in notes)
+                  and any("slow 还在启动，这一轮先不用" in n for n in notes), str(notes))
+            await asyncio.sleep(2.0)
+            await session._prepare_run()
+            check("慢服务器: 连上之后下一轮自动加进来", "mcp__slow__echo" in {t.name for t in session.agent.state.tools})
+        finally:
+            for hook in session.resources.get_extension_api().before_start_hooks:
+                for cell in getattr(hook, "__closure__", None) or ():
+                    value = cell.cell_contents
+                    if isinstance(value, dict) and value.get("manager") is not None:
+                        await value["manager"].close()
+
+
 # --------------------------------------------------------------------------- #
 # pytest 兼容层
 # --------------------------------------------------------------------------- #
@@ -628,6 +664,10 @@ def test_add_command() -> None:
     asyncio.run(case_add_command())
 
 
+def test_slow_server() -> None:
+    asyncio.run(case_slow_server())
+
+
 async def main() -> int:
     print("配置");        test_config(); test_import()
     print("stdio");       await case_stdio()
@@ -635,6 +675,7 @@ async def main() -> int:
     print("小函数");      test_helpers(); test_permissions()
     print("扩展");        await case_extension()
     print("/mcp add");    test_parse_add(); await case_add_command()
+    print("慢服务器");    await case_slow_server()
     print()
     if FAILURES:
         print(f"{len(FAILURES)} 处失败：")

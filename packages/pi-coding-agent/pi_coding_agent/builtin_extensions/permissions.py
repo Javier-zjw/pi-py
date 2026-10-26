@@ -44,7 +44,8 @@ MODES = {
     "auto": "全部自动",
 }
 SAFE_TOOLS = {"read", "grep", "find", "ls", "update_plan", "ask_user", "submit_plan",
-              "web_search", "web_fetch"}     # web_fetch 自己拒绝本机 / 内网地址
+              "web_search", "web_fetch",     # web_fetch 自己拒绝本机 / 内网地址
+              "task"}       # 派子智能体本身不用确认：它的每次工具调用另外经过检查
 EDIT_TOOLS = {"edit", "write"}
 
 # 只读命令：单独出现（或在管道、&& 里每一段都是）时不用问

@@ -27,7 +27,7 @@ from fakes import FAKE_MODEL, Sandbox, fake_models  # noqa: E402
 
 from pi_agent import CustomMessage
 from pi_ai import TextContent, ThinkingContent, ToolCall, Usage, UserMessage  # noqa: E402
-from pi_tui import Theme, display_width  # noqa: E402
+from pi_tui import Theme, display_width, strip_ansi  # noqa: E402
 from pi_tui.theme import ColorMode  # noqa: E402
 
 from pi_app.renderer import SLOT_LINES, SessionRenderer  # noqa: E402
@@ -517,6 +517,30 @@ def test_web_tool_lines() -> None:
           and "mcp__" not in live and "1234 字 · 1 张图" in live, live)
 
 
+def test_subagent_lines() -> None:
+    """子智能体：运行中显示描述和"正在做什么"，做完显示次数和用时；ctrl+o 里先列步骤再是报告；费用计入状态栏"""
+    renderer = SessionRenderer(theme=Theme(ColorMode.NONE), stream=io.StringIO())
+    renderer.on_event(ev("agent_start"))
+    renderer.on_event(ev("tool_execution_start", tool_call_id="t1", tool_name="task",
+                         arguments={"description": "调研认证模块", "prompt": "…"}))
+    renderer.on_event(ev("tool_execution_update", tool_call_id="t1", tool_name="task",
+                         partial=SimpleNamespace(details={"activity": "read src/auth.py", "tools": 3})))
+    live = "\n".join(renderer._live_lines())
+    check("子智能体: 运行中显示描述、正在做什么、次数", "子智能体  调研认证模块" in live
+          and "read src/auth.py · 3 次工具" in live, live)
+    renderer.on_event(ev("tool_execution_end", tool_call_id="t1", tool_name="task", is_error=False,
+                         result=SimpleNamespace(content=[SimpleNamespace(text="报告：认证在 src/auth.py:12")],
+                                                details={"tools": 5, "seconds": 12.3, "cost": 0.05,
+                                                         "steps": ["read src/auth.py", "grep login"]})))
+    live = "\n".join(renderer._live_lines())
+    check("子智能体: 做完显示次数和用时", "✓ 子智能体  调研认证模块  5 次工具 · 12.3s" in live, live)
+    check("子智能体: 费用计入状态栏", abs(renderer.status.cost - 0.05) < 1e-9, str(renderer.status.cost))
+    section = next(s for s in renderer.turn_sections(renderer.turn) if "子智能体" in s.title)
+    body = [strip_ansi(line) for line in section.body]
+    check("子智能体: ctrl+o 先列步骤再是报告", body[:2] == ["⏺ read src/auth.py", "⏺ grep login"]
+          and any("报告：认证在 src/auth.py:12" in line for line in body), str(body))
+
+
 def test_busy_command() -> None:
     """一轮之外的耗时命令：转圈 + 命令名 + 用时，扩展报的进度跟在后面；结束后收起"""
     renderer = SessionRenderer(theme=Theme(ColorMode.NONE), stream=io.StringIO())
@@ -741,6 +765,7 @@ async def main() -> int:
     test_tool_lines()
     test_web_tool_lines()
     test_busy_command()
+    test_subagent_lines()
     test_turn_sections()
     test_welcome()
     test_code_highlight()

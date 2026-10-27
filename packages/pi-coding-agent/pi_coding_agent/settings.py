@@ -52,6 +52,8 @@ DEFAULT_SETTINGS : dict[str, Any] = {
     # 按文件名通配配命令，{file} 换成路径，退出码非 0 就把输出（最多 maxLines 行）给模型
     # 长期记忆（builtin_extensions/memory.py）：每份最多多少字，写满了模型要先合并再记
     "memory": {"enabled": True, "userChars": 2000, "projectChars": 4000},
+    # /reflect（builtin_extensions/reflect.py）：回顾用的模型，留空用当前模型
+    "reflect": {"model": ""},
     "checks": {"enabled": True, "builtin": True, "timeout": 30, "maxLines": 30, "commands": {}},
     "web": {
         "fetch": {"maxChars": 20000, "timeout": 20},

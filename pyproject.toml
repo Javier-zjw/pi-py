@@ -6,11 +6,13 @@ requires-python = ">=3.10"
 
 [tool.uv.workspace]
 members = ["packages/*"]
+exclude = ["packages/pi-web"]   # 前端（Vue），不是 Python 包
 
 [tool.uv.sources]
 pi-ai = { workspace = true }
 pi-agent = { workspace = true }
 pi-coding-agent = { workspace = true }
+pi-tui = { workspace = true }
 
 [dependency-groups]
 dev = ["import-linter>=2.0", "pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.6"]

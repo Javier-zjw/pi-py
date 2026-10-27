@@ -277,9 +277,16 @@ async def run_interactive(session: AgentSession, show_thinking: bool) -> None:
             print(f"{RED}{type(exc).__name__}: {exc}{RESET}")
 
 
-async def run_print(session: AgentSession, message: str, as_json: bool) -> None:
+async def run_print(session: AgentSession, message: str, as_json: bool) -> int:
+    """跑完一条消息；最后一次模型调用出错（重试也没救回来）时返回 1——脚本、CI、评测靠退出码判断"""
     session.subscribe(json_printer if as_json else make_printer(False))
     await session.prompt(message)
+    last = next((m for m in reversed(session.messages) if getattr(m, "role", "") == "assistant"),
+                None)
+    if last is not None and last.stop_reason == "error":
+        print(f"{RED}model error: {last.error_message or 'unknown'}{RESET}", file=sys.stderr)
+        return 1
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -310,6 +317,15 @@ async def main_async(argv: list[str] | None = None) -> int:
     for note in services.diagnostics:
         print(f"{YELLOW}! {note}{RESET}", file=sys.stderr)
 
+    model = None
+    if args.model:
+        # 写错的模型名不能悄悄换成默认模型：评测、脚本会以为测的是它
+        model = services.model_runtime.resolve(args.model)
+        if model is None:
+            known = ", ".join(f"{m.provider}/{m.id}" for m in services.model_runtime.list_models())
+            print(f"{RED}Unknown model: {args.model}{RESET}\nKnown models: {known}", file=sys.stderr)
+            return 2
+
     if args.no_session:
         session_manager = SessionManager.in_memory(cwd)
     elif args.resume:
@@ -322,7 +338,7 @@ async def main_async(argv: list[str] | None = None) -> int:
     session = create_agent_session(
         services=services,
         session_manager=session_manager,
-        model=args.model,
+        model=model,
         thinking_level=args.think,
         tools=args.tools.split(",") if args.tools else None,
         exclude_tools=[t for t in args.exclude_tools.split(",") if t],
@@ -344,7 +360,7 @@ async def main_async(argv: list[str] | None = None) -> int:
         else:
             if not message:
                 message = sanitize(sys.stdin.read()).strip()
-            await run_print(session, message, as_json=(mode == "json"))
+            return await run_print(session, message, as_json=(mode == "json"))
     finally:
         session.dispose()
     return 0

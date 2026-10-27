@@ -92,6 +92,8 @@ class ExtensionAPI:
     # 工具执行后的钩子：(调用, 结果, 会话) → 新结果 | None。改完文件就检查、修剪吵闹的输出、
     # 反复出现的报错后面追加提示——都在这里，模型跳不过去（写在提示里的规则可能被忽略）
     after_tool_hooks: list[Callable[[Any, Any, Any], Awaitable[Any]]] = field(default_factory=list)
+    # 会话开始时拼进系统提示的片段：handler(session) → 文字 | None（记忆等）
+    prompt_sections: list[Callable[[Any], str | None]] = field(default_factory=list)
     owner: str = ""
     # 当前正在 activate 的扩展名，用于把注册项归属到扩展上
     ownership: dict[str, list[str]] = field(default_factory=dict)
@@ -245,6 +247,26 @@ class ExtensionAPI:
             if new is not None:
                 changed = new
         return changed
+
+    def system_prompt_section(self, handler: Callable[[Any], str | None]) -> None:
+        """会话开始时调一次 handler(session)，返回的文字接在基础系统提示后面——这次会话每轮都在、
+        子智能体也有，会话中途不再变（每轮都变的内容用 before_agent_start 改 state.system_prompt，
+        但那样会让前缀缓存失效）"""
+        self.prompt_sections.append(handler)
+        self._own("hook", "system_prompt_section")
+
+    def run_prompt_sections(self, session: Any) -> tuple[list[str], list[str]]:
+        """返回 (片段, 错误)；出错的片段跳过"""
+        parts, errors = [], []
+        for handler in list(self.prompt_sections):
+            try:
+                text = handler(session)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{type(exc).__name__}: {exc}")
+                continue
+            if text:
+                parts.append(text)
+        return parts, errors
 
     async def run_context_hook(self, messages: list) -> list:
         for handler in list(self.context_hooks):

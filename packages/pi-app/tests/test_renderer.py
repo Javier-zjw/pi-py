@@ -598,6 +598,32 @@ def test_check_display() -> None:
     check("检查: write 的输出里已经有了，不重复列", "检查没过 · python" not in body, body)
 
 
+def test_memory_line() -> None:
+    """长期记忆：不算工具调用；记成功了留一行「✎ 记住了（项目）：…」，没记上只进 ctrl+o"""
+    out = io.StringIO()
+    renderer = SessionRenderer(theme=Theme(ColorMode.NONE), stream=out)
+    renderer.on_event(ev("agent_start"))
+
+    def memory(call_id, details, error=False, text="Saved"):
+        renderer.on_event(ev("tool_execution_start", tool_call_id=call_id, tool_name="memory",
+                             arguments={"action": "add"}))
+        renderer.on_event(ev("tool_execution_end", tool_call_id=call_id, tool_name="memory", is_error=error,
+                             result=SimpleNamespace(content=[SimpleNamespace(text=text)], details=details)))
+
+    memory("m1", {"action": "add", "scope": "project", "text": "测试用 make test"})
+    memory("m2", {"action": "replace", "scope": "user", "text": "回答尽量简短", "old": "回答简短",
+                  "redacted": True})
+    memory("m3", {"action": "remove", "scope": "project", "old": "过时的那条"})
+    memory("m4", {"action": "add", "scope": "project"}, error=True, text="project memory is full (3990/4000)")
+    shown = out.getvalue()
+    check("记忆: 记下 / 改了 / 忘掉各留一行", "✎ 记住了（项目）：测试用 make test" in shown
+          and "✎ 改了记忆（全局）：回答尽量简短（密钥已隐去）" in shown
+          and "✎ 忘掉了（项目）：过时的那条" in shown, shown)
+    check("记忆: 没记上不打扰，只进 ctrl+o", "full" not in shown
+          and any("记忆没写成" in str(v) for k, v in renderer.turn.steps), str(renderer.turn.steps))
+    check("记忆: 不算工具调用", not renderer.turn.tools and "memory" not in "\n".join(renderer._live_lines()))
+
+
 def test_turn_sections() -> None:
     """查看器里的段落：按发生顺序，标题一行说清做了什么，正文是全文；失败的工具默认展开"""
     renderer = SessionRenderer(theme=Theme(ColorMode.NONE), stream=io.StringIO())
@@ -834,6 +860,7 @@ async def main() -> int:
     test_busy_command()
     test_subagent_lines()
     test_check_display()
+    test_memory_line()
     test_turn_sections()
     test_welcome()
     test_code_highlight()

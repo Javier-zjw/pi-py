@@ -200,7 +200,14 @@ class AgentSession:
         # 权限扩展按 permissions.nonInteractive 决定放行还是拒绝
         self.permission_handler: PermissionHandler | None = None
         self.agent.subscribe(self._on_agent_event)
-        self.resources.get_extension_api().session = self
+        api = self.resources.get_extension_api()
+        api.session = self
+        # 扩展在会话开始时拼进系统提示的片段（记忆）：进基线，这次会话里不再变
+        sections, errors = api.run_prompt_sections(self)
+        self.services.diagnostics += [f"system_prompt_section 失败：{e}" for e in errors]
+        if sections:
+            self._base_system_prompt = "\n\n".join([self._base_system_prompt, *sections])
+            self.agent.state.system_prompt = self._base_system_prompt
 
 
     def _repair_interrupted(self, restored: dict[str, Any]) -> list[str]:

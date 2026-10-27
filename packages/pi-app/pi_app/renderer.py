@@ -81,7 +81,8 @@ PREVIEW_ROWS = 12     # 回答还没定稿的部分（半行、没收齐的表�
 PLAN_TOOL = "update_plan"   # 任务计划（内置扩展 todo）：不算工具调用，显示成勾选单
 SUBMIT_TOOL = "submit_plan"  # 计划模式提交计划：不算工具调用，计划本身单独成块显示
 ASK_TOOL = "ask_user"         # 计划模式向用户提问：界面弹选择器，答案单独成行显示
-QUIET_TOOLS = (PLAN_TOOL, SUBMIT_TOOL, ASK_TOOL)
+MEMORY_TOOL = "memory"        # 长期记忆：不算工具调用，记成功了留一行「✎ 记住了」
+QUIET_TOOLS = (PLAN_TOOL, SUBMIT_TOOL, ASK_TOOL, MEMORY_TOOL)
 PLAN_ROWS = 8         # 计划最多显示几步
 ECHO_ROWS = (4, 8)    # 回显用户输入最多几行（终端高度的 1/3，夹在这个范围里），多的折叠
 TOOL_ROWS = 3         # 活动区里这一批工具最多显示几行（最新的几个）
@@ -632,6 +633,8 @@ class SessionRenderer:
     def _on_tool_execution_end(self, event) -> None:
         if event.tool_name == ASK_TOOL:
             self._show_answers(event.result)
+        if event.tool_name == MEMORY_TOOL:
+            self._show_memory(event)
         if event.tool_name in QUIET_TOOLS:
             return
         record = self.state.running.pop(event.tool_call_id, None)
@@ -854,6 +857,24 @@ class SessionRenderer:
         record = [f"提问：{a['question']} → {a['answer']}" for a in answers] or ["跳过了提问"]
         self.turn.steps.append(("text", "\n".join(record)))
         self._emit(lines)
+
+    def _show_memory(self, event) -> None:
+        """模型记下 / 改了 / 删了一条长期记忆：留一行，让用户知道它记了什么（不对可以 /memory forget）"""
+        details = getattr(event.result, "details", None)
+        details = details if isinstance(details, dict) else {}
+        if event.is_error or not details.get("action"):
+            # 没记上（写满了、找不到要改的那条）：模型会自己处理，过程里留个记录
+            text = "".join(getattr(c, "text", "") or "" for c in event.result.content or [])
+            self.turn.steps.append(("text", f"✎ 记忆没写成：{first_line(text, 200)}"))
+            return
+        t = self.theme
+        scope = "全局" if details.get("scope") == "user" else "项目"
+        verb = {"add": "记住了", "replace": "改了记忆", "remove": "忘掉了"}.get(details["action"], "记忆")
+        content = details.get("text") if details["action"] != "remove" else details.get("old")
+        note = "（密钥已隐去）" if details.get("redacted") else ""
+        line = f"✎ {verb}（{scope}）：{content or ''}{note}"
+        self.turn.steps.append(("text", line))
+        self._emit([t.muted(f"{INDENT}{truncate(line, max(self.width - len(INDENT) - 1, 20))}")])
 
     def _plan_open(self) -> bool:
         return bool(self.plan) and any(s.get("status") != "completed" for s in self.plan)

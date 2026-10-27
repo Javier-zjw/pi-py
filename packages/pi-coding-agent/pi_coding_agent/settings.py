@@ -50,6 +50,8 @@ DEFAULT_SETTINGS : dict[str, Any] = {
     # 改完就检查（builtin_extensions/checks.py）：edit / write 后检查那个文件，有问题附在工具结果后面。
     # builtin：内置的 Python 语法 / JSON / TOML 解析；commands：{"*.py": "ruff check -q {file}"} 这样
     # 按文件名通配配命令，{file} 换成路径，退出码非 0 就把输出（最多 maxLines 行）给模型
+    # 长期记忆（builtin_extensions/memory.py）：每份最多多少字，写满了模型要先合并再记
+    "memory": {"enabled": True, "userChars": 2000, "projectChars": 4000},
     "checks": {"enabled": True, "builtin": True, "timeout": 30, "maxLines": 30, "commands": {}},
     "web": {
         "fetch": {"maxChars": 20000, "timeout": 20},

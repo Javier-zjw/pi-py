@@ -131,11 +131,17 @@ async def run_subagent(
     max_turns: int = 30,
     cancel: asyncio.Event | None = None,
     on_activity: Callable[[str, int], None] | None = None,
+    role: str = "",
+    read_only: bool | None = None,
 ) -> SubagentResult:
-    """跑一个子智能体直到它交出报告（或被中断、出错、超出轮数）"""
+    """跑一个子智能体直到它交出报告（或被中断、出错、超出轮数）。role：自定义子智能体的角色说明；
+    read_only：系统提示里写明只读（默认 explore 才是）"""
     from pi_ai import is_retryable, retry_after
 
-    prompt = system_prompt + SUBAGENT_PROMPT + (READ_ONLY_PROMPT if kind == "explore" else "")
+    read_only = kind == "explore" if read_only is None else read_only
+    prompt = system_prompt + SUBAGENT_PROMPT + (READ_ONLY_PROMPT if read_only else "")
+    if role:
+        prompt += f'\n<agent_role name="{kind}">\n{role}\n</agent_role>'
     state = AgentState(system_prompt=prompt, model=model, thinking_level=thinking_level, tools=tools)
     retries = {"n": 0}
 

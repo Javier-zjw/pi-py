@@ -32,6 +32,7 @@ def parse_front_matter(text: str) -> tuple[dict[str, str], str]:
     - 值可以带引号；
     - 多行写法：``description: >``（折叠成一行）/ ``|``（保留换行），以及缩进的续行——
       别人写的技能（如 Agent-Reach）常这样写描述，只认单行会把描述读成 ``>``；
+    - 值为空、下面是 YAML 列表（``tools:`` 换行 ``- read``）时，记成逗号分隔的一行（``read, grep``）；
     - 值为空、下面缩进的是嵌套键（``metadata:``）时，这个键记成空串。
     """
     if not text.startswith("---"):
@@ -47,6 +48,11 @@ def parse_front_matter(text: str) -> tuple[dict[str, str], str]:
 
     def flush() -> None:
         if key is None or not block:
+            return
+        if style == "list":
+            items = [line for line in block if line]
+            if items and all(line.startswith("- ") for line in items):
+                meta[key] = ", ".join(line[2:].strip().strip("'\"") for line in items)
             return
         if style.startswith("|"):
             meta[key] = "\n".join(block).strip()
@@ -71,7 +77,9 @@ def parse_front_matter(text: str) -> tuple[dict[str, str], str]:
             key, style, meta[name] = name, value, ""
         else:
             meta[name] = value.strip("'\"")
-            key = name if value else None     # 空值下面是嵌套键，不收
+            key = name
+            if not value:           # 下面可能是列表（收）或嵌套键（不收，记空串）
+                style = "list"
     flush()
     return meta, body
 

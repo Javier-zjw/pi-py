@@ -46,6 +46,7 @@ class Agent:
             stream_options: dict[str, Any] | None = None,
             on_stream_error: Callable[[AssistantMessage], Awaitable[bool]] | None = None,
             max_error_retries: int = 2,
+            before_stop: Callable[[], Awaitable[list[AgentMessage]]] | None = None,
     ) -> None:
         self.state = initial_state or AgentState()
         self.stream_fn = stream_fn
@@ -58,6 +59,8 @@ class Agent:
         self.stream_options = stream_options or {}
         self.on_stream_error = on_stream_error
         self.max_error_retries = max_error_retries
+        # 模型要停、follow-up 队列也空了时问一次上层：返回消息就接着跑（Stop 钩子要求继续）
+        self.before_stop = before_stop
 
         self.steering_queue = PendingMessageQueue(mode=queue_mode)
         self.follower_queue = PendingMessageQueue(mode=queue_mode)
@@ -104,7 +107,10 @@ class Agent:
             return self.steering_queue.take()
 
         async def on_before_stop() -> list[AgentMessage]:
-            return self.follower_queue.take() or self.steering_queue.take()
+            queued = self.follower_queue.take() or self.steering_queue.take()
+            if queued or self.before_stop is None:
+                return queued
+            return await self.before_stop() or []
 
         return LoopConfig(
             stream_fn=self.stream_fn,

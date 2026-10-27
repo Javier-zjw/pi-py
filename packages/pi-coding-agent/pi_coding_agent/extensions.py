@@ -92,6 +92,10 @@ class ExtensionAPI:
     # 工具执行后的钩子：(调用, 结果, 会话) → 新结果 | None。改完文件就检查、修剪吵闹的输出、
     # 反复出现的报错后面追加提示——都在这里，模型跳不过去（写在提示里的规则可能被忽略）
     after_tool_hooks: list[Callable[[Any, Any, Any], Awaitable[Any]]] = field(default_factory=list)
+    # 用户提交一条消息时：handler(text, session) → PromptHookResult | None（拦下 / 补充上下文）
+    prompt_hooks: list[Callable[[str, Any], Awaitable[Any]]] = field(default_factory=list)
+    # 模型要停下时：handler(session) → 要它接着做的话 | None
+    stop_hooks: list[Callable[[Any], Awaitable[str | None]]] = field(default_factory=list)
     # 会话开始时拼进系统提示的片段：handler(session) → 文字 | None（记忆等）
     prompt_sections: list[Callable[[Any], str | None]] = field(default_factory=list)
     owner: str = ""
@@ -248,6 +252,47 @@ class ExtensionAPI:
                 changed = new
         return changed
 
+    def before_prompt(self, handler: Callable[[str, Any], Awaitable[Any]]) -> None:
+        """用户提交一条消息（prompt，不含运行中的插话）时调用 handler(原话, session)：返回
+        PromptHookResult(block=True, reason=…) 不发给模型（reason 给用户看）；context=[…] 作为附加文本块
+        跟在原话后面（同 @文件 的附件块，压缩和回显只取原话）。出错放行"""
+        self.prompt_hooks.append(handler)
+        self._own("hook", "before_prompt")
+
+    async def run_prompt_hooks(self, text: str, session: Any) -> PromptHookResult:
+        merged = PromptHookResult()
+        for handler in list(self.prompt_hooks):
+            try:
+                result = await handler(text, session)
+            except Exception as exc:  # noqa: BLE001
+                self.tool_call_errors.append(f"{type(exc).__name__}: {exc}")
+                continue
+            if result is None:
+                continue
+            merged.context += list(result.context)
+            if result.block:
+                merged.block, merged.reason = True, result.reason
+                break
+        return merged
+
+    def before_stop(self, handler: Callable[[Any], Awaitable[str | None]]) -> None:
+        """模型这一轮要停下（没调工具、排队的 follow-up 也送完了）时调用 handler(session)：返回一段话
+        就作为消息插进去让它接着做（如 Stop 钩子"测试还没跑"），None 照常停。出错照常停"""
+        self.stop_hooks.append(handler)
+        self._own("hook", "before_stop")
+
+    async def run_stop_hooks(self, session: Any) -> list[str]:
+        reasons = []
+        for handler in list(self.stop_hooks):
+            try:
+                reason = await handler(session)
+            except Exception as exc:  # noqa: BLE001
+                self.tool_call_errors.append(f"{type(exc).__name__}: {exc}")
+                continue
+            if reason:
+                reasons.append(reason)
+        return reasons
+
     def system_prompt_section(self, handler: Callable[[Any], str | None]) -> None:
         """会话开始时调一次 handler(session)，返回的文字接在基础系统提示后面——这次会话每轮都在、
         子智能体也有，会话中途不再变（每轮都变的内容用 before_agent_start 改 state.system_prompt，
@@ -295,6 +340,13 @@ class ExtensionAPI:
         if self.session is None:
             raise RuntimeError("no session bound to this extension runtime")
         await self.session.prompt(text)
+
+
+@dataclass
+class PromptHookResult:
+    block: bool = False
+    reason: str = ""                # 拦下时给用户看的说明
+    context: list[str] = field(default_factory=list)    # 跟在用户原话后面给模型看的补充
 
 
 @dataclass

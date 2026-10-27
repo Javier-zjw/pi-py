@@ -35,6 +35,7 @@ from .session import SessionManager
 from .session_events import (
     AttachmentsEvent,
     ModeChangedEvent,
+    NoticeEvent,
     PlanProposedEvent,
     ProgressEvent,
     TodoUpdatedEvent,
@@ -56,6 +57,7 @@ __all__ = [
     "AgentSession",
     "AgentSessionServices",
     "AttachmentsEvent",
+    "NoticeEvent",
     "BASE_SYSTEM_PROMPT",
     "CONFIG_DIR_NAME",
     "Command",

@@ -624,6 +624,18 @@ def test_memory_line() -> None:
     check("记忆: 不算工具调用", not renderer.turn.tools and "memory" not in "\n".join(renderer._live_lines()))
 
 
+def test_notice_line() -> None:
+    """扩展的说明（钩子）：一行 ⚙，警告和普通的颜色不同；也记进 ctrl+o"""
+    out = io.StringIO()
+    renderer = SessionRenderer(theme=Theme(ColorMode.NONE), stream=out)
+    renderer.on_event(SimpleNamespace(type="notice", text="钩子拦下了 bash：别删库", level="warn", source="hook"))
+    renderer.on_event(SimpleNamespace(type="notice", text="PostToolUse 钩子 fmt 超时（0.5 秒），没有生效",
+                                      level="info", source="hook"))
+    shown = out.getvalue()
+    check("说明: 每条一行 ⚙", "⚙ 钩子拦下了 bash：别删库" in shown and "⚙ PostToolUse 钩子 fmt 超时" in shown, shown)
+    check("说明: 记进这一轮的过程", sum("⚙" in str(v) for _, v in renderer.turn.steps) == 2)
+
+
 def test_turn_sections() -> None:
     """查看器里的段落：按发生顺序，标题一行说清做了什么，正文是全文；失败的工具默认展开"""
     renderer = SessionRenderer(theme=Theme(ColorMode.NONE), stream=io.StringIO())
@@ -861,6 +873,7 @@ async def main() -> int:
     test_subagent_lines()
     test_check_display()
     test_memory_line()
+    test_notice_line()
     test_turn_sections()
     test_welcome()
     test_code_highlight()

@@ -231,6 +231,10 @@ class EventTranslator:
                  "text": f"⟳ {event.error[:120]} · {event.delay:g}s 后第 "
                          f"{event.attempt}/{event.max_attempts} 次重试"}]
 
+    def _on_notice(self, event) -> list[dict]:
+        # 扩展给用户的一行说明（钩子等）：复用说明帧
+        return [{"type": "injected", "notice": True, "text": f"⚙ {event.text}"}]
+
     def _on_attachments(self, event) -> list[dict]:
         # @文件附上了什么、附不上的提醒：同样复用说明帧
         items = [f"{i['label']}（{i['note']}）" if i.get("note") else i["label"]

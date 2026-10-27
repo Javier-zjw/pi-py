@@ -158,6 +158,7 @@ class AgentSession:
             on_stream_error=self._on_stream_error,
             before_tool_call=self._before_tool_call,
             after_tool_call=self._after_tool_call,
+            before_stop=self._before_stop,
             # 重试次数由 _retry_after_error 按设置控制；这里给够余量（+1 留给上下文超长的那次）
             max_error_retries=int(self.settings.get("retry.maxRetries", 3) or 0) + 1,
         )
@@ -589,6 +590,16 @@ class AgentSession:
             return None
         return AfterToolCallResult(result=new, terminate=bool(getattr(new, "terminate", False)))
 
+    async def _before_stop(self) -> list[AgentMessage]:
+        """模型要停下时问扩展（hooks.json 的 Stop）：有话要说就插一条消息让它接着做"""
+        reasons = await self.resources.get_extension_api().run_stop_hooks(self)
+        if not reasons:
+            return []
+        text = "\n\n".join(reasons)
+        first = text.strip().splitlines()[0][:120] if text.strip() else ""
+        return [CustomMessage(custom_type="stop_hook", content=text, timestamp=time.time(),
+                              details={"notice": f"钩子要求继续：{first}"})]
+
     async def ask_user(self, questions: list[dict[str, Any]]) -> list[dict[str, Any]] | None:
         """让界面向用户提问。questions 每项 {question, header?, options: [{label, description?,
         recommended?}]}；返回每题的 {question, answer, custom}，用户跳过返回 None。
@@ -624,19 +635,33 @@ class AgentSession:
             expand_prompt_templates: bool = True,
             expand_mentions: bool = True,
     ) -> list[AgentMessage]:
+        from .session_events import NoticeEvent
+
+        # 扩展的提交钩子（hooks.json 的 UserPromptSubmit）：看的是用户原话（模板展开前，同 Claude Code）
+        hooked = await self.resources.get_extension_api().run_prompt_hooks(text, self)
+        if hooked.block:
+            self._emit(NoticeEvent(text=f"这条消息没有发出：{hooked.reason or '被钩子拦下'}",
+                                   level="warn", source="hook"))
+            return []
         if expand_prompt_templates:
             text = self.expand_prompt_template(text)
         message: AgentMessage | str = text
         extra = ""
         if expand_mentions:
-            message, extra = self._attach_mentions(text, images)
+            message, extra = self._attach_mentions(text, images, hooked.context)
             images = None
+        elif hooked.context:
+            message = UserMessage(content=[TextContent(text=text),
+                                           *[TextContent(text=c) for c in hooked.context],
+                                           *(images or [])], timestamp=time.time())
+            images, extra = None, "\n".join(hooked.context)
         await self._compaction_idle.wait()
         # 先压缩、后执行：新请求本身不参与压缩，压缩完成后才追加
         await self._prepare_run(extra_text=text + extra)
         return await self.agent.prompt(message, images)
 
-    def _attach_mentions(self, text: str, images: Iterable[ImageContent] | None):
+    def _attach_mentions(self, text: str, images: Iterable[ImageContent] | None,
+                         context: Sequence[str] = ()):
         """@文件 / 拖进来的图片 → 用户消息的附件块（见 mentions.py）。返回 (消息, 附件文字)。
         原话、附件文字、图片分成几个块：原话还是原话，压缩时提取用户原话不会被文件内容撑大"""
         from .mentions import expand_mentions
@@ -650,13 +675,16 @@ class AgentSession:
             self._emit(AttachmentsEvent(
                 items=[{"label": a.label, "kind": a.kind, "note": a.note} for a in expanded.attachments],
                 warnings=expanded.warnings))
-        if not expanded.context and not all_images:
+        if not expanded.context and not all_images and not context:
             return text, ""
         content: list[Any] = [TextContent(text=text)]
         if expanded.context:
             content.append(TextContent(text=expanded.context))
+        # 扩展补充的上下文（提交钩子的输出）：同附件一样跟在原话后面，原话还是第一个文本块
+        content += [TextContent(text=c) for c in context]
         content.extend(all_images)
-        return UserMessage(content=content, timestamp=time.time()), expanded.context
+        return (UserMessage(content=content, timestamp=time.time()),
+                "\n".join([expanded.context, *context]).strip())
 
     async def _prepare_run(self, extra_text: str = "") -> None:
         """每次运行前（新请求或续跑）：模式、扩展钩子、按需压缩"""

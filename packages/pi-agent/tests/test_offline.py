@@ -602,6 +602,24 @@ async def case_follow_up() -> None:
     check("后续: 触发了第二轮", "第二轮" in texts, str(texts))
 
 
+async def case_before_stop() -> None:
+    asked: list[int] = []
+
+    async def before_stop():
+        asked.append(len(asked))
+        return [UserMessage(content="Stop 钩子：还没跑测试", timestamp=0)] if len(asked) == 1 else []
+
+    agent, _ = make_agent([[TextContent(text="第一轮")], [TextContent(text="跑完了")]],
+                          before_stop=before_stop)
+    agent.follow_up("排队的后续")
+    await agent.prompt("go")
+    texts = [m.text() for m in agent.state.messages]
+    check("要停时: 先送排队的 follow-up，再问 before_stop", texts.index("排队的后续")
+          < texts.index("Stop 钩子：还没跑测试"), str(texts))
+    check("要停时: before_stop 返回消息就接着跑，返回空才停", "跑完了" in texts and len(asked) == 2,
+          str(texts))
+
+
 async def case_abort() -> None:
     started = asyncio.Event()
 
@@ -969,6 +987,10 @@ def test_follow_up() -> None:
     asyncio.run(case_follow_up())
 
 
+def test_before_stop() -> None:
+    asyncio.run(case_before_stop())
+
+
 def test_abort() -> None:
     asyncio.run(case_abort())
 
@@ -1031,6 +1053,7 @@ async def main() -> int:
     print("队列与中断")
     await case_steering()
     await case_follow_up()
+    await case_before_stop()
     await case_abort()
     await case_abort_silent_model()
     await case_max_turns()

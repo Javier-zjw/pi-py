@@ -806,6 +806,14 @@ class SessionRenderer:
         self.ticker.stop()
         self.live.finalize()
 
+    def _on_notice(self, event) -> None:
+        """扩展给用户的一行说明（钩子拦下了提交、钩子出错 / 超时、钩子的 systemMessage……）"""
+        t = self.theme
+        mark = t.warn("⚙") if event.level == "warn" else t.muted("⚙")
+        text = truncate(" ".join(str(event.text).split()), max(self.width - len(INDENT) - 3, 20))
+        self.turn.steps.append(("text", f"⚙ {event.text}"))
+        self._emit([f"{INDENT}{mark} {t.muted(text)}"])
+
     def _on_attachments(self, event) -> None:
         """发送前 @ 附上了什么：一行列出；附不上的（看不了图、太大、二进制）各一行提醒"""
         t = self.theme

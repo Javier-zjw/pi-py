@@ -96,6 +96,13 @@ def activate(pi) -> None:
 
     async def check(call, session):
         decision, detail = decide(session, call.name, call.arguments or {})
+        # hooks.json 的 PreToolUse 钩子给的意见（hooks 扩展先于这里跑）：allow 免确认、ask 强制确认；
+        # deny 规则照样优先（同 Claude Code："deny and ask rules are still evaluated"）
+        hint = hook_hints(session).pop(getattr(call, "id", ""), None)
+        if hint == "allow" and decision == "ask":
+            return None
+        if hint == "ask" and decision == "allow":
+            decision = "ask"
         if decision == "allow":
             return None
         if decision == "deny":
@@ -146,6 +153,15 @@ def activate(pi) -> None:
 
     pi.register_command("permissions", "查看或切换权限模式（ask / acceptEdits / auto）", cmd_permissions,
                         usage="/permissions [ask|acceptEdits|auto]")
+
+
+def hook_hints(session) -> dict[str, str]:
+    """PreToolUse 钩子对某次调用的意见：{tool_call_id: allow | ask}，挂在会话对象上（同 _permission_state）"""
+    hints = getattr(session, "_hook_permission", None)
+    if hints is None:
+        hints = {}
+        session._hook_permission = hints
+    return hints
 
 
 def describe(session) -> str:

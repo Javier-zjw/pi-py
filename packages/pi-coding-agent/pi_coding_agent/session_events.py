@@ -33,6 +33,15 @@ class AttachmentsEvent:
 
 
 @dataclass
+class NoticeEvent:
+    """给用户看的一行说明（钩子拦下了提交、钩子报错、钩子的 systemMessage……）"""
+    text: str
+    level: Literal["info", "warn"] = "info"
+    source: str = ""
+    type: Literal["notice"] = "notice"
+
+
+@dataclass
 class ProgressEvent:
     """耗时操作（扩展命令，如 /mcp add 连服务器）进行到哪一步：界面在转圈后面显示这句话"""
     text: str

@@ -157,6 +157,11 @@ def _message_text(message: Any) -> str:
                    if getattr(block, "type", "") == "text").strip()
 
 
+def _check_failed(record: Any) -> bool:
+    """edit / write 后的检查（checks 扩展）发现了问题"""
+    return (record.details or {}).get("check", {}).get("ok") is False
+
+
 def first_line(text: str, limit: int) -> str:
     for line in (text or "").split("\n"):
         if line.strip():
@@ -445,7 +450,13 @@ class SessionRenderer:
                         # 子智能体：先列它做过的每一步，再是交回的报告
                         body += [t.muted(f"⏺ {step}") for step in record.details["steps"]] + [""]
                     body += wrapped(record.output, t.muted if not record.is_error else t.error)
-                sections.append(Section(title, clip(body), expanded=record.is_error))
+                # edit 显示的是 diff、看不到工具输出，检查结果单独列；write 的输出里已经带着了
+                for problem in ((record.details.get("check") or {}).get("problems") or []
+                                if record.patch else []):
+                    body += [t.warn(f"⚠ 检查没过 · {problem.get('source', '')}")]
+                    body += wrapped(str(problem.get("message") or ""), t.warn)
+                sections.append(Section(title, clip(body),
+                                        expanded=record.is_error or _check_failed(record)))
         return sections
 
     def expand_last_turn(self) -> None:
@@ -1189,6 +1200,8 @@ class SessionRenderer:
             _, added, removed, note = change
             stat = f"{t.success(f'+{added}')} {t.error(f'−{removed}')}" if record.name == "edit" else \
                 t.success(f"{note} {added} 行")
+            if _check_failed(record):
+                stat += f" {t.warn('⚠ 检查没过')}"     # 改完就检查（checks 扩展）发现了问题
             return stat
         if record.name == "read" and details.get("lines") is not None:
             return t.muted(f"{details['lines']} 行")

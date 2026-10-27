@@ -566,6 +566,38 @@ def test_busy_command() -> None:
     renderer.ticker.stop()
 
 
+def test_check_display() -> None:
+    """改完就检查发现问题：工具行在加减行数后面标 ⚠，ctrl+o 里那段默认展开、列出问题"""
+    out = io.StringIO()
+    renderer = SessionRenderer(theme=Theme(ColorMode.NONE), stream=out)
+    renderer.cwd = "/work"
+    renderer.on_event(ev("agent_start"))
+    check_info = {"ok": False, "file": "bad.py", "problems": [
+        {"source": "python", "message": "syntax error at line 1, column 7: invalid syntax\n    1 | def f(:"}]}
+    for call_id, name, details in (
+            ("w1", "write", {"path": "/work/bad.py", "created": True, "check": check_info}),
+            ("e1", "edit", {"path": "/work/ok.py", "patch": "-a\n+b\n"}),
+            ("e2", "edit", {"path": "/work/bad2.py", "patch": "-a\n+b(\n", "check": check_info})):
+        renderer.on_event(ev("tool_execution_start", tool_call_id=call_id, tool_name=name,
+                             arguments={"path": details["path"], "content": "def f(:\n"}))
+        renderer.on_event(ev("tool_execution_end", tool_call_id=call_id, tool_name=name, is_error=False,
+                             result=SimpleNamespace(content=[SimpleNamespace(text="Created")],
+                                                    details=details)))
+    live = "\n".join(renderer._live_lines())
+    check("检查: 工具行标出检查没过、不当成失败", "✓ write  bad.py  新建 1 行 ⚠ 检查没过" in live, live)
+    check("检查: 没问题的照常", "✓ edit  ok.py  +1 −1" in live and live.count("⚠") == 2, live)
+    sections = renderer.turn_sections(renderer.turn)
+    bad = next(s for s in sections if "bad.py" in strip_ansi(s.title))
+    good = next(s for s in sections if "ok.py" in strip_ansi(s.title))
+    body = "\n".join(strip_ansi(line) for line in bad.body)
+    check("检查: ctrl+o 里默认展开", bad.expanded and not good.expanded)
+    edited = next(s for s in sections if "bad2.py" in strip_ansi(s.title))
+    edited_body = "\n".join(strip_ansi(line) for line in edited.body)
+    check("检查: edit 显示 diff，问题列在 diff 下面", edited.expanded and "+b(" in edited_body
+          and "⚠ 检查没过 · python" in edited_body and "1 | def f(:" in edited_body, edited_body)
+    check("检查: write 的输出里已经有了，不重复列", "检查没过 · python" not in body, body)
+
+
 def test_turn_sections() -> None:
     """查看器里的段落：按发生顺序，标题一行说清做了什么，正文是全文；失败的工具默认展开"""
     renderer = SessionRenderer(theme=Theme(ColorMode.NONE), stream=io.StringIO())
@@ -801,6 +833,7 @@ async def main() -> int:
     test_web_tool_lines()
     test_busy_command()
     test_subagent_lines()
+    test_check_display()
     test_turn_sections()
     test_welcome()
     test_code_highlight()

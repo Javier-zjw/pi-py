@@ -89,6 +89,9 @@ class ExtensionAPI:
         default_factory=list
     )
     tool_call_errors: list[str] = field(default_factory=list)
+    # 工具执行后的钩子：(调用, 结果, 会话) → 新结果 | None。改完文件就检查、修剪吵闹的输出、
+    # 反复出现的报错后面追加提示——都在这里，模型跳不过去（写在提示里的规则可能被忽略）
+    after_tool_hooks: list[Callable[[Any, Any, Any], Awaitable[Any]]] = field(default_factory=list)
     owner: str = ""
     # 当前正在 activate 的扩展名，用于把注册项归属到扩展上
     ownership: dict[str, list[str]] = field(default_factory=dict)
@@ -222,6 +225,26 @@ class ExtensionAPI:
                 arguments = result.arguments
                 call.arguments = arguments
         return BeforeToolCallResult(arguments=arguments) if arguments is not None else None
+
+    def after_tool_call(self, handler: Callable[[Any, Any, Any], Awaitable[Any]]) -> None:
+        """工具执行完（被拦下的不算）调用 handler(call, result, session)：返回新的 AgentToolResult
+        替换结果（给模型看的和界面显示的都换），返回 None 不改。多个钩子按注册顺序串起来，
+        后一个拿到前一个改过的结果"""
+        self.after_tool_hooks.append(handler)
+        self._own("hook", "after_tool_call")
+
+    async def run_after_tool_hooks(self, call: Any, result: Any, session: Any) -> Any | None:
+        changed = None
+        for handler in list(self.after_tool_hooks):
+            try:
+                new = await handler(call, changed or result, session)
+            except Exception as exc:  # noqa: BLE001
+                # 坏钩子不该吞掉工具结果：记下来，保留原结果
+                self.tool_call_errors.append(f"{type(exc).__name__}: {exc}")
+                continue
+            if new is not None:
+                changed = new
+        return changed
 
     async def run_context_hook(self, messages: list) -> list:
         for handler in list(self.context_hooks):

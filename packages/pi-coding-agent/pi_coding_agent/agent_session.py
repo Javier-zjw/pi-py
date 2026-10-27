@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterable, Sequence
 
 from pi_agent import (
+    AfterToolCallResult,
     Agent,
     AgentEvent,
     AgentMessage,
@@ -156,6 +157,7 @@ class AgentSession:
             transform_context=self._transform_context,
             on_stream_error=self._on_stream_error,
             before_tool_call=self._before_tool_call,
+            after_tool_call=self._after_tool_call,
             # 重试次数由 _retry_after_error 按设置控制；这里给够余量（+1 留给上下文超长的那次）
             max_error_retries=int(self.settings.get("retry.maxRetries", 3) or 0) + 1,
         )
@@ -573,6 +575,12 @@ class AgentSession:
 
     async def _before_tool_call(self, call: Any, state: Any) -> Any:
         return await self.resources.get_extension_api().run_tool_call_hooks(call, self)
+
+    async def _after_tool_call(self, call: Any, result: Any, state: Any) -> Any:
+        new = await self.resources.get_extension_api().run_after_tool_hooks(call, result, self)
+        if new is None:
+            return None
+        return AfterToolCallResult(result=new, terminate=bool(getattr(new, "terminate", False)))
 
     async def ask_user(self, questions: list[dict[str, Any]]) -> list[dict[str, Any]] | None:
         """让界面向用户提问。questions 每项 {question, header?, options: [{label, description?,

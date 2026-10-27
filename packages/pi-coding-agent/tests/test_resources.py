@@ -491,7 +491,7 @@ def test_resource_loader() -> None:
         check("资源: 发现上下文文件",
               any("项目约定" in f.content for f in loader.get_context_files()))
         check("资源: 加载扩展",
-              [e.name for e in loader.get_extensions()] == ["mcp", "permissions", "plan_mode", "subagents", "todo", "tool_budget", "web", "demo-ext"],
+              [e.name for e in loader.get_extensions()] == ["checks", "mcp", "permissions", "plan_mode", "subagents", "todo", "tool_budget", "web", "demo-ext"],
               str([(e.name, e.error) for e in loader.get_extensions()]))
         check("资源: 扩展注册的工具可取",
               [t.name for t in loader.get_extension_api().tools] == ["task", "update_plan", "web_search", "web_fetch", "hello"])

@@ -47,6 +47,10 @@ DEFAULT_SETTINGS : dict[str, Any] = {
     # （"auto" = 配了 key 的 API 在前、再试免 key 的；也可以写后端名列表）、是否用免 key 兜底
     # 子智能体（builtin_extensions/subagents.py）：model 留空用当前模型，可写 provider/model 换便宜的
     "subagents": {"model": "", "maxTurns": 30, "maxParallel": 4, "maxOutputChars": 20000},
+    # 改完就检查（builtin_extensions/checks.py）：edit / write 后检查那个文件，有问题附在工具结果后面。
+    # builtin：内置的 Python 语法 / JSON / TOML 解析；commands：{"*.py": "ruff check -q {file}"} 这样
+    # 按文件名通配配命令，{file} 换成路径，退出码非 0 就把输出（最多 maxLines 行）给模型
+    "checks": {"enabled": True, "builtin": True, "timeout": 30, "maxLines": 30, "commands": {}},
     "web": {
         "fetch": {"maxChars": 20000, "timeout": 20},
         "search": {"backends": "auto", "keyless": True, "limit": 5, "timeout": 12},

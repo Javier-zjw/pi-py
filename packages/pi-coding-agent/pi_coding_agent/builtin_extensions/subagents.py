@@ -102,6 +102,8 @@ def activate(pi) -> None:
                 task=brief, kind=kind, model=model, stream_fn=session.model_runtime.stream_fn,
                 system_prompt=session._base_system_prompt, tools=tools, cwd=session.cwd,
                 thinking_level=session.agent.state.thinking_level, before_tool_call=guard,
+                # 工具执行后的钩子（改完就检查等）和主会话一样
+                after_tool_call=session._after_tool_call,
                 max_turns=max(int(get("subagents.maxTurns") or 30), 2), cancel=ctx.cancel_event,
                 on_activity=activity)
 

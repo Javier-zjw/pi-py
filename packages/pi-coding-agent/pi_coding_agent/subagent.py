@@ -127,6 +127,7 @@ async def run_subagent(
     cwd: str,
     thinking_level: str = "off",
     before_tool_call: Any = None,
+    after_tool_call: Any = None,
     max_turns: int = 30,
     cancel: asyncio.Event | None = None,
     on_activity: Callable[[str, int], None] | None = None,
@@ -148,6 +149,7 @@ async def run_subagent(
 
     agent = Agent(stream_fn=stream_fn, initial_state=state, tool_execution="parallel",
                   max_turns=max_turns + 2, before_tool_call=before_tool_call,
+                  after_tool_call=after_tool_call,
                   on_stream_error=on_stream_error, max_error_retries=4)
     result = SubagentResult(report="")
     started = time.monotonic()

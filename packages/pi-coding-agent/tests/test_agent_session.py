@@ -1961,6 +1961,50 @@ def test_cli_printers() -> None:
     check("CLI: 文本渲染器可构造", callable(printer))
 
 
+async def case_cli_exit_codes() -> None:
+    """评测、脚本靠退出码：模型名写错不能悄悄换成默认模型，模型报错不能退出 0"""
+    from pi_coding_agent.cli import main_async, run_print
+
+    with Sandbox() as cwd:
+        err = io.StringIO()
+        real_stderr, sys.stderr = sys.stderr, err
+        try:
+            code = await main_async(["-C", str(cwd), "--agent-dir", str(cwd / "agent"),
+                                     "-m", "nope/nope", "hi"])
+        finally:
+            sys.stderr = real_stderr
+        check("CLI: 写错的模型名退出 2 并说明", code == 2 and "Unknown model: nope/nope"
+              in err.getvalue() and "Known models:" in err.getvalue(), f"{code} {err.getvalue()}")
+        check("CLI: 模型名写错时不建会话文件", not (cwd / "agent" / "sessions").exists())
+
+        session, provider = make_session(cwd, [[TextContent(text="好")]])
+        out = io.StringIO()
+        real_stdout, sys.stdout = sys.stdout, out
+        try:
+            ok = await run_print(session, "在吗", as_json=False)
+        finally:
+            sys.stdout = real_stdout
+        check("CLI: 正常回答退出 0", ok == 0 and "好" in out.getvalue(), out.getvalue())
+
+        def failing(model, context, options=None):
+            async def gen():
+                message = AssistantMessage(stop_reason="error", error_message="401 invalid api key")
+                yield StartEvent(partial=message)
+                yield ErrorEvent(error="401", message=message)
+            return gen()
+
+        provider.fn = failing
+        err = io.StringIO()
+        real_stdout, real_stderr = sys.stdout, sys.stderr
+        sys.stdout, sys.stderr = io.StringIO(), err
+        try:
+            code = await run_print(session, "再问", as_json=True)
+        finally:
+            sys.stdout, sys.stderr = real_stdout, real_stderr
+        check("CLI: 模型报错退出 1 并把原因写到 stderr", code == 1
+              and "401 invalid api key" in err.getvalue(), f"{code} {err.getvalue()}")
+
+
 async def case_cli_commands() -> None:
     from pi_coding_agent.cli import handle_command
 
@@ -2176,6 +2220,10 @@ def test_cli_commands() -> None:
     asyncio.run(case_cli_commands())
 
 
+def test_cli_exit_codes() -> None:
+    asyncio.run(case_cli_exit_codes())
+
+
 async def main() -> int:
     print("端到端")
     await case_simple_turn()
@@ -2236,6 +2284,7 @@ async def main() -> int:
     test_cli_parser()
     test_cli_printers()
     await case_cli_commands()
+    await case_cli_exit_codes()
 
     print()
     if FAILURES:

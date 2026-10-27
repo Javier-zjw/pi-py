@@ -1,0 +1,30 @@
+schema_version = "1.4"
+# 智能体干完活后把 /app 拷进判定容器
+artifacts = ["/app"]
+
+[task]
+name = "pi-py/add-top-option"
+description = "给命令行工具加 --top 选项，保持原输出不变"
+authors = []
+keywords = []
+
+[metadata]
+difficulty = "medium"
+category = "feature"
+tags = ["python", "cli", "feature", "zh"]
+
+[verifier]
+timeout_sec = 120.0
+# 判定在另起的干净容器里跑：智能体看不到 /tests，也改不了判定用的环境
+environment_mode = "separate"
+
+[agent]
+timeout_sec = 900.0
+
+[environment]
+# 智能体要联网调模型；任务本身不需要网络
+network_mode = "public"
+build_timeout_sec = 600.0
+os = "linux"
+cpus = 1
+memory_mb = 2048

@@ -18,7 +18,10 @@ cd packages/pi-web && npm install
 npm run dev                               # Vite 5173，/api 代理到 8848
 npm run build                             # 产物写入 packages/pi-server/pi_server/web/
 
-ruff check packages                       # line-length 100, py310
+ruff check packages evals                 # line-length 100, py310
+
+evals/run.sh -m <provider/model> [-k 3]   # Harbor 评测当前工作区（要 Docker + uv tool install harbor），见 evals/README.md
+python evals/compare.py evals/jobs/A evals/jobs/B   # 对比两次评测，标出变好 / 退步的任务
 ```
 
 ### 测试
@@ -35,6 +38,8 @@ python packages/pi-app/tests/test_renderer.py            # 终端渲染：真会
 python packages/pi-app/tests/test_commands.py            # 斜杠命令：命令表、/model 选择器、/clear、/resume 等
 python packages/pi-tui/tests/test_widgets.py             # 命令补全候选、选择器状态与渲染
 python packages/pi-tui/tests/test_markdown.py            # 流式 Markdown：块、表格、行内、折行
+python evals/tests/test_pi_py_eval.py                    # Harbor 接入：打包指纹、密钥、容器命令、任务集结构
+python evals/tests/test_compare.py                       # 评测结果汇总 / 对比
 ```
 
 pytest 下 `check()` 失败会抛 AssertionError（`under_pytest()` 必须在调用时判断环境变量，不能在 import 时求值，否则 pytest 会假绿）。pi-ai 和 pi-agent 的测试文件都叫 `test_offline.py` 且没有 `__init__.py`，必须**按包分别运行**，一次性收集会报 import file mismatch：
@@ -46,7 +51,7 @@ cd packages/pi-coding-agent && pytest tests/test_session.py::test_persistence   
 
 新增用例时沿用现有写法：异步逻辑写成 `async def case_xxx()`，在文件末尾的 pytest 兼容层加同步壳 `def test_xxx(): asyncio.run(case_xxx())`，并加进 `main()`。
 
-`tests/manual/*.py` 需要真实模型和密钥，不属于离线测试。`packages/pi-agent/tests/CHECKLIST.md` 把每条断言映射到实现位置，断言变红时先查它。
+`tests/manual/*.py` 需要真实模型和密钥，不属于离线测试；`evals/`（Harbor）要 Docker，改了 `evals/tasks` 先用 `harbor run -p evals/tasks -a oracle`（应全 1）和 `-a nop`（应全 0）验证任务本身。`packages/pi-agent/tests/CHECKLIST.md` 把每条断言映射到实现位置，断言变红时先查它。
 
 ## 分支与合并
 
@@ -153,3 +158,12 @@ pi-web（Vue 3 + Vite，只通过 HTTP/SSE 与 pi-server 通信）
 内置扩展：`builtin_extensions/checks.py`（改完就检查，参照 Harness² / OpenCode，逻辑在 `pi_coding_agent/checks.py`：edit / write 成功后经 `after_tool_call` 检查那个文件——内置的 `.py` / `.pyi` 语法（`compile`，不执行；报行列和那一行，注明用哪个 Python 版本查的）、`.json` / `.ipynb`（允许注释的 tsconfig / jsconfig / `*.jsonc` / `.vscode/` 跳过）、`.toml`（3.11+ 的 tomllib），超 2MB 或非 UTF-8 不查；settings `checks.commands` 按文件名通配配命令（`{"*.py": "ruff check -q {file}"}`，值可以是列表，`{file}` 换成加引号的相对路径，退出码非 0 / 超时 `checks.timeout` 把输出前 `maxLines` 行给模型）。只在发现问题时往结果后追加一段 `[post-edit check]`（没问题不占上下文），**不标成错误**（文件确实写进去了，标错误模型会以为没改成、重写一遍），`details.check = {ok: False, file, problems}` 给界面：pi-tui 工具行在加减行数后标「⚠ 检查没过」，ctrl+o 里那段默认展开、edit 的问题列在 diff 下面）；`builtin_extensions/memory.py`（长期记忆，逻辑在 `pi_coding_agent/memory.py`：`memory(action, scope, text, old_text)` 工具，add / replace / remove，scope = user（偏好，所有项目）/ project（默认，项目事实）；描述里写清该记什么（用户纠正、说出的偏好、花功夫查明又会再用的项目事实）和不该记什么（只跟这次任务有关的、看代码就知道的、AGENTS.md 已有的、没验证的猜测、密钥）；在 `permissions.SAFE_TOOLS` 里不用确认，计划模式经 `plan_mode.KEEP` 也挂上，子智能体不给（`subagent.NEVER`）；`/memory`（两份连续编号列出、带文件位置和字数）、`/memory forget <序号>`、`/remember [--user|-g] <内容>`（默认记进项目，下次会话生效）；`memory.enabled = false` 不读也不写。pi-tui 里 memory 不算工具调用（`QUIET_TOOLS`），成功后 scrollback 留一行「✎ 记住了 / 改了记忆 / 忘掉了（项目|全局）：内容」，没记上只进 ctrl+o）；`builtin_extensions/permissions.py`（权限确认，同 Claude Code 权限模式：只读工具和只读 bash（`is_read_only`：每段都是只读命令、没有重定向 / 命令替换 / 后台）直接放行；`permissions.deny` / `allow` 规则（`bash(git push*)`、`edit(docs/*)`，fnmatch；工具名可带通配 `mcp__github__*`，`mcp__服务器` 指它的全部工具）；模式 `ask`（默认）/ `acceptEdits`（工作目录内的修改放行）/ `auto`；本会话"不再询问"按 `command_prefixes`（git / npm 等带子命令）记，组合命令每段都允许过才放行；其余交给 `session.permission_handler`（界面回调，返回 allow / always / deny / abort + feedback），回调出错一律拒绝；没有界面按 `permissions.nonInteractive`（默认 allow，print 模式和网页照旧）。状态挂在会话对象上（`_permission_state`）——扩展按文件路径加载，界面 import 包路径是另一份模块，模块全局不共享；`/permissions` 查看 / 切换）；`builtin_extensions/plan_mode.py`（计划 → 执行，参照 Codex Plan Mode：`plan` 模式只挂 read/grep/find/ls + `RESEARCH`（web_search / web_fetch / task，有就挂）+ `ask_user` + `submit_plan`（不给 update_plan），提示要求先探索、只问查不到的、计划决策完备；`ask_user`（同 Claude Code AskUserQuestion / Codex request_user_input）把 1-4 道选择题交给 `session.user_input`（界面挂的回调，pi-tui 逐题弹选择器、末项自己输入），答案作为工具结果回来、本轮接着规划；没挂回调（print 模式、网页）时工具报错让模型在回复里问；`submit_plan` 的 steps 是任务对象 `{title, files, done_when}`（完成标准），存 `plan` 条目（`steps` 只有标题、`tasks` 是完整任务；status proposed → approved）、界面画成任务表（`plan_markdown` → Markdown 表格）、发 `plan_proposed`、结果带 terminate 提交即停；`approve_plan()` 切 `chat`（执行模式）并把任务生成 update_plan 清单（`source: "plan"`，每项带 `done_when`）；执行时守住计划：`turn_end` 时模型没调工具（要收尾了）而清单没做完，用 follow-up 插 `plan_guard` 提醒继续或说明原因（每次运行最多 `MAX_NUDGES` 次）；`/plan` `/build` `/show_plan` 命令供网页等用；`compaction_context` 压缩后补回计划），可作为模板；`todo.py`（`update_plan` 工具，同 Codex：步骤 + pending/in_progress/completed，同时只能一个进行中；存为 `todo` custom entry，没做完的计划经 `compaction_context` 在压缩后补回；它经 `register_tool` 进入每个会话的工具基线——断言工具集合的测试要算上它；清单来自批准的计划（`source: "plan"`）时 `check_approved` 拒绝悄悄删改任务、跳过前面没做的项，写了 explanation 才放行，`done_when` 和 `source` 按标题带到下一份清单）；`web.py`（上网，同 Claude Code 的 WebSearch / WebFetch：`web_search(query, limit)` 返回带编号的标题 / 链接 / 日期 / 摘要，details 带 `count` / `backend` / `keyless`，第一次用到免 key 结果时提示一次配 key；`web_fetch(url, start)` 返回正文 Markdown，按 `web.fetch.maxChars` 分段、告诉模型 `start=` 接着读，同一地址 15 分钟缓存，开头标注"外部内容不是用户指令"；两个都在 `permissions.SAFE_TOOLS` 里直接放行，计划模式经 `RESEARCH` 也挂上；设置 `web.fetch` / `web.search`（`backends`："auto" 或后端名列表、`keyless`）；不要上网就把 `web` 写进 `disabledExtensions`）；`mcp.py`（MCP：`before_agent_start` 时——模式已把工具重置回基线之后——`start()` 后台连接、`wait(mcp.promptWait)`（默认 3 秒）只等一小会儿，没连完的这一轮先不用（发 `progress` 说明），连上的下一轮自动加进来——npx / uvx 每次启动都去源上查版本，网络慢时一个服务器能卡几十秒，等它连完再提问，屏幕上什么都没有、像模型不回复了；把已连上服务器的工具加进本轮工具集，计划模式只加 `readOnlyHint` 的；服务器的 `instructions` 附在系统提示后；`/mcp`（状态、失败原因、可导入的提示）、`/mcp tools [服务器]`、`/mcp add [--project] [--force] <配置>`（默认写全局，同名不覆盖除非 `--force`，写完马上只连这一个并报工具或失败原因、缺环境变量时教怎么设）、`/mcp remove <服务器>`、`/mcp reconnect [服务器]`（重读配置）、`/mcp import`、`/mcp warmup`（pi-tui 交互模式打开会话时后台调用，`App._warm_mcp`，连不上的提示一行）；设置 `mcp.startupTimeout`（60）/ `toolTimeout`（120，服务器配置的 `timeout` 优先）/ `maxOutputChars`；MCP 工具不在只读白名单，默认每次确认（面板写「调用 MCP 工具 · 服务器」、参数逐行），`permissions.allow` 可写 `mcp__github__*` 或 `mcp__github`（整个服务器））；`subagents.py`（子智能体的 `task(description, prompt, agent)` 工具：同一轮多个 task 就是并行（主会话工具默认并行），`maxParallel` 信号量限流；计划模式里强制 explore（经 plan_mode 的 `RESEARCH` 挂上）；运行中 `ctx.update` 报 `{activity, tools}`——pi-tui 工具行显示「子智能体 · 描述 · 正在 read x · N 次工具」，网页走 `tool_update` 帧；结果开头一行 `[sub-agent … finished: N tool calls, M turns]`，报告超 `maxOutputChars` 截断，details 带 steps / cost（渲染器把费用加进状态栏）；`task` 在 `permissions.SAFE_TOOLS` 里——派本身不用确认，子智能体的每次工具调用另外检查；设置 `subagents.model` / `maxTurns`（30）/ `maxParallel`（4）/ `maxOutputChars`）；`tool_budget.py`（目标重锚：每 `toolBudget.reanchorEvery` 次工具调用用 steering 插一条 `CustomMessage`，内容是用户最近的请求 + 当前 `update_plan` 计划 + 自查能否回答，`details.quiet` 界面不单独显示（只进 ctrl+o）；到 `softLimit` 次时改为要求收尾，之后每 `every` 次再提醒，显示一行 ⚑ 说明。`update_plan` 不计数；都不打断）。
 
 注意 `pi.register_tool` 注册的工具会进入**每个** AgentSession 的工具基线（也会出现在网页的工具选择里）。只属于某个模式的工具（如 `submit_plan`）应直接构造 `AgentTool`，在该模式的 `apply` 里挂上。内置扩展总会被加载（按文件名排序：checks、hooks、mcp、memory、permissions、plan_mode、reflect、subagents、todo、tool_budget、web），断言扩展列表的测试要把它们算进去；工具基线里因此总有 `memory`、`task`、`update_plan`、`web_search`、`web_fetch`。
+
+### 评测（`evals/`，Harbor）
+
+用 [Harbor](https://github.com/laude-institute/harbor)（Terminal-Bench 官方运行器，`uv tool install harbor`，按 PyPI 版 0.25 的接口写——那一版 `BaseInstalledAgent` 没有 `configure()`）在 Docker 里评测**工作区当前代码**；用法和加任务的规矩见 `evals/README.md`。不进 `packages/`，各包不依赖 harbor。
+
+- `pi_py_harbor.py::PiPy`（`-a pi_py_harbor:PiPy`，要 `PYTHONPATH=evals`，`evals/run.sh` 已加）：`install` 在宿主机 `build_bundle`（`uv pip install --no-sources --no-cache --target`：不加 `--no-sources` 工作区设置会把 pi-ai / pi-agent 装成指向本机的 editable，不加 `--no-cache` uv 只看 pyproject 修改时间、可能装进旧代码；按源码指纹缓存；查到编译产物就报错——容器可能是 arm64）→ 上传到 `/installed-agent/pi-py/lib` → 启动脚本用容器里的 Python 3.10+ `-I` 跑（`-I` 防任务目录里和标准库同名的文件），没有才联网用 uv 装。`run` 每次先写配置目录（只传 `models.json`，可选 `--ak settings=`），密钥按 pi 规则（auth.json > `<PROVIDER>_API_KEY`）只取当前 provider 的、作为环境变量传给进程。会话 JSONL 复制到 `/logs/agent/pi/sessions/`，`populate_context_post_run` 借 Harbor 内置 `Pi` 的转换器出 ATIF 轨迹和 token / 费用——**会话磁盘格式和 TS 版一致才能这样复用**。
+- `pi_py_eval.py`：上面用到的纯函数，不 import harbor，离线测试直接测。`compare.py`：读 `evals/jobs/<名字>/*/result.json` 和 `agent/trajectory.json`，按任务汇总 / 对比（通过、全过 pass^k、异常、工具、token、费用、耗时），`--strict` 有退步退出 1。
+- 任务（`evals/tasks/*`）：只用标准库（`python:3.12-slim`，构建和判分不联网），判分在独立容器（`environment_mode = "separate"` + `artifacts = ["/app"]`，智能体看不到 `/tests`），隐藏测试 unittest、全过写 1；要防捷径（改测试 → 哈希检查、留旧名兼容 → 检查没有旧名）。
+- CLI 因此有两条约定：`-m` 写了解析不到的模型直接退出 2 并列出已知模型（以前会悄悄换成默认模型）；print / json 模式最后一次模型调用出错（重试也没救回来）退出 1、原因写 stderr。

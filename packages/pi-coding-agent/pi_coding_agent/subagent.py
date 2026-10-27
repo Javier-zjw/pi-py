@@ -31,7 +31,7 @@ from pi_ai import AssistantMessage
 READ_ONLY_TOOLS = ("read", "grep", "find", "ls", "bash")
 RESEARCH_TOOLS = ("web_search", "web_fetch")
 # general 子智能体也不给的：不能再派子智能体；计划 / 提问 / 任务清单是主对话和用户之间的事
-NEVER = {"task", "update_plan", "ask_user", "submit_plan"}
+NEVER = {"task", "update_plan", "ask_user", "submit_plan", "memory"}
 AGENT_TYPES = ("explore", "general")
 STEP_LIMIT = 60
 

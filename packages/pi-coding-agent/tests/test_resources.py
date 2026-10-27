@@ -491,10 +491,10 @@ def test_resource_loader() -> None:
         check("资源: 发现上下文文件",
               any("项目约定" in f.content for f in loader.get_context_files()))
         check("资源: 加载扩展",
-              [e.name for e in loader.get_extensions()] == ["checks", "mcp", "permissions", "plan_mode", "subagents", "todo", "tool_budget", "web", "demo-ext"],
+              [e.name for e in loader.get_extensions()] == ["checks", "mcp", "memory", "permissions", "plan_mode", "subagents", "todo", "tool_budget", "web", "demo-ext"],
               str([(e.name, e.error) for e in loader.get_extensions()]))
         check("资源: 扩展注册的工具可取",
-              [t.name for t in loader.get_extension_api().tools] == ["task", "update_plan", "web_search", "web_fetch", "hello"])
+              [t.name for t in loader.get_extension_api().tools] == ["memory", "task", "update_plan", "web_search", "web_fetch", "hello"])
 
         prompt = loader.get_system_prompt()
         check("资源: 系统提示含技能块", "<skills>" in prompt and "commit-message" in prompt)
@@ -506,12 +506,12 @@ def test_resource_loader() -> None:
         # reload 必须重建扩展状态：删掉扩展文件后，它注册的东西也该消失
         loader.reload()
         check("资源: reload 后工具不重复",
-              len(loader.get_extension_api().tools) == 5,
+              len(loader.get_extension_api().tools) == 6,
               str([t.name for t in loader.get_extension_api().tools]))
         (cwd / ".pi" / "extensions" / "demo.py").unlink()
         loader.reload()
         check("资源: reload 丢弃已删除扩展的工具",
-              [t.name for t in loader.get_extension_api().tools] == ["task", "update_plan", "web_search", "web_fetch"],
+              [t.name for t in loader.get_extension_api().tools] == ["memory", "task", "update_plan", "web_search", "web_fetch"],
               str([t.name for t in loader.get_extension_api().tools]))
         check("资源: reload 丢弃已删除扩展的命令",
               "greet" not in loader.get_extension_api().commands,

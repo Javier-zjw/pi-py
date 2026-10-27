@@ -39,6 +39,7 @@ ENTRY_TYPE = "plan"
 READ_ONLY = ("read", "grep", "find", "ls")
 # 调研用的只读工具：web 扩展的上网工具；task 在计划模式里只能派只读的 explore 子智能体
 RESEARCH = ("web_search", "web_fetch", "task")
+KEEP = ("memory",)      # 计划模式里也能记东西：写的是记忆文件，不是项目
 ASK_TOOL = "ask_user"
 GUARD_TYPE = "plan_guard"   # 清单没做完就想收尾时的提醒（CustomMessage）
 MAX_NUDGES = 2              # 每次运行最多提醒几次：确实做不下去时让模型能停下来
@@ -172,7 +173,7 @@ def activate(pi) -> None:
         session.agent.state.system_prompt = (session.agent.state.system_prompt or "") + PLAN_PROMPT
         excluded = set(session.settings.get("excludeTools") or [])
         tools = create_tools([name for name in READ_ONLY if name not in excluded], session.cwd)
-        tools += [t for t in session.agent.state.tools if t.name in RESEARCH]
+        tools += [t for t in session.agent.state.tools if t.name in RESEARCH + KEEP]
         tools += [ask_tool, submit_tool]
         session.agent.set_tools(tools)
 

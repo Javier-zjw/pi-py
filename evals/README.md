@@ -59,6 +59,7 @@ PYTHONPATH=evals harbor run -p evals/tasks -a pi_py_harbor:PiPy -m deepseek/deep
 python evals/compare.py evals/jobs/base               # 按任务汇总
 python evals/compare.py evals/jobs/base evals/jobs/new  # 改动前后对比，标出 ↑ 变好 / ↓ 退步
 python evals/compare.py evals/jobs/base evals/jobs/new --strict   # 有退步就退出 1
+python evals/compare.py evals/jobs/base --errors       # 列出每次没通过的原因：异常的说明和 pi 最后的输出，做错的给隐藏测试结果
 harbor view evals/jobs                                 # 网页里逐步回放每次运行的轨迹
 ```
 
@@ -72,7 +73,7 @@ harbor view evals/jobs                                 # 网页里逐步回放�
 每次运行的明细在 `evals/jobs/<名字>/<任务>__<编号>/`：
 
 - `agent/pi-py.txt`：pi 的输出；
-- `agent/pi/sessions/*.jsonl`：会话原文（和本机 `~/.pi/agent/sessions` 里的一样，pi-tui 可以 `--resume` 打开）；
+- `agent/pi/sessions/*.jsonl`：会话原文（和本机 `~/.pi/agent/sessions` 里的一样，pi-tui 可以 `--resume` 打开）。pi 边跑边写在这里，超时被强制结束也留得下；
 - `agent/trajectory.json`：Harbor 统一格式的轨迹；
 - `verifier/test-stdout.txt`：隐藏测试的输出，看哪条没过；
 - `result.json`：判分、异常、token、费用。
@@ -84,7 +85,7 @@ harbor view evals/jobs                                 # 网页里逐步回放�
 - **测的是工作区里的代码**：每次运行先在本机把 `packages/` 下的 pi-ai、pi-agent、pi-coding-agent 连同依赖（httpx 等，都是纯 Python）打成一个目录（`uv pip install --target`，按源码内容缓存在临时目录，改了代码才重打）。然后上传到容器的 `/installed-agent/pi-py/lib`，用容器里的 Python 3.10+ 以 `python -I` 启动。
   - 不装进任务自己的 Python 环境，也不改 PATH 和 PYTHONPATH。
   - 任务目录里和标准库同名的文件也影响不到它。
-  - 镜像里没有 Python 3.10+ 时，才联网用 uv 装一个独立的 Python。这个兜底分支在本仓库的开发环境里测不了（网络策略不允许访问 astral.sh / GitHub）。
+  - 镜像里没有 Python 3.10+ 时，先用镜像自带的包管理器（apt / dnf / yum / apk）装 python3（ubuntu 24.04 装出来是 3.12），这会往任务容器里加一个系统包；系统自带的太旧（比如 debian 11 是 3.9）才联网用 uv 下载一个独立的 Python。最后这一步要能访问 astral.sh 和 GitHub，本仓库的开发环境测不了。
 - **密钥不落盘**：在本机按 pi 的规则（auth.json 优先，其次 `<PROVIDER>_API_KEY` 环境变量）只取当前模型那个 provider 的 key，作为环境变量交给容器里的 pi 进程。`auth.json` 不上传，日志里也不会出现密钥。`models.json` 会上传，自定义的 provider 照常能用。
 - **轨迹**：pi-py 的会话文件格式和 TS 版 pi 一致，所以直接交给 Harbor 内置的 pi 转换器，生成轨迹并统计 token 和费用。
 - **退出码**：模型名写错退出 2；模型调用失败（重试也没救回来）退出 1。Harbor 把这两种记成"异常"，和"做错了"分开统计。
@@ -126,3 +127,5 @@ python evals/compare.py evals/jobs/pi-ts evals/jobs/base
 ```
 
 公开基准的任务多、镜像大，一次全量要花不少钱和时间。先用 `-l 10`（只跑前 10 个）试。
+
+**网络慢时先把镜像下好**：Terminal-Bench 等基准的镜像放在 ghcr.io，每个几百 MB 到 1GB 多，每道题只给 10 分钟启动。同时跑几道、网速又慢时会报 `EnvironmentStartTimeoutError`（pi-py 根本没开始）。先用 `docker pull` 逐个下载（镜像名在任务的 `task.toml` 的 `docker_image`），本地有了 Harbor 就不再下载；或者加 `--environment-build-timeout-multiplier 3` 放宽时限、`-n 1` 让一个镜像独占带宽。Terminal-Bench 的镜像只有 x86 版，在 M 芯片的 Mac 上靠模拟运行，两道 QEMU 题（模拟里再起虚拟机）很可能超时。

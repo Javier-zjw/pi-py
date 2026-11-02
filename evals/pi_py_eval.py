@@ -94,7 +94,6 @@ def build_bundle(repo: Path = REPO, cache_root: Path | None = None) -> Path:
             # 容器可能是另一种 CPU（Mac 上是 arm64），带编译产物的依赖不能直接搬过去
             raise RuntimeError(f"依赖里有编译产物，不能跨平台使用：{native[:5]}")
         shutil.rmtree(building / "bin", ignore_errors=True)       # 本机路径的启动脚本，用不上
-        (building / "VERSION").write_text(git_version(repo) + "\n")
         (building / ".complete").write_text("")
         if target.exists():
             shutil.rmtree(building)
@@ -158,18 +157,29 @@ def run_command(model: str, instruction: str, *, output: str, sessions_out: str,
                 thinking: str | None = None, exclude_tools: tuple[str, ...] = (),
                 pi: PurePosixPath | Path = REMOTE_BIN,
                 config: PurePosixPath | Path = REMOTE_CONFIG) -> str:
-    """跑一次 pi（print 模式，输出同时写进 output）并把会话复制到 sessions_out；退出码是 pi 的"""
+    """跑一次 pi（print 模式，输出同时写进 output）；退出码是 pi 的。
+
+    会话目录（配置目录下的 sessions）链接到 sessions_out：pi 边跑边写进日志目录，
+    超时被强制结束也留得下记录——跑完再复制的话，最需要看的那次（卡住、超时）恰好什么都没有。
+    pi 按项目分子目录（sessions/<项目>/xxx.jsonl），转换前由 collect_sessions 摊平。"""
     options = f"-t {shlex.quote(thinking)} " if thinking else ""
     if exclude_tools:
         options += f"--exclude-tools {shlex.quote(','.join(exclude_tools))} "
     sessions = shlex.quote(f"{config}/sessions")
     return (
-        f"mkdir -p {shlex.quote(sessions_out)}; "
-        f"{{ {shlex.quote(str(pi))} --mode print --agent-dir {shlex.quote(str(config))} "
+        f"mkdir -p {shlex.quote(sessions_out)} {shlex.quote(str(config))} && "
+        f"rm -rf {sessions} && ln -s {shlex.quote(sessions_out)} {sessions} && "
+        f"{shlex.quote(str(pi))} --mode print --agent-dir {shlex.quote(str(config))} "
         f"-m {shlex.quote(model)} {options}{shlex.quote(instruction)} </dev/null 2>&1 "
-        f"| tee {shlex.quote(output)}; }}; "
-        "status=$?; "
-        f"if [ -d {sessions} ]; then find {sessions} -name '*.jsonl' "
-        f"-exec cp {{}} {shlex.quote(sessions_out)}/ \\; ; fi; "
-        "exit $status"
+        f"| tee {shlex.quote(output)}"
     )
+
+
+def collect_sessions(root: Path) -> list[Path]:
+    """把 root 下各项目子目录里的会话文件复制到 root 本层（Harbor 的 pi 转换器只看这一层），返回它们"""
+    if not root.is_dir():
+        return []
+    for path in sorted(root.rglob("*.jsonl")):
+        if path.parent != root and not (root / path.name).exists():
+            (root / path.name).write_bytes(path.read_bytes())
+    return sorted(root.glob("*.jsonl"))

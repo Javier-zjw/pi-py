@@ -249,6 +249,44 @@ def test_run_command() -> None:
               and "[--exclude-tools]" not in (logs / "o.txt").read_text())
 
 
+def run_script(env_extra: dict[str, str], *args: str) -> list[str]:
+    """跑 evals/run.sh，harbor 和 python3 换成假的：返回 harbor 收到的参数"""
+    with tempfile.TemporaryDirectory() as tmp:
+        bin_dir = Path(tmp)
+        (bin_dir / "harbor").write_text('#!/bin/sh\nfor a in "$@"; do printf "%s\\n" "$a"; done\n')
+        (bin_dir / "python3").write_text("#!/bin/sh\nexit 0\n")       # 打包那一步
+        for name in ("harbor", "python3"):
+            (bin_dir / name).chmod(0o755)
+        env = {k: v for k, v in os.environ.items() if k != "EVAL_PROXY"}
+        env.update(PATH=f"{bin_dir}:{os.environ['PATH']}", **env_extra)
+        done = subprocess.run([str(EVALS / "run.sh"), *args], env=env, text=True,
+                              capture_output=True, timeout=30, check=False)
+    return done.stdout.splitlines()
+
+
+def test_run_script() -> None:
+    plain = run_script({}, "-m", "p/m")
+    check("run.sh: 默认跑示范任务、结果写 evals/jobs、用 PiPy",
+          plain[:2] == ["run", "-a"] and "pi_py_harbor:PiPy" in plain
+          and plain[plain.index("-o") + 1] == "evals/jobs"
+          and plain[plain.index("-p") + 1] == "evals/tasks", str(plain))
+    check("run.sh: 安装时限默认放宽、写在用户参数前面（用户的覆盖它）",
+          "--agent-setup-timeout-multiplier" in plain
+          and plain.index("--agent-setup-timeout-multiplier") < plain.index("-m"), str(plain))
+    check("run.sh: 没设 EVAL_PROXY 不带代理", "--ae" not in plain and "--ve" not in plain)
+    dataset = run_script({}, "-m", "p/m", "-d", "terminal-bench@2.0")
+    check("run.sh: 给了 -d 就不加默认的 -p", "-p" not in dataset, str(dataset))
+
+    proxied = run_script({"EVAL_PROXY": "http://host.docker.internal:7890"}, "-m", "p/m")
+    pairs = {(proxied[i], proxied[i + 1]) for i in range(len(proxied) - 1)}
+    for flag in ("--ae", "--ve"):
+        for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+            check(f"run.sh: EVAL_PROXY → {flag} {name}",
+                  (flag, f"{name}=http://host.docker.internal:7890") in pairs, str(proxied))
+        check(f"run.sh: {flag} 不代理本机（宿主机上的模型服务直连）",
+              (flag, "NO_PROXY=localhost,127.0.0.1,host.docker.internal") in pairs)
+
+
 def test_tasks() -> None:
     tasks = sorted(p for p in (EVALS / "tasks").iterdir() if p.is_dir())
     check("任务: 至少 5 个", len(tasks) >= 5, str([t.name for t in tasks]))
@@ -275,6 +313,7 @@ def main() -> int:
     print("找 Python"); test_find_python()
     print("启动脚本");  test_launcher()
     print("运行命令");  test_run_command()
+    print("run.sh");    test_run_script()
     print("任务集");    test_tasks()
     print()
     if FAILURES:

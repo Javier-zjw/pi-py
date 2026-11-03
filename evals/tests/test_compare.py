@@ -126,8 +126,18 @@ def test_errors() -> None:
         wrong = trial(job, "wrong", 0, 0.0)
         (wrong / "verifier").mkdir()
         (wrong / "verifier" / "test-stdout.txt").write_text("test_a ... ok\nFAIL: test_b\nFAILED (failures=1)\n")
+        broken = trial(job, "nonet", 0, 0.0)
+        (broken / "verifier").mkdir()
+        (broken / "verifier" / "test-stdout.txt").write_text(
+            "downloading uv\n/tests/test.sh: line 23: uv: command not found\n")
+        trial(job, "slow", 0, 1.0, exception="AgentTimeoutError", message="timed out after 900")
         _, out = run_main(str(job), "--errors")
         check("原因: 通过的不列", "ok__0" not in out, out)
+        check("原因: 判分脚本自己没跑起来的单独标出，不说做错了",
+              "nonet__0  判分脚本可能没跑起来" in out and "uv: command not found" in out
+              and "nonet__0  做错了" not in out and "EVAL_PROXY" in out, out)
+        check("原因: 测试没过的照样是做错了", "wrong__0  做错了" in out, out)
+        check("原因: 超时但判分通过的标出来", "slow__0  异常 AgentTimeoutError（判分已通过）" in out, out)
         check("原因: 异常给开头和结尾（中间的长命令省掉）、去掉颜色码",
               "crash__0  异常 NonZeroAgentExitCodeError：Command failed (exit 1)" in out
               and "model error: 401" in out and "x" * 300 not in out and "\x1b" not in out, out)

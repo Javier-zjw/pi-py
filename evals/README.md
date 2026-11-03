@@ -82,7 +82,11 @@ harbor view evals/jobs                                 # 网页里逐步回放�
 
 ## 怎么接进去的
 
-- **测的是工作区里的代码**：每次运行先在本机把 `packages/` 下的 pi-ai、pi-agent、pi-coding-agent 连同依赖（httpx 等，都是纯 Python）打成一个目录（`uv pip install --target`，按源码内容缓存在临时目录，改了代码才重打）。然后上传到容器的 `/installed-agent/pi-py/lib`，用容器里的 Python 3.10+ 以 `python -I` 启动。
+- **测的是工作区里的代码**：`run.sh` 先在本机打包（`python3 evals/pi_py_eval.py build`，也可以单独运行它检查），再上传到容器的 `/installed-agent/pi-py/lib`，用容器里的 Python 3.10+ 以 `python -I` 启动。
+  - 包 = 依赖（httpx 等，都是纯 Python）+ `packages/` 下 pi-ai、pi-agent、pi-coding-agent 的源码。依赖只在第一次和改了 pyproject 后从 PyPI 下载一次；我们的代码每次直接复制，不联网。
+  - 缓存在 `~/.cache/pi-py-harbor/`（可用环境变量 `PI_PY_HARBOR_CACHE` 换位置），不放系统临时目录——macOS 会删掉临时目录里几天没用的文件，留下残缺的包。每份缓存带文件清单，用之前逐个核对，缺了就重建。只留最近 3 个版本的包。
+  - 第一次下载依赖连不上 PyPI 时，`run.sh` 会在启动 Harbor 之前直接报错。
+  - `run.sh` 默认把智能体安装时限放宽到 3 倍（`--agent-setup-timeout-multiplier 3`，自己再写一次就以你的为准）。
   - 不装进任务自己的 Python 环境，也不改 PATH 和 PYTHONPATH。
   - 任务目录里和标准库同名的文件也影响不到它。
   - 镜像里没有 Python 3.10+ 时，先用镜像自带的包管理器（apt / dnf / yum / apk）装 python3（ubuntu 24.04 装出来是 3.12），这会往任务容器里加一个系统包；系统自带的太旧（比如 debian 11 是 3.9）才联网用 uv 下载一个独立的 Python。最后这一步要能访问 astral.sh 和 GitHub，本仓库的开发环境测不了。

@@ -18,4 +18,11 @@ if [ "$source_given" = 0 ]; then
   set -- -p evals/tasks "$@"
 fi
 
-PYTHONPATH="evals${PYTHONPATH:+:$PYTHONPATH}" exec harbor run -a pi_py_harbor:PiPy -o evals/jobs "$@"
+# 先在本机把 pi-py 打好包：失败（比如第一次下载依赖时连不上 PyPI）就在这里报出来，
+# 而不是每道题在 Harbor 的安装阶段各自重试、各自超时
+python3 evals/pi_py_eval.py build >/dev/null
+
+# 安装时限默认放宽到 3 倍：镜像里没有 Python 时要先用 apt 装，x86 镜像在 M 芯片上模拟运行更慢。
+# 写在用户参数前面，用户自己给了就以用户的为准（同一个选项后面的覆盖前面的）
+PYTHONPATH="evals${PYTHONPATH:+:$PYTHONPATH}" exec harbor run -a pi_py_harbor:PiPy -o evals/jobs \
+  --agent-setup-timeout-multiplier 3 "$@"

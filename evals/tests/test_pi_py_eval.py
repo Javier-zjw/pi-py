@@ -92,6 +92,66 @@ def test_fingerprint() -> None:
         check("指纹: 改了 pyproject 也变", E.fingerprint(root) != second)
 
 
+def fake_deps(cache: Path, root: Path) -> Path:
+    """事先放好一份完整的依赖缓存：build_bundle 就不调 uv、不联网"""
+    deps = cache / f"deps-{E.deps_key(root)}"
+    (deps / "httpx").mkdir(parents=True)
+    (deps / "httpx" / "__init__.py").write_text("HTTPX = 1\n")
+    E.write_manifest(deps)
+    return deps
+
+
+def test_bundle() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root, cache = Path(tmp) / "repo", Path(tmp) / "cache"
+        fake_repo(root)
+        cli = root / "packages" / "pi-coding-agent" / "pi_coding_agent" / "cli.py"
+        cli.write_text("def main(): return 0\n")
+        cached = root / "packages" / "pi-ai" / "pi_ai" / "__pycache__"
+        cached.mkdir()
+        (cached / "x.pyc").write_bytes(b"\0")
+        fake_deps(cache, root)
+        bundle = E.build_bundle(root, cache)
+        check("打包: 依赖 + 三个包的源码", (bundle / "httpx" / "__init__.py").is_file()
+              and (bundle / "pi_coding_agent" / "cli.py").is_file()
+              and (bundle / "pi_ai" / "__init__.py").is_file(), str(sorted(bundle.iterdir())))
+        check("打包: 不带 __pycache__", not (bundle / "pi_ai" / "__pycache__").exists())
+        check("打包: 带清单、完整", E.is_complete(bundle))
+        check("打包: 同样的源码直接复用", E.build_bundle(root, cache) == bundle)
+
+        # macOS 清理临时目录删掉了一部分文件：要发现并重建（以前会沿用残缺的目录）
+        (bundle / "pi_coding_agent" / "cli.py").unlink()
+        check("打包: 缺了文件就不算完整", not E.is_complete(bundle))
+        check("打包: 缺文件的重建", E.build_bundle(root, cache) == bundle
+              and (bundle / "pi_coding_agent" / "cli.py").is_file() and E.is_complete(bundle))
+        (bundle / "pi_ai" / "__init__.py").write_text("")
+        check("打包: 文件大小不对也不算完整", not E.is_complete(bundle))
+        E.build_bundle(root, cache)
+        check("打包: 大小不对的重建", (bundle / "pi_ai" / "__init__.py").read_text() == "X = 1\n")
+
+        # 旧代码留下的、没有清单的残缺目录：换掉，不沿用
+        cli.write_text("def main(): return 1\n")
+        stale = cache / f"bundle-{E.fingerprint(root)}"
+        (stale / "pi_coding_agent").mkdir(parents=True)
+        (stale / ".complete").write_text("")
+        fresh = E.build_bundle(root, cache)
+        fresh_cli = fresh / "pi_coding_agent" / "cli.py"
+        check("打包: 没清单的旧目录被换掉", fresh == stale and fresh_cli.is_file()
+              and fresh_cli.read_text() == "def main(): return 1\n")
+
+        for n in range(5):
+            cli.write_text(f"def main(): return {n + 10}\n")
+            latest = E.build_bundle(root, cache)
+        kept = sorted(p.name for p in cache.glob("bundle-*"))
+        check("打包: 只留最近 3 个", len(kept) == 3 and latest.name in kept, str(kept))
+        check("打包: 依赖缓存不删", any(cache.glob("deps-*")))
+
+        before = E.deps_key(root)
+        (root / "packages" / "pi-agent" / "pyproject.toml").write_text(
+            '[project]\nname = "pi-agent"\ndependencies = ["x"]\n')
+        check("依赖: pyproject 变了换一份依赖缓存", E.deps_key(root) != before)
+
+
 def run_bash(command: str, **kw) -> subprocess.CompletedProcess:
     # Harbor 执行智能体命令时会在前面加 set -o pipefail
     bash = shutil.which("bash") or "bash"
@@ -211,6 +271,7 @@ def test_tasks() -> None:
 def main() -> int:
     print("密钥");      test_keys()
     print("指纹");      test_fingerprint()
+    print("打包");      test_bundle()
     print("找 Python"); test_find_python()
     print("启动脚本");  test_launcher()
     print("运行命令");  test_run_command()

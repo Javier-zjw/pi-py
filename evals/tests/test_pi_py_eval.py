@@ -12,6 +12,7 @@ Python（太旧的跳过）；启动脚本（-I：PYTHONPATH 和当前目录里�
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import stat
 import subprocess
@@ -142,11 +143,13 @@ def test_run_command() -> None:
         root = Path(tmp)
         config, logs = root / "config", root / "logs"
         pi = root / "pi"
-        # 假的 pi：打印参数、在配置目录里留一个会话、按 PI_EXIT 退出
+        # 假的 pi：打印参数、在配置目录里写会话（同 pi：sessions/<项目>/xxx.jsonl）、
+        # 按 PI_SLEEP 卡住（模拟超时被杀）、按 PI_EXIT 退出
         pi.write_text(
             "#!/bin/sh\n"
             'for a in "$@"; do printf "[%s]\\n" "$a"; done\n'
             f'mkdir -p "{config}/sessions/--app--" && echo "{{}}" > "{config}/sessions/--app--/s.jsonl"\n'
+            'sleep "${PI_SLEEP:-0}"\n'
             'exit "${PI_EXIT:-0}"\n')
         pi.chmod(pi.stat().st_mode | stat.S_IEXEC)
         instruction = "改一下 `a.py` 里的 $HOME 和 \"引号\"\n第二行 'x'"
@@ -162,7 +165,22 @@ def test_run_command() -> None:
               all(f"[{a}]" in output for a in ("deepseek/deepseek-chat", "-t", "high", "--mode",
                                                 "print", "--agent-dir", str(config))), output)
         check("运行: 关掉上网工具", "[--exclude-tools]\n[web_search,web_fetch]" in output, output)
-        check("运行: 失败了会话也复制出来", (logs / "pi" / "sessions" / "s.jsonl").is_file())
+        sessions = logs / "pi" / "sessions"
+        check("运行: 会话直接写在日志目录里", (sessions / "--app--" / "s.jsonl").is_file())
+        found = E.collect_sessions(sessions)
+        check("运行: 摊平到日志目录这一层（Harbor 的转换器只看这层）",
+              [p.name for p in found] == ["s.jsonl"] and (sessions / "s.jsonl").is_file(), str(found))
+        check("运行: 再摊平一次不重复", E.collect_sessions(sessions) == found)
+        check("运行: 目录不存在时返回空", E.collect_sessions(root / "nowhere") == [])
+
+        # 超时被杀：pi 还没退出，会话也已经在日志目录里
+        killed = root / "killed"
+        command = E.run_command("m/x", "hi", output=str(killed / "o.txt"),
+                                sessions_out=str(killed / "sessions"), pi=pi, config=config)
+        done = run_bash(f"timeout 1 bash -c {shlex.quote('set -o pipefail; ' + command)}",
+                        env={**os.environ, "PI_SLEEP": "30"})
+        check("运行: 超时被杀，会话照样留在日志目录里", done.returncode == 124
+              and (killed / "sessions" / "--app--" / "s.jsonl").is_file(), str(done.returncode))
         plain = E.run_command("m/x", "hi", output=str(logs / "o.txt"),
                               sessions_out=str(logs / "s2"), pi=pi, config=root / "none")
         done = run_bash(plain, env={**os.environ, "PI_EXIT": "0"})

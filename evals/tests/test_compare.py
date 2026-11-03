@@ -40,19 +40,22 @@ def check(name: str, cond: bool, detail: str = "") -> None:
 
 
 def trial(job: Path, task: str, n: int, reward: float | None, *, exception: str | None = None,
-          tools: int = 2, tokens: tuple[int, int] = (1000, 100), cost: float = 0.01) -> None:
+          message: str = "", tools: int = 2, tokens: tuple[int, int] = (1000, 100),
+          cost: float = 0.01) -> Path:
     folder = job / f"{task}__{n}"
     (folder / "agent").mkdir(parents=True)
     (folder / "result.json").write_text(json.dumps({
         "task_name": f"pi-py/{task}",
         "verifier_result": None if reward is None else {"rewards": {"reward": reward}},
-        "exception_info": {"exception_type": exception} if exception else None,
+        "exception_info": ({"exception_type": exception, "exception_message": message}
+                           if exception else None),
         "agent_result": {"n_input_tokens": tokens[0], "n_output_tokens": tokens[1], "cost_usd": cost},
         "agent_execution": {"started_at": "2026-10-27T08:00:00Z",
                             "finished_at": "2026-10-27T08:00:30Z"},
     }))
     steps = [{"source": "agent", "tool_calls": [{"function_name": "bash"}] * tools}]
     (folder / "agent" / "trajectory.json").write_text(json.dumps({"steps": steps}))
+    return folder
 
 
 def run_main(*args: str) -> tuple[int, str]:
@@ -113,9 +116,34 @@ def test_compare() -> None:
               and "只跑了 1 次" in out, out)
 
 
+def test_errors() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        job = Path(tmp) / "job"
+        trial(job, "ok", 0, 1.0)
+        command = "Command failed (exit 1): " + "x" * 500 + " stdout: \x1b[31mmodel error: 401\x1b[0m"
+        crashed = trial(job, "crash", 0, None, exception="NonZeroAgentExitCodeError", message=command)
+        (crashed / "agent" / "pi-py.txt").write_text("→ bash\n\x1b[31mmodel error: 401 invalid key\x1b[0m\n")
+        wrong = trial(job, "wrong", 0, 0.0)
+        (wrong / "verifier").mkdir()
+        (wrong / "verifier" / "test-stdout.txt").write_text("test_a ... ok\nFAIL: test_b\nFAILED (failures=1)\n")
+        _, out = run_main(str(job), "--errors")
+        check("原因: 通过的不列", "ok__0" not in out, out)
+        check("原因: 异常给开头和结尾（中间的长命令省掉）、去掉颜色码",
+              "crash__0  异常 NonZeroAgentExitCodeError：Command failed (exit 1)" in out
+              and "model error: 401" in out and "x" * 300 not in out and "\x1b" not in out, out)
+        check("原因: 异常附上 pi 最后的输出", "pi 最后的输出：model error: 401 invalid key" in out, out)
+        check("原因: 做错的附上隐藏测试最后几行", "wrong__0  做错了" in out
+              and "隐藏测试：FAILED (failures=1)" in out, out)
+        _, out = run_main(str(job))
+        check("原因: 不加 --errors 不列", "做错了" not in out, out)
+        _, out = run_main(str(job), str(job), "--errors")
+        check("原因: 对比时列出后一次的", "wrong__0  做错了" in out, out)
+
+
 def main() -> int:
     print("读取和汇总"); test_load_and_summarize()
     print("对比");       test_compare()
+    print("没通过的原因"); test_errors()
     print()
     if FAILURES:
         print(f"{len(FAILURES)} 处失败：")

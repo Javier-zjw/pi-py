@@ -3,6 +3,7 @@
     python evals/compare.py evals/jobs/基线                 # 一次运行的按任务汇总
     python evals/compare.py evals/jobs/基线 evals/jobs/改后  # 两次对比，标出变好 / 退步的任务
     python evals/compare.py A B --strict                    # 有任务退步就退出 1（可以接进 CI）
+    python evals/compare.py 基线 --errors                   # 列出每次没通过的原因
 
 每个任务：通过（reward=1 的次数 / 次数）、全过（每次都过，同 pass^k，衡量稳定性）、异常（模型报错、
 超时等，不是"做错了"）、平均工具调用次数、token（输入含缓存 + 输出）、费用、智能体耗时。
@@ -13,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -24,6 +26,8 @@ class Trial:
     task: str
     reward: float | None          # None：出了异常、没判分
     exception: str | None = None
+    message: str = ""             # 异常的说明
+    folder: Path | None = None    # 这次运行的结果目录
     tool_calls: int = 0
     tokens: int = 0
     cost: float = 0.0
@@ -85,12 +89,15 @@ def load_trial(trial_dir: Path) -> Trial | None:
         return None
     rewards = (data.get("verifier_result") or {}).get("rewards") or {}
     reward = rewards.get("reward")
-    exception = (data.get("exception_info") or {}).get("exception_type")
+    info = data.get("exception_info") or {}
+    exception = info.get("exception_type")
     usage = data.get("agent_result") or {}
     return Trial(
         task=data["task_name"].split("/")[-1],
         reward=float(reward) if isinstance(reward, (int, float)) else None,
         exception=exception,
+        message=info.get("exception_message") or "",
+        folder=trial_dir,
         tool_calls=_tool_calls(trial_dir),
         tokens=(usage.get("n_input_tokens") or 0) + (usage.get("n_output_tokens") or 0),
         cost=usage.get("cost_usd") or 0.0,
@@ -174,19 +181,61 @@ def compare(old: dict[str, TaskStats], new: dict[str, TaskStats]) -> tuple[str, 
     return _table(rows), regressed
 
 
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _tail(path: Path, lines: int) -> list[str]:
+    try:
+        text = ANSI.sub("", path.read_text(errors="replace"))
+    except OSError:
+        return []
+    return [line.rstrip()[:200] for line in text.splitlines() if line.strip()][-lines:]
+
+
+def _brief(message: str) -> str:
+    """异常说明：开头（哪一步）+ 结尾（原因）；"Command failed" 的中间是整条命令，没用"""
+    text = " ".join(ANSI.sub("", message).split())
+    return text if len(text) <= 320 else f"{text[:80]} … {text[-240:]}"
+
+
+def explain(job: dict[str, TaskStats]) -> str:
+    """每次没通过的运行：异常的说明和 pi 最后的输出；做错的给隐藏测试最后几行"""
+    out: list[str] = []
+    for stats in job.values():
+        for t in stats.trials:
+            if (t.reward or 0) >= 1 and not t.exception:
+                continue
+            folder = t.folder.name if t.folder else t.task
+            if t.exception:
+                head = _brief(t.message)
+                out.append(f"✗ {folder}  异常 {t.exception}：{head}")
+                tail = _tail(t.folder / "agent" / "pi-py.txt", 3) if t.folder else []
+                out += [f"    pi 最后的输出：{line}" for line in tail]
+            else:
+                out.append(f"✗ {folder}  做错了（判分 {t.reward}）")
+                tail = _tail(t.folder / "verifier" / "test-stdout.txt", 4) if t.folder else []
+                out += [f"    隐藏测试：{line}" for line in tail]
+    return "\n".join(out) if out else "每次运行都通过了。"
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("jobs", nargs="+", type=Path, help="一个或两个 harbor run 的结果目录")
     parser.add_argument("--strict", action="store_true", help="有任务退步就退出 1")
+    parser.add_argument("--errors", action="store_true", help="列出每次没通过的原因")
     args = parser.parse_args(argv)
     if len(args.jobs) > 2:
         parser.error("最多对比两次运行")
     jobs = [load_job(j) for j in args.jobs]
     if len(jobs) == 1:
         print(summarize(jobs[0]))
+        if args.errors:
+            print("\n" + explain(jobs[0]))
         return 0
     table, regressed = compare(*jobs)
     print(table)
+    if args.errors:
+        print("\n" + explain(jobs[1]))
     runs = min(s.runs for job in jobs for s in job.values())
     if runs < 3:
         print(f"\n注意：每个任务只跑了 {runs} 次，差一两次可能只是运气。用 -k 3 以上再下结论。")

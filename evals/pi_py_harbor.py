@@ -45,6 +45,8 @@ from pi_py_eval import (
     REMOTE_ROOT,
     ThinkingLevel,
     build_bundle,
+    collect_sessions,
+    git_version,
     key_env_name,
     launcher,
     resolve_api_key,
@@ -92,12 +94,11 @@ class PiPy(BaseInstalledAgent):
         await self.exec_as_root(environment,
                                 command=f"rm -rf {REMOTE_ROOT} && mkdir -p {REMOTE_ROOT}/bin")
         await environment.upload_dir(bundle, str(REMOTE_LIB))
-        found = await environment.exec(command=FIND_PYTHON)
-        python = (found.stdout or "").strip().splitlines()[-1] if found.return_code == 0 else ""
-        if not python:
-            await self.ensure_system_dependencies(environment, ("curl",))
-            done = await self.exec_as_root(environment, command=INSTALL_PYTHON)
-            python = (done.stdout or "").strip().splitlines()[-1]
+        # 版本每次现取：包按源码内容缓存，提交了但代码没变时沿用旧包，版本号不能跟着包走
+        version = await asyncio.to_thread(git_version)
+        await self.exec_as_root(
+            environment, command=f"printf '%s\\n' {shlex.quote(version)} > {REMOTE_LIB}/VERSION")
+        python = await self._install_python(environment)
         script = launcher(python)
         await self.exec_as_root(
             environment,
@@ -105,6 +106,34 @@ class PiPy(BaseInstalledAgent):
                     f"&& chmod -R a+rX {REMOTE_ROOT}",
         )
         await self.exec_as_agent(environment, command=f"{REMOTE_BIN} --help >/dev/null")
+
+    async def _find_python(self, environment: BaseEnvironment) -> str:
+        found = await environment.exec(command=FIND_PYTHON)
+        lines = (found.stdout or "").strip().splitlines()
+        return lines[-1] if found.return_code == 0 and lines else ""
+
+    async def _install_python(self, environment: BaseEnvironment) -> str:
+        """容器里的 Python 3.10+：现成的 → 系统包管理器装 python3 → 联网用 uv 装独立的。
+
+        包管理器排在下载前面：apt 等走发行版的软件源（国内一般有镜像、也能直连），
+        uv 要从 astral.sh 和 GitHub 下载，网络不好时最容易失败；ubuntu 24.04 装出来是 3.12。
+        系统自带的太旧（如 debian 11 是 3.9）才走下载。"""
+        python = await self._find_python(environment)
+        if python:
+            return python
+        try:
+            await self.ensure_system_dependencies(environment, ("python3",))
+        except RuntimeError as exc:  # 命令失败（NonZeroAgentExitCodeError）就走下载，原因记下来
+            self.logger.warning(f"用系统包管理器装 python3 失败，改为下载：{exc}")
+        python = await self._find_python(environment)
+        if python:
+            return python
+        await self.ensure_system_dependencies(environment, ("curl",))
+        done = await self.exec_as_root(environment, command=INSTALL_PYTHON)
+        lines = (done.stdout or "").strip().splitlines()
+        if not lines:
+            raise RuntimeError("容器里没有 Python 3.10+，系统包管理器和 uv 都没装上")
+        return lines[-1]
 
     async def _write_config(self, environment: BaseEnvironment) -> None:
         """配置目录：models.json（自定义 provider）、可选的 settings.json；密钥不写进来。
@@ -153,6 +182,7 @@ class PiPy(BaseInstalledAgent):
 
     def populate_context_post_run(self, context: AgentContext) -> None:
         """会话 JSONL → ATIF 轨迹 + token / 费用（借 Harbor 内置 pi 的转换器，格式相同）"""
+        collect_sessions(self.logs_dir / self._SESSIONS_DIRECTORY)
         try:
             Pi(logs_dir=self.logs_dir, model_name=self.model_name).populate_context_post_run(context)
         except Exception:

@@ -18,6 +18,22 @@ if [ "$source_given" = 0 ]; then
   set -- -p evals/tasks "$@"
 fi
 
+# 容器里走代理（国内网络）：EVAL_PROXY=http://host.docker.internal:7890 evals/run.sh ...
+# 智能体那边（apt 装 Python、pip、下载）用 --ae，判分那边（Terminal-Bench 的 test.sh 要下载 uv、
+# pytest）用 --ve；host.docker.internal 是 Docker Desktop 里容器访问宿主机的地址
+if [ -n "${EVAL_PROXY:-}" ]; then
+  proxy_args=()
+  for flag in --ae --ve; do
+    for name in HTTP_PROXY HTTPS_PROXY http_proxy https_proxy; do
+      proxy_args+=("$flag" "$name=$EVAL_PROXY")
+    done
+    for name in NO_PROXY no_proxy; do
+      proxy_args+=("$flag" "$name=localhost,127.0.0.1,host.docker.internal")
+    done
+  done
+  set -- "${proxy_args[@]}" "$@"
+fi
+
 # 先在本机把 pi-py 打好包：失败（比如第一次下载依赖时连不上 PyPI）就在这里报出来，
 # 而不是每道题在 Harbor 的安装阶段各自重试、各自超时
 python3 evals/pi_py_eval.py build >/dev/null

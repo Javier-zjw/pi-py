@@ -53,6 +53,31 @@ evals/run.sh -m ... -n 2                                              # 同时�
 PYTHONPATH=evals harbor run -p evals/tasks -a pi_py_harbor:PiPy -m deepseek/deepseek-chat -o evals/jobs
 ```
 
+### 国内网络：让题目容器走代理
+
+仓库里的 5 道示范题不用联网，公开基准大多要：
+- 智能体那边：镜像里没 Python 时用 apt 装，做题时也常要 `pip install`；
+- 判分那边：Terminal-Bench 的判分脚本要先从 astral.sh 下载 uv、再从 PyPI 装 pytest。
+
+容器直连国外很慢或连不上时，会出现这些现象：
+- 安装超时（`AgentSetupTimeoutError`）；
+- 判分输出里有 `uv: command not found`。`compare.py --errors` 会把这类标成"判分脚本可能没跑起来"，**这种 0 分不算智能体做错**。
+
+办法是让容器走你本机的代理。`host.docker.internal` 是 Docker Desktop 里容器访问宿主机的地址，端口用你代理软件的 HTTP 端口（Clash 默认 7890）：
+
+```bash
+# 先确认容器能通过代理上网：打印 200 就行
+docker run --rm -e https_proxy=http://host.docker.internal:7890 python:3.12-slim \
+  python3 -c "import urllib.request; print(urllib.request.urlopen('https://pypi.org/simple/pip/', timeout=20).status)"
+
+# 跑评测时加上 EVAL_PROXY
+EVAL_PROXY=http://host.docker.internal:7890 evals/run.sh -m <模型> -d terminal-bench-sample@2.0
+```
+
+`EVAL_PROXY` 会给智能体（`--ae`）和判分（`--ve`）两边都设上 `HTTP_PROXY` / `HTTPS_PROXY`（大小写各一份）。本机和 `host.docker.internal` 不走代理，你在 Mac 上跑的模型服务照样直连。
+
+上面那条测试命令连不上（`Connection refused`）的话，在代理软件里打开"允许局域网连接"（Clash 叫 Allow LAN）再试。
+
 ## 看结果
 
 ```bash

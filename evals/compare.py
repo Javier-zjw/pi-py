@@ -198,6 +198,24 @@ def _brief(message: str) -> str:
     return text if len(text) <= 320 else f"{text[:80]} … {text[-240:]}"
 
 
+# 判分脚本自己没跑起来的迹象：Terminal-Bench 的 test.sh 要先联网装 uv / pytest，
+# 容器上不了网时测试根本没执行，判 0 分但不说明智能体做错了
+VERIFIER_BROKEN = re.compile(
+    r"command not found|Could not resolve host|Temporary failure in name resolution|"
+    r"Failed to connect|Connection (?:refused|timed out|reset)|Network is unreachable|"
+    r"curl: \(\d+\)|/root/\.local/bin/env: No such file", re.IGNORECASE)
+
+
+def verifier_broken(folder: Path | None) -> str:
+    """判分输出里像是环境问题（不是测试没过）的第一行；没有返回空串"""
+    if folder is None:
+        return ""
+    for line in _tail(folder / "verifier" / "test-stdout.txt", 400):
+        if VERIFIER_BROKEN.search(line):
+            return line
+    return ""
+
+
 def explain(job: dict[str, TaskStats]) -> str:
     """每次没通过的运行：异常的说明和 pi 最后的输出；做错的给隐藏测试最后几行"""
     out: list[str] = []
@@ -208,9 +226,15 @@ def explain(job: dict[str, TaskStats]) -> str:
             folder = t.folder.name if t.folder else t.task
             if t.exception:
                 head = _brief(t.message)
-                out.append(f"✗ {folder}  异常 {t.exception}：{head}")
+                passed = "（判分已通过）" if (t.reward or 0) >= 1 else ""
+                out.append(f"✗ {folder}  异常 {t.exception}{passed}：{head}")
                 tail = _tail(t.folder / "agent" / "pi-py.txt", 3) if t.folder else []
                 out += [f"    pi 最后的输出：{line}" for line in tail]
+            elif broken := verifier_broken(t.folder):
+                out.append(f"? {folder}  判分脚本可能没跑起来（判分 {t.reward}，不一定是做错了）："
+                           f"{broken}")
+                out.append("    多半是判分容器上不了网（要下载 uv / pytest）：用 EVAL_PROXY 让容器走代理，"
+                           "见 evals/README.md")
             else:
                 out.append(f"✗ {folder}  做错了（判分 {t.reward}）")
                 tail = _tail(t.folder / "verifier" / "test-stdout.txt", 4) if t.folder else []

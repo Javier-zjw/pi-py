@@ -12,7 +12,6 @@ import os
 import shlex
 import shutil
 import subprocess
-import tempfile
 import threading
 from pathlib import Path, PurePosixPath
 from typing import Literal
@@ -69,37 +68,118 @@ def git_version(repo: Path = REPO) -> str:
     return head + ("-dirty" if dirty else "")
 
 
+MANIFEST = "MANIFEST.json"
+
+
+def default_cache_root() -> Path:
+    """持久缓存目录。不用系统临时目录：macOS 会删掉临时目录里几天没碰过的文件，
+    留下残缺的包（曾经因此报 No module named 'pi_coding_agent.cli'）"""
+    return Path(os.environ.get("PI_PY_HARBOR_CACHE") or Path.home() / ".cache" / "pi-py-harbor")
+
+
+def write_manifest(folder: Path) -> None:
+    """记下目录里每个文件和大小；is_complete 用它核对缓存有没有被删坏"""
+    files = {str(p.relative_to(folder)): p.stat().st_size
+             for p in sorted(folder.rglob("*")) if p.is_file() and p.name != MANIFEST}
+    (folder / MANIFEST).write_text(json.dumps(files, indent=0, sort_keys=True))
+
+
+def is_complete(folder: Path) -> bool:
+    """缓存目录完整：有清单，清单里的文件都在、大小都对"""
+    try:
+        files = json.loads((folder / MANIFEST).read_text())
+    except (OSError, ValueError):
+        return False
+    for name, size in files.items():
+        try:
+            if (folder / name).stat().st_size != size:
+                return False
+        except OSError:
+            return False
+    return True
+
+
+def _install(building: Path, target: Path) -> Path:
+    """把建好的目录换到 target：target 已经完整（别的进程刚建好）就丢掉自己的，残缺的先删掉"""
+    write_manifest(building)
+    if is_complete(target):
+        shutil.rmtree(building, ignore_errors=True)
+        return target
+    shutil.rmtree(target, ignore_errors=True)
+    building.rename(target)
+    return target
+
+
+def deps_key(repo: Path = REPO) -> str:
+    """依赖由三个包的 pyproject 决定（加上目标 Python 版本）"""
+    digest = hashlib.sha256(repr(MIN_PYTHON).encode())
+    for name in PACKAGES:
+        digest.update((repo / "packages" / name / "pyproject.toml").read_bytes())
+    return digest.hexdigest()[:16]
+
+
+def build_deps(repo: Path = REPO, cache_root: Path | None = None) -> Path:
+    """三个包的第三方依赖（httpx 等，纯 Python），只在 pyproject 变了时联网装一次"""
+    cache_root = cache_root or default_cache_root()
+    target = cache_root / f"deps-{deps_key(repo)}"
+    if is_complete(target):
+        return target
+    uv = shutil.which("uv")
+    if uv is None:
+        raise RuntimeError("打包 pi-py 需要 uv（https://docs.astral.sh/uv/）")
+    cache_root.mkdir(parents=True, exist_ok=True)
+    building = cache_root / f"{target.name}.{os.getpid()}.tmp"
+    shutil.rmtree(building, ignore_errors=True)
+    # --no-sources：按普通包装（否则工作区设置会让 pi-ai / pi-agent 装成指向本机路径的 editable）；
+    # 装完把我们自己的三个包删掉——它们每次从源码现拷，这里只留依赖
+    command = [uv, "pip", "install", "--quiet", "--no-sources",
+               "--target", str(building), "--python-version", "{}.{}".format(*MIN_PYTHON),
+               *(str(repo / "packages" / name) for name in PACKAGES)]
+    done = subprocess.run(command, cwd=repo, text=True, capture_output=True, check=False)
+    if done.returncode != 0:
+        shutil.rmtree(building, ignore_errors=True)
+        raise RuntimeError(f"下载 pi-py 的依赖失败（要能访问 PyPI，只在第一次和改了 pyproject 后需要）："
+                           f"{done.stderr.strip()[-1500:]}")
+    native = [p.name for p in building.rglob("*") if p.suffix in (".so", ".pyd", ".dylib")]
+    if native:
+        # 容器可能是另一种 CPU（Mac 上是 arm64），带编译产物的依赖不能直接搬过去
+        shutil.rmtree(building, ignore_errors=True)
+        raise RuntimeError(f"依赖里有编译产物，不能跨平台使用：{native[:5]}")
+    shutil.rmtree(building / "bin", ignore_errors=True)       # 本机路径的启动脚本，用不上
+    for name in PACKAGES:
+        module = name.replace("-", "_")
+        shutil.rmtree(building / module, ignore_errors=True)
+        for info in building.glob(f"{module}-*.dist-info"):
+            shutil.rmtree(info, ignore_errors=True)
+    return _install(building, target)
+
+
 def build_bundle(repo: Path = REPO, cache_root: Path | None = None) -> Path:
-    """把三个包和依赖装进一个目录（只含纯 Python 文件），返回它；同样的源码只打一次"""
-    cache_root = cache_root or Path(tempfile.gettempdir()) / "pi-py-harbor"
-    target = cache_root / fingerprint(repo)
+    """依赖 + 三个包的源码（直接拷，不联网）拼成一个目录，返回它；同样的源码只拼一次"""
+    cache_root = cache_root or default_cache_root()
+    target = cache_root / f"bundle-{fingerprint(repo)}"
     with _bundle_lock:
-        if (target / ".complete").exists():
+        if is_complete(target):
             return target
-        uv = shutil.which("uv")
-        if uv is None:
-            raise RuntimeError("打包 pi-py 需要 uv（https://docs.astral.sh/uv/）")
+        deps = build_deps(repo, cache_root)
         building = cache_root / f"{target.name}.{os.getpid()}.tmp"
         shutil.rmtree(building, ignore_errors=True)
-        # --no-sources：按普通包装（否则工作区设置会让 pi-ai / pi-agent 装成指向本机路径的 editable）
-        # --no-cache：uv 只按 pyproject 的修改时间判断本地包要不要重建，可能装进旧代码
-        command = [uv, "pip", "install", "--quiet", "--no-sources", "--no-cache",
-                   "--target", str(building), "--python-version", "{}.{}".format(*MIN_PYTHON),
-                   *(str(repo / "packages" / name) for name in PACKAGES)]
-        done = subprocess.run(command, cwd=repo, text=True, capture_output=True, check=False)
-        if done.returncode != 0:
-            raise RuntimeError(f"打包 pi-py 失败：{done.stderr.strip()[-2000:]}")
-        native = [p.name for p in building.rglob("*") if p.suffix in (".so", ".pyd", ".dylib")]
-        if native:
-            # 容器可能是另一种 CPU（Mac 上是 arm64），带编译产物的依赖不能直接搬过去
-            raise RuntimeError(f"依赖里有编译产物，不能跨平台使用：{native[:5]}")
-        shutil.rmtree(building / "bin", ignore_errors=True)       # 本机路径的启动脚本，用不上
-        (building / ".complete").write_text("")
-        if target.exists():
-            shutil.rmtree(building)
-        else:
-            building.rename(target)
-    return target
+        shutil.copytree(deps, building, ignore=shutil.ignore_patterns(MANIFEST))
+        for name in PACKAGES:
+            module = name.replace("-", "_")
+            shutil.copytree(repo / "packages" / name / module, building / module,
+                            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"))
+        _install(building, target)
+        prune_bundles(cache_root, keep=target)
+        return target
+
+
+def prune_bundles(cache_root: Path, keep: Path, limit: int = 3) -> None:
+    """每改一次代码多一个包，只留最近用过的 limit 个（含 keep）"""
+    bundles = sorted((p for p in cache_root.glob("bundle-*") if p.is_dir() and p != keep),
+                     key=lambda p: p.stat().st_mtime, reverse=True)
+    for old in bundles[limit - 1:]:
+        shutil.rmtree(old, ignore_errors=True)
 
 
 # -- 宿主机：模型和密钥 ------------------------------------------------------- #
@@ -183,3 +263,24 @@ def collect_sessions(root: Path) -> list[Path]:
         if path.parent != root and not (root / path.name).exists():
             (root / path.name).write_bytes(path.read_bytes())
     return sorted(root.glob("*.jsonl"))
+
+
+def main(argv: list[str] | None = None) -> int:
+    """python3 evals/pi_py_eval.py build：先打好包（evals/run.sh 在启动 Harbor 前调用）。
+    打包失败在这一步就报出来，而不是每道题在 Harbor 的安装阶段各自重试、各自超时"""
+    import sys
+
+    args = sys.argv[1:] if argv is None else argv
+    if args != ["build"]:
+        print("用法：python3 evals/pi_py_eval.py build", file=sys.stderr)
+        return 2
+    try:
+        print(build_bundle())
+    except RuntimeError as exc:
+        print(f"✗ {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
